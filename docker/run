@@ -1,0 +1,14 @@
+#!/usr/bin/bash
+set -e
+
+GOOS=linux GOARCH=amd64 go build -o data/bin/gsg ..
+chmod +x data/bin/gsg
+
+data_path=$(realpath data)
+dcsa_path=/data/dcsa.json
+
+docker build -t test_gsg .
+docker run -i \
+	-v $data_path:/data \
+	-e GOOGLE_APPLICATION_CREDENTIALS=$dcsa_path \
+	test_gsg
