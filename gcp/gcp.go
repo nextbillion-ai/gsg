@@ -311,6 +311,25 @@ func DownloadObject(bucket, prefix, dstFile string, bars *bar.Container) {
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
 }
 
+// AttempLock attempts to write a remote lock file
+func AttemptLock(bucket, object string) {
+
+	// write lock
+	client := storageClient()
+	o := client.Bucket(bucket).Object(object)
+	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
+	if _, err := wc.Write([]byte("1")); err != nil {
+		logger.Debug("failed with %s", err)
+		return
+	}
+	defer func() {
+		if err := wc.Close(); err != nil {
+			logger.Debug("lock failed")
+			common.Exit()
+		}
+	}()
+}
+
 // UploadObject uploads an object from a file
 func UploadObject(srcFile, bucket, object string, bars *bar.Container) {
 	// open source file
