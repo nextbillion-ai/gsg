@@ -320,8 +320,9 @@ func AttemptLock(bucket, object string) {
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
 	if _, err := wc.Write([]byte("1")); err != nil {
 		logger.Debug("failed with %s", err)
-		return
+		common.Exit()
 	}
+	// it is observed that when preconditions (such as DoesNotExist) failed, err will only be thrown at writer close(). so we check and exit here.
 	defer func() {
 		if err := wc.Close(); err != nil {
 			logger.Debug("lock failed")
