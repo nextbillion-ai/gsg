@@ -13,6 +13,7 @@ import (
 func init() {
 	rsyncCmd.Flags().BoolP("r", "r", false, "rsync an entire directory tree")
 	rsyncCmd.Flags().BoolP("d", "d", false, "delete objects if not exists")
+	rsyncCmd.Flags().BoolP("v", "v", false, "force checksum after command operated, raise error if failed")
 	rootCmd.AddCommand(rsyncCmd)
 }
 
@@ -24,6 +25,7 @@ var rsyncCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		isRec, _ := cmd.Flags().GetBool("r")
 		isDel, _ := cmd.Flags().GetBool("d")
+		forceChecksum, _ := cmd.Flags().GetBool("v")
 		srcScheme, srcBucket, srcPrefix := common.ParseURL(args[0])
 		dstScheme, dstBucket, dstPrefix := common.ParseURL(args[1])
 
@@ -34,12 +36,12 @@ var rsyncCmd = &cobra.Command{
 			if gcp.IsDirectory(srcBucket, srcPrefix) {
 				srcAttrs := gcpAttrsToLinuxAttrs(srcPrefix, gcp.GetObjectsAttributes(srcBucket, srcPrefix, isRec))
 				dstAttrs := linux.GetObjectsAttributes(dstPrefix, isRec)
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs)
+				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
 				logger.Info("Starting synchronization...")
 				for _, obj := range copyList {
 					srcPath := common.JoinPath(srcPrefix, obj.RelativePath)
 					dstPath := common.JoinPath(dstPrefix, obj.RelativePath)
-					gcp.DownloadObjectWithWorkerPool(srcBucket, srcPath, dstPath, pool, bars)
+					gcp.DownloadObjectWithWorkerPool(srcBucket, srcPath, dstPath, pool, bars, forceChecksum)
 				}
 				if isDel {
 					for _, obj := range deleteList {
@@ -58,7 +60,7 @@ var rsyncCmd = &cobra.Command{
 			if linux.IsDirectory(srcPrefix) {
 				srcAttrs := linux.GetObjectsAttributes(srcPrefix, isRec)
 				dstAttrs := gcpAttrsToLinuxAttrs(dstPrefix, gcp.GetObjectsAttributes(dstBucket, dstPrefix, isRec))
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs)
+				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
 				logger.Info("Starting synchronization...")
 				for _, obj := range copyList {
 					srcPath := obj.FullPath
@@ -79,7 +81,7 @@ var rsyncCmd = &cobra.Command{
 			if gcp.IsDirectory(srcBucket, srcPrefix) {
 				srcAttrs := gcpAttrsToLinuxAttrs(srcPrefix, gcp.GetObjectsAttributes(srcBucket, srcPrefix, isRec))
 				dstAttrs := gcpAttrsToLinuxAttrs(dstPrefix, gcp.GetObjectsAttributes(dstBucket, dstPrefix, isRec))
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs)
+				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
 				logger.Info("Starting synchronization...")
 				for _, attrs := range copyList {
 					srcPath := attrs.FullPath
@@ -103,7 +105,7 @@ var rsyncCmd = &cobra.Command{
 			if linux.IsDirectory(srcPrefix) {
 				srcAttrs := linux.GetObjectsAttributes(srcPrefix, isRec)
 				dstAttrs := linux.GetObjectsAttributes(dstPrefix, isRec)
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs)
+				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
 				logger.Info("Starting synchronization...")
 				for _, attrs := range copyList {
 					srcPath := attrs.FullPath
@@ -142,7 +144,12 @@ func gcpAttrsToLinuxAttrs(prefix string, attrs []*storage.ObjectAttrs) []*linux.
 	return res
 }
 
-func getCopyAndDeleteLists(srcAttrs, dstAttrs []*linux.FileAttrs) (copyList, deleteList []*linux.FileAttrs) {
+func getCopyAndDeleteLists(
+	srcAttrs, dstAttrs []*linux.FileAttrs,
+	forceChecksum bool,
+) (
+	copyList, deleteList []*linux.FileAttrs,
+) {
 	// create srcAttrsMap
 	srcAttrsMap := map[string]*linux.FileAttrs{}
 	for _, attrs := range srcAttrs {
@@ -158,7 +165,7 @@ func getCopyAndDeleteLists(srcAttrs, dstAttrs []*linux.FileAttrs) (copyList, del
 	// create copyList
 	for _, attrs := range srcAttrs {
 		dstAttrs, ok := dstAttrsMap[attrs.RelativePath]
-		if ok && attrs.Same(dstAttrs) {
+		if ok && attrs.Same(dstAttrs, forceChecksum) {
 			continue
 		}
 		copyList = append(copyList, attrs)

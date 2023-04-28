@@ -179,7 +179,12 @@ func CopyObject(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 }
 
 // DownloadObjectWithWorkerPool downloads a specific byte range of an object to a file.
-func DownloadObjectWithWorkerPool(bucket, prefix, dstFile string, pool *worker.Pool, bars *bar.Container) {
+func DownloadObjectWithWorkerPool(
+	bucket, prefix, dstFile string,
+	pool *worker.Pool,
+	bars *bar.Container,
+	forceChecksum bool,
+) {
 	// check object
 	attrs := GetObjectAttributes(bucket, prefix)
 	if attrs == nil {
@@ -235,7 +240,7 @@ func DownloadObjectWithWorkerPool(bucket, prefix, dstFile string, pool *worker.P
 				defer func() { _ = rc.Close() }()
 
 				// create write with offset and length of file
-				fl, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
 				_, err = fl.Seek(startByte, 0)
 				if err != nil {
 					logger.Debug("failed with %s", err)
@@ -261,11 +266,16 @@ func DownloadObjectWithWorkerPool(bucket, prefix, dstFile string, pool *worker.P
 			return
 		}
 		common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
+		MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 	})
 }
 
 // DownloadObject downloads an object to a file
-func DownloadObject(bucket, prefix, dstFile string, bars *bar.Container) {
+func DownloadObject(
+	bucket, prefix, dstFile string,
+	bars *bar.Container,
+	forceChecksum bool,
+) {
 	// check object
 	attrs := GetObjectAttributes(bucket, prefix)
 	if attrs == nil {
@@ -309,6 +319,7 @@ func DownloadObject(bucket, prefix, dstFile string, bars *bar.Container) {
 		logger.Debug("failed with %s", err)
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
+	MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 }
 
 // AttempLock attempts to write a remote lock file
@@ -439,4 +450,32 @@ func GetFileModificationTime(attrs *storage.ObjectAttrs) time.Time {
 		mt = attrs.Updated
 	}
 	return mt
+}
+
+// equalCRC32C return true if CRC32C values are the same
+// - compare a local file with an object from gcp
+func equalCRC32C(localPath, bucket, object string) bool {
+	localCRC32C := common.GetFileCRC32C(localPath)
+	gcpCRC32C := uint32(0)
+	attr := GetObjectAttributes(bucket, object)
+	if attr != nil {
+		gcpCRC32C = attr.CRC32C
+	}
+	logger.Info("CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
+		localPath, bucket, object, localCRC32C, gcpCRC32C)
+	return localCRC32C == gcpCRC32C
+}
+
+// MustEqualCRC32C compare CRC32C values if flag is set
+// - compare a local file with an object from gcp
+// - exit process if values are different
+func MustEqualCRC32C(flag bool, localPath, bucket, object string) {
+	if !flag {
+		return
+	}
+	if !equalCRC32C(localPath, bucket, object) {
+		logger.Info("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+		common.Exit()
+	}
+	logger.Info("CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 }

@@ -15,8 +15,8 @@ func init() {
 
 var hashCmd = &cobra.Command{
 	Use:   "hash [url]",
-	Short: "Get hash value of objects",
-	Long:  "Get hash value of objects",
+	Short: "Get checksum value of objects",
+	Long:  "Get checksum value of objects",
 	Args:  cobra.ExactArgs(1),
 	Run: func(_ *cobra.Command, args []string) {
 		scheme, bucket, prefix := common.ParseURL(args[0])

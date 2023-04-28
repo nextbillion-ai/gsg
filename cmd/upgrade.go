@@ -60,7 +60,7 @@ var upgradeCmd = &cobra.Command{
 		}
 
 		// upgrade local version
-		gcp.DownloadObject(upgradeBucket, srcPath, dstPath, bars)
+		gcp.DownloadObject(upgradeBucket, srcPath, dstPath, bars, true)
 		common.Chmod(dstPath, 0766)
 	},
 }
