@@ -11,16 +11,18 @@ import (
 
 func init() {
 	cpCmd.Flags().BoolP("r", "r", false, "copy an entire directory tree")
+	cpCmd.Flags().BoolP("v", "v", false, "force checksum after command operated, raise error if failed")
 	rootCmd.AddCommand(cpCmd)
 }
 
 var cpCmd = &cobra.Command{
-	Use:   "cp [-r] [source url]... [destination url]",
+	Use:   "cp [-v] [-r] [source url]... [destination url]",
 	Short: "Copy files and objects",
 	Long:  "Copy files and objects",
 	Args:  cobra.MinimumNArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		isRec, _ := cmd.Flags().GetBool("r")
+		forceChecksum, _ := cmd.Flags().GetBool("v")
 		dstScheme, dstBucket, dstPrefix := common.ParseURL(args[len(args)-1])
 
 		for i := 0; i < len(args)-1; i++ {
@@ -33,7 +35,7 @@ var cpCmd = &cobra.Command{
 						objs := gcp.ListObjects(srcBucket, srcPrefix, isRec)
 						for _, obj := range objs {
 							dstPath := common.GetDstPath(srcPrefix, obj, dstPrefix)
-							gcp.DownloadObjectWithWorkerPool(srcBucket, obj, dstPath, pool, bars)
+							gcp.DownloadObjectWithWorkerPool(srcBucket, obj, dstPath, pool, bars, forceChecksum)
 						}
 					} else {
 						logger.Info("Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", srcBucket, srcPrefix)
@@ -44,7 +46,7 @@ var cpCmd = &cobra.Command{
 						_, name := common.ParseFile(srcPrefix)
 						dstPrefix = common.JoinPath(dstPrefix, name)
 					}
-					gcp.DownloadObjectWithWorkerPool(srcBucket, srcPrefix, dstPrefix, pool, bars)
+					gcp.DownloadObjectWithWorkerPool(srcBucket, srcPrefix, dstPrefix, pool, bars, forceChecksum)
 				} else {
 					logger.Info("Invalid bucket[%s] with prefix[%s]", srcBucket, srcPrefix)
 					common.Exit()

@@ -21,7 +21,7 @@ type FileAttrs struct {
 // Same check if two attributes are same file storing differently
 // - refer to gsutil logic:
 // - - https://cloud.google.com/storage/docs/gsutil/commands/rsync
-func (fa *FileAttrs) Same(other *FileAttrs) bool {
+func (fa *FileAttrs) Same(other *FileAttrs, forceChecksum bool) bool {
 	if other == nil {
 		return false
 	}
@@ -36,9 +36,11 @@ func (fa *FileAttrs) Same(other *FileAttrs) bool {
 		return false
 	}
 
-	// compare modification time
-	if !fa.ModTime.Equal(time.Time{}) && !other.ModTime.Equal(time.Time{}) {
-		return fa.ModTime.Equal(other.ModTime)
+	if !forceChecksum {
+		// compare modification time
+		if !fa.ModTime.Equal(time.Time{}) && !other.ModTime.Equal(time.Time{}) {
+			return fa.ModTime.Equal(other.ModTime)
+		}
 	}
 
 	// compare crc32
@@ -48,6 +50,7 @@ func (fa *FileAttrs) Same(other *FileAttrs) bool {
 	if other.CRC32C <= 0 {
 		other.CRC32C = common.GetFileCRC32C(other.FullPath)
 	}
+	logger.Info("CRC32C checking of [%s] and [%s] are [%d] with [%d].", fa.FullPath, other.FullPath, fa.CRC32C, other.CRC32C)
 	return fa.CRC32C == other.CRC32C
 }
 
