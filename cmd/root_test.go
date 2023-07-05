@@ -8,5 +8,5 @@ import (
 
 func TestMultiThread(t *testing.T) {
 	assert.False(t, enableMultiThread)
-	assert.Equal(t, 256, multiThread)
+	assert.Equal(t, 64, multiThread)
 }
