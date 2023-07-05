@@ -50,7 +50,7 @@ func storageClient() *storage.Client {
 		var err error
 		_client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(path))
 		if err != nil {
-			logger.Warn("get client failed with %s", err)
+			logger.Info("get client failed with %s", err)
 			common.Exit()
 		}
 	})
@@ -93,7 +93,7 @@ func GetObjectsAttributes(bucket, prefix string, recursive bool) []*storage.Obje
 			break
 		}
 		if err != nil {
-			logger.Warn("get objects attributes failed with %s", err)
+			logger.Info("get objects attributes failed with %s", err)
 			common.Exit()
 		}
 		if len(attrs.Name) > 0 && common.IsSubPath(attrs.Name, prefix) {
@@ -150,7 +150,7 @@ func DeleteObject(bucket, prefix string) {
 	client := storageClient()
 	err := client.Bucket(bucket).Object(prefix).Delete(context.Background())
 	if err != nil {
-		logger.Warn("delete object failed with %s", err)
+		logger.Info("delete object failed with %s", err)
 		common.Exit()
 	}
 	logger.Info("Removing bucket[%s] prefix[%s]", bucket, prefix)
@@ -171,7 +171,7 @@ func CopyObject(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 	dst := client.Bucket(dstBucket).Object(dstPrefix)
 	_, err := dst.CopierFrom(src).Run(context.Background())
 	if err != nil {
-		logger.Warn("copy object failed with %s", err)
+		logger.Info("copy object failed with %s", err)
 		common.Exit()
 	}
 	logger.Info(
@@ -237,7 +237,7 @@ func DownloadObjectWithWorkerPool(
 					context.Background(), startByte, length,
 				)
 				if err != nil {
-					logger.Warn("download object failed when create reader with %s", err)
+					logger.Info("download object failed when create reader with %s", err)
 					common.Exit()
 				}
 				defer func() { _ = rc.Close() }()
@@ -246,14 +246,14 @@ func DownloadObjectWithWorkerPool(
 				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
 				_, err = fl.Seek(startByte, 0)
 				if err != nil {
-					logger.Warn("download object failed when seek for offset with %s", err)
+					logger.Info("download object failed when seek for offset with %s", err)
 					common.Exit()
 				}
 				defer func() { _ = fl.Close() }()
 
 				// write data with offset and length to file
 				if _, err := io.Copy(io.MultiWriter(fl, pb), rc); err != nil {
-					logger.Warn("download object failed when write to offet with %s", err)
+					logger.Info("download object failed when write to offet with %s", err)
 					common.Exit()
 				}
 			},
@@ -265,7 +265,7 @@ func DownloadObjectWithWorkerPool(
 		wg.Wait()
 		err := os.Rename(dstFileTemp, dstFile)
 		if err != nil {
-			logger.Warn("download object failed when rename file with %s", err)
+			logger.Info("download object failed when rename file with %s", err)
 			common.Exit()
 		}
 		common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
@@ -296,7 +296,7 @@ func DownloadObject(
 	dstFileTemp := common.GetTempFile(dstFile)
 	f, err := os.Create(dstFileTemp)
 	if err != nil {
-		logger.Warn("download object failed when create file with %s", err)
+		logger.Info("download object failed when create file with %s", err)
 		common.Exit()
 	}
 
@@ -304,7 +304,7 @@ func DownloadObject(
 	client := storageClient()
 	rc, err := client.Bucket(bucket).Object(prefix).NewReader(context.Background())
 	if err != nil {
-		logger.Warn("download object failed with when create reader %s", err)
+		logger.Info("download object failed with when create reader %s", err)
 		common.Exit()
 	}
 	defer func() { _ = rc.Close() }()
@@ -312,14 +312,14 @@ func DownloadObject(
 	// write to file
 	pb := bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
 	if _, err := io.Copy(io.MultiWriter(f, pb), rc); err != nil {
-		logger.Warn("download object failed when write to file with %s", err)
+		logger.Info("download object failed when write to file with %s", err)
 		common.Exit()
 	}
 
 	// move back temp file
 	err = os.Rename(dstFileTemp, dstFile)
 	if err != nil {
-		logger.Warn("download object failed when rename file with %s", err)
+		logger.Info("download object failed when rename file with %s", err)
 		common.Exit()
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
@@ -333,14 +333,14 @@ func AttemptLock(bucket, object string) {
 	o := client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
 	if _, err := wc.Write([]byte("1")); err != nil {
-		logger.Warn("attemp lock failed when write with %s", err)
+		logger.Info("attemp lock failed when write with %s", err)
 		common.Exit()
 	}
 
 	// it is observed that when preconditions (such as DoesNotExist) failed, err will only be thrown at writer close(). so we check and exit here.
 	defer func() {
 		if err := wc.Close(); err != nil {
-			logger.Warn("attemp lock failed when close with %s", err)
+			logger.Info("attemp lock failed when close with %s", err)
 			common.Exit()
 		}
 	}()
@@ -351,7 +351,7 @@ func UploadObject(srcFile, bucket, object string, bars *bar.Container) {
 	// open source file
 	f, err := os.Open(srcFile)
 	if err != nil {
-		logger.Warn("upload object failed when open file with %s", err)
+		logger.Info("upload object failed when open file with %s", err)
 		common.Exit()
 	}
 	defer func() { _ = f.Close() }()
@@ -365,7 +365,7 @@ func UploadObject(srcFile, bucket, object string, bars *bar.Container) {
 	o := client.Bucket(bucket).Object(object)
 	wc := o.NewWriter(context.Background())
 	if _, err = io.Copy(io.MultiWriter(wc, pb), f); err != nil {
-		logger.Warn("upload object failed when copy file with %s", err)
+		logger.Info("upload object failed when copy file with %s", err)
 		common.Exit()
 	}
 	defer func() { _ = wc.Close() }()
@@ -386,7 +386,7 @@ func OutputObject(bucket, prefix string) []byte {
 	client := storageClient()
 	rc, err := client.Bucket(bucket).Object(prefix).NewReader(context.Background())
 	if err != nil {
-		logger.Warn("output object failed when create reader with %s", err)
+		logger.Info("output object failed when create reader with %s", err)
 		common.Exit()
 	}
 	defer func() { _ = rc.Close() }()
@@ -395,7 +395,7 @@ func OutputObject(bucket, prefix string) []byte {
 	buf := new(bytes.Buffer)
 	_, err = buf.ReadFrom(rc)
 	if err != nil {
-		logger.Warn("output object failed when write to buffer with %s", err)
+		logger.Info("output object failed when write to buffer with %s", err)
 		common.Exit()
 	}
 	bs := buf.Bytes()
@@ -478,7 +478,7 @@ func MustEqualCRC32C(flag bool, localPath, bucket, object string) {
 		return
 	}
 	if !equalCRC32C(localPath, bucket, object) {
-		logger.Warn("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+		logger.Info("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 		common.Exit()
 	}
 	logger.Info("CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
