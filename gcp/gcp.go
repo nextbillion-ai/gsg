@@ -326,7 +326,7 @@ func DownloadObject(
 	MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 }
 
-// AttempLock attempts to write a remote lock file
+// AttemptLock attempts to write a remote lock file
 func AttemptLock(bucket, object string) {
 	// write lock
 	client := storageClient()
