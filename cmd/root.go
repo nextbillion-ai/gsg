@@ -25,7 +25,7 @@ func init() {
 		"enabel concurrency of execution workers",
 	)
 	rootCmd.PersistentFlags().IntVarP(
-		&multiThread, "c", "c", 256,
+		&multiThread, "c", "c", 64,
 		"set concurrency of execution workers, limit from 1 to 1000",
 	)
 	rootCmd.PersistentFlags().Bool(

@@ -2,10 +2,6 @@
 
 This is a tool for operating objects on gcs with command line mode.
 
--Cli app could found on gcs:
-` gs://static.nextbillion.io/gsg/latest`
-` gs://static.nextbillion.io/gsg/{version}`
-
 -For accessing gcp need to set an env pointing to google credential json file:
 `GOOGLE_APPLICATION_CREDENTIALS`
 
