@@ -1,10 +1,14 @@
 package common
 
 import (
+	"bytes"
 	"crypto/md5"
+	"encoding/binary"
+	"fmt"
 	"gsutil-go/logger"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,10 +97,22 @@ func GetFileSize(path string) int64 {
 	return fi.Size()
 }
 
-// GetFileCRC32C gets the crc32c of a file
-func GetFileCRC32C(path string) uint32 {
-	if IsPathDirectory(path) {
-		return 0
+func readOrComputeCRC32c(path string) uint32 {
+	result := uint32(0)
+	var buf bytes.Buffer
+	buf.WriteString(path)
+	buf.WriteString("-")
+	buf.WriteString(GetFileModificationTime(path).String())
+	buf.WriteString("-crc32c")
+	bufStr := string(buf.Bytes())
+	logger.Debug("cacheFilePathStr: %s", bufStr)
+	cacheFileName := fmt.Sprintf("/tmp/%x", md5.Sum([]byte(bufStr)))
+
+	b, e := os.ReadFile(cacheFileName)
+	if e == nil {
+		result = binary.LittleEndian.Uint32(b)
+		logger.Debug("loaded crc32c [%s] from catch: %d", cacheFileName, result)
+		return result
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -109,9 +125,26 @@ func GetFileCRC32C(path string) uint32 {
 	_, err = io.Copy(h32, file)
 	if err != nil {
 		logger.Debug("failed with %s", err)
+	}
+	result = h32.Sum32()
+	crcBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(crcBytes, result)
+	err = os.WriteFile(cacheFileName, crcBytes, fs.ModePerm)
+	if err != nil {
+		logger.Debug("write crc32c cachefile failed with %s", err)
+	} else {
+		logger.Debug("wrote crc32c cachefile : %s", cacheFileName)
+	}
+	return result
+}
+
+// GetFileCRC32C gets the crc32c of a file
+func GetFileCRC32C(path string) uint32 {
+	path, _ = filepath.Abs(path)
+	if IsPathDirectory(path) {
 		return 0
 	}
-	return h32.Sum32()
+	return readOrComputeCRC32c(path)
 }
 
 // GetFileMD5 gets the md5 of a file
