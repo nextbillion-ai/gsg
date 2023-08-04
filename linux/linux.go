@@ -4,6 +4,7 @@ import (
 	"gsutil-go/common"
 	"gsutil-go/logger"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -56,12 +57,12 @@ func (fa *FileAttrs) Same(other *FileAttrs, forceChecksum bool) bool {
 
 // GetRealPath gets real path of a directory
 func GetRealPath(dir string) string {
-	stdout, err := exec.Command("realpath", dir).Output()
-	if err != nil {
-		logger.Debug("failed with %s", err)
+	r, e := filepath.Abs(dir)
+	if e != nil {
+		logger.Debug("GetRealPath failed:  %s", e)
 		return ""
 	}
-	return strings.Trim(string(stdout), " \t\n")
+	return r
 }
 
 // GetObjectAttributes gets attributes of a file
