@@ -340,7 +340,9 @@ func AttemptUnLock(bucket, object string) {
 	o := client.Bucket(bucket).Object(object)
 	//delete fails means other client has acquired lock
 	logger.Debug("unlock with generation:%d", generation)
-	_ = o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background())
+	if e1 := o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background()); e1 != nil {
+		logger.Debug("unlock error: %+v", e1)
+	}
 }
 
 // AttemptLock attempts to write a remote lock file
