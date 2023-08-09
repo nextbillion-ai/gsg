@@ -3,6 +3,7 @@ package gcp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"gsutil-go/bar"
 	"gsutil-go/common"
@@ -326,24 +327,71 @@ func DownloadObject(
 	MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 }
 
+// AttemptUnLock attempts to release a remote lock file
+func AttemptUnLock(bucket, object string) {
+	cacheFileName := common.GenTempFileName(bucket, "/", object)
+	generationBytes, e := os.ReadFile(cacheFileName)
+	generation := binary.LittleEndian.Uint64(generationBytes)
+	if e != nil {
+		logger.Debug("failed to read lock cache: %+v", cacheFileName)
+		common.Finish()
+	}
+	client := storageClient()
+	o := client.Bucket(bucket).Object(object)
+	//delete fails means other client has acquired lock
+	logger.Debug("unlock with generation:%d", generation)
+	_ = o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background())
+}
+
 // AttemptLock attempts to write a remote lock file
-func AttemptLock(bucket, object string) {
+func AttemptLock(bucket, object string, ttl time.Duration) {
 	// write lock
 	client := storageClient()
 	o := client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-	if _, err := wc.Write([]byte("1")); err != nil {
-		logger.Info("attemp lock failed when write with %s", err)
-		common.Exit()
+	var e0 error
+	wc.Write([]byte("1"))
+	if e0 = wc.Close(); e0 != nil {
+		//upon failure, get object metadata
+		attrs, e1 := o.Attrs(context.Background())
+		logger.Debug("expire: %+v, current: %+v, ttl:%+v", attrs.CustomTime, time.Now(), ttl)
+		if e1 == nil {
+			if attrs.CustomTime.Before(time.Now()) {
+				logger.Debug("expired. delete and try lock again")
+				_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
+				//try acquire lock again
+				wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
+				wc.Write([]byte("1"))
+				if e2 := wc.Close(); e2 != nil {
+					logger.Info("attemp lock failed: %s", e2)
+					common.Exit()
+				}
+			} else {
+				//lock acquire failure, quit with error
+				logger.Info("attemp lock failed: %s", e0)
+				common.Exit()
+			}
+		}
 	}
-
-	// it is observed that when preconditions (such as DoesNotExist) failed, err will only be thrown at writer close(). so we check and exit here.
-	defer func() {
-		if err := wc.Close(); err != nil {
-			logger.Info("attemp lock failed when close with %s", err)
+	//upon sucessful write, store generation in /tmp
+	logger.Debug("lock acquired. updating ttl")
+	if attrs, e3 := o.Attrs(context.Background()); e3 == nil {
+		logger.Debug("storing generation: %+v", attrs.Generation)
+		cacheFileName := common.GenTempFileName(bucket, "/", object)
+		generationBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(generationBytes, uint64(attrs.Generation))
+		if e4 := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); e4 != nil {
+			logger.Info("cache lock generation failed: %s", e4)
 			common.Exit()
 		}
-	}()
+	}
+
+	//upon sucessful write, store ttl in CustomTime metadata
+	logger.Debug("lock acquired. updating ttl")
+	if _, e3 := o.Update(context.Background(), storage.ObjectAttrsToUpdate{CustomTime: time.Now().Add(ttl)}); e3 != nil {
+		logger.Info("store ttl failed: %s", e3)
+		common.Exit()
+	}
 }
 
 // UploadObject uploads an object from a file
