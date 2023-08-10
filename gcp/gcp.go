@@ -357,16 +357,15 @@ func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 	client := storageClient()
 	o := client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-	var e0 error
 	wc.Write([]byte("1"))
-	if e0 = wc.Close(); e0 != nil {
-		//upon failure, get object metadata
-		attrs, e1 := o.Attrs(context.Background())
-		if e1 != nil {
-			return 0, e1
-		}
-		//logger.Debug("DoAttemptLock expire: %+v, current: %+v, ttl:%+v", attrs.CustomTime, time.Now(), ttl)
-		if attrs.CustomTime.Before(time.Now()) {
+	e0 := wc.Close()
+	attrs, e1 := o.Attrs(context.Background())
+	if e1 != nil {
+		return 0, e1
+	}
+	if e0 != nil {
+		//logger.Debug("DoAttemptLock expire: %+v, current: %+v, ttl:%+v", attrs.Updated, time.Now(), ttl)
+		if attrs.Updated.Add(ttl).Before(time.Now()) {
 			//logger.Debug("DoAttemptLock expired. delete and try lock again")
 			_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
 			//try acquire lock again
@@ -380,18 +379,8 @@ func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 			return 0, e0
 		}
 	}
-	//upon sucessful write, store ttl in CustomTime metadata
-	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
-	if _, e3 := o.Update(context.Background(), storage.ObjectAttrsToUpdate{CustomTime: time.Now().Add(ttl)}); e3 != nil {
-		return 0, e3
-	}
 	//upon sucessful write, store generation in /tmp
 	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
-	attrs, e4 := o.Attrs(context.Background())
-	if e4 != nil {
-		return 0, e4
-		//logger.Debug("DoAttempLock storing generation: %+v", attrs.Generation)
-	}
 	return attrs.Generation, nil
 
 }
