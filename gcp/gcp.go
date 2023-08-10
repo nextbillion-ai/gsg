@@ -327,6 +327,15 @@ func DownloadObject(
 	MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 }
 
+// DoAttemptUnlock takes generation as input and returns potential error
+func DoAttemptUnlock(bucket, object string, generation int64) error {
+	client := storageClient()
+	o := client.Bucket(bucket).Object(object)
+	//delete fails means other client has acquired lock
+	logger.Debug("DoAttemptUnlock: unlock with generation:%d", generation)
+	return o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background())
+}
+
 // AttemptUnLock attempts to release a remote lock file
 func AttemptUnLock(bucket, object string) {
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
@@ -336,17 +345,14 @@ func AttemptUnLock(bucket, object string) {
 		logger.Debug("failed to read lock cache: %+v", cacheFileName)
 		common.Finish()
 	}
-	client := storageClient()
-	o := client.Bucket(bucket).Object(object)
-	//delete fails means other client has acquired lock
-	logger.Debug("unlock with generation:%d", generation)
-	if e1 := o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background()); e1 != nil {
-		logger.Debug("unlock error: %+v", e1)
+	if e := DoAttemptUnlock(bucket, object, int64(generation)); e != nil {
+		logger.Debug("unlock error: %+v", e)
+		common.Finish()
 	}
 }
 
-// AttemptLock attempts to write a remote lock file
-func AttemptLock(bucket, object string, ttl time.Duration) {
+// DoAttemptLock returns generation and potential error
+func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 	// write lock
 	client := storageClient()
 	o := client.Bucket(bucket).Object(object)
@@ -356,42 +362,55 @@ func AttemptLock(bucket, object string, ttl time.Duration) {
 	if e0 = wc.Close(); e0 != nil {
 		//upon failure, get object metadata
 		attrs, e1 := o.Attrs(context.Background())
-		logger.Debug("expire: %+v, current: %+v, ttl:%+v", attrs.CustomTime, time.Now(), ttl)
-		if e1 == nil {
-			if attrs.CustomTime.Before(time.Now()) {
-				logger.Debug("expired. delete and try lock again")
-				_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
-				//try acquire lock again
-				wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-				wc.Write([]byte("1"))
-				if e2 := wc.Close(); e2 != nil {
-					logger.Info("attemp lock failed: %s", e2)
-					common.Exit()
-				}
-			} else {
-				//lock acquire failure, quit with error
-				logger.Info("attemp lock failed: %s", e0)
-				common.Exit()
-			}
+		if e1 != nil {
+			return 0, e1
 		}
+		//logger.Debug("DoAttemptLock expire: %+v, current: %+v, ttl:%+v", attrs.CustomTime, time.Now(), ttl)
+		if attrs.CustomTime.Before(time.Now()) {
+			//logger.Debug("DoAttemptLock expired. delete and try lock again")
+			_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
+			//try acquire lock again
+			wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
+			wc.Write([]byte("1"))
+			if e2 := wc.Close(); e2 != nil {
+				return 0, e2
+			}
+		} else {
+			//lock acquire failure, quit with error
+			return 0, e0
+		}
+	}
+	//upon sucessful write, store ttl in CustomTime metadata
+	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
+	if _, e3 := o.Update(context.Background(), storage.ObjectAttrsToUpdate{CustomTime: time.Now().Add(ttl)}); e3 != nil {
+		return 0, e3
 	}
 	//upon sucessful write, store generation in /tmp
-	logger.Debug("lock acquired. updating ttl")
-	if attrs, e3 := o.Attrs(context.Background()); e3 == nil {
-		logger.Debug("storing generation: %+v", attrs.Generation)
-		cacheFileName := common.GenTempFileName(bucket, "/", object)
-		generationBytes := make([]byte, 8)
-		binary.LittleEndian.PutUint64(generationBytes, uint64(attrs.Generation))
-		if e4 := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); e4 != nil {
-			logger.Info("cache lock generation failed: %s", e4)
-			common.Exit()
-		}
+	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
+	attrs, e4 := o.Attrs(context.Background())
+	if e4 != nil {
+		return 0, e4
+		//logger.Debug("DoAttempLock storing generation: %+v", attrs.Generation)
+	}
+	return attrs.Generation, nil
+
+}
+
+// AttemptLock attempts to write a remote lock file
+func AttemptLock(bucket, object string, ttl time.Duration) {
+	generation, e := DoAttemptLock(bucket, object, ttl)
+	if e != nil {
+		logger.Info("attemp lock failed: %s", e)
+		common.Exit()
 	}
 
-	//upon sucessful write, store ttl in CustomTime metadata
-	logger.Debug("lock acquired. updating ttl")
-	if _, e3 := o.Update(context.Background(), storage.ObjectAttrsToUpdate{CustomTime: time.Now().Add(ttl)}); e3 != nil {
-		logger.Info("store ttl failed: %s", e3)
+	//upon sucessful write, store generation in /tmp
+	logger.Debug("AttemptLock: storing generation: %+v", generation)
+	cacheFileName := common.GenTempFileName(bucket, "/", object)
+	generationBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(generationBytes, uint64(generation))
+	if e1 := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); e1 != nil {
+		logger.Info("AttemptLock: cache lock generation failed: %s", e1)
 		common.Exit()
 	}
 }
