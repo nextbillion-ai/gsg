@@ -1,9 +1,9 @@
 package cmd
 
 import (
-	"gsutil-go/common"
-	"gsutil-go/gcp"
-	"gsutil-go/logger"
+	"gsg/common"
+	"gsg/gcp"
+	"gsg/logger"
 	"strconv"
 	"time"
 

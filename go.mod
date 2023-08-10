@@ -1,4 +1,4 @@
-module gsutil-go
+module gsg
 
 go 1.18
 

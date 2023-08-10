@@ -1,7 +1,7 @@
 package main
 
 import (
-	"gsutil-go/cmd"
+	"gsg/cmd"
 )
 
 func main() {

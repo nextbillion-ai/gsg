@@ -1,8 +1,8 @@
 package worker
 
 import (
-	"gsutil-go/common"
-	"gsutil-go/logger"
+	"gsg/common"
+	"gsg/logger"
 	"sync"
 	"time"
 )

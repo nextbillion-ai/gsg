@@ -1,10 +1,10 @@
 package cmd
 
 import (
-	"gsutil-go/common"
-	"gsutil-go/gcp"
-	"gsutil-go/linux"
-	"gsutil-go/logger"
+	"gsg/common"
+	"gsg/gcp"
+	"gsg/linux"
+	"gsg/logger"
 	"strconv"
 	"strings"
 

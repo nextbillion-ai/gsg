@@ -2,9 +2,9 @@ package cmd
 
 import (
 	"encoding/base64"
-	"gsutil-go/common"
-	"gsutil-go/gcp"
-	"gsutil-go/logger"
+	"gsg/common"
+	"gsg/gcp"
+	"gsg/logger"
 
 	"github.com/spf13/cobra"
 )

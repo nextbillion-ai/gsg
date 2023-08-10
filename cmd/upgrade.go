@@ -2,10 +2,10 @@ package cmd
 
 import (
 	"fmt"
-	"gsutil-go/common"
-	"gsutil-go/gcp"
-	"gsutil-go/linux"
-	"gsutil-go/logger"
+	"gsg/common"
+	"gsg/gcp"
+	"gsg/linux"
+	"gsg/logger"
 	"runtime"
 
 	"github.com/spf13/cobra"
