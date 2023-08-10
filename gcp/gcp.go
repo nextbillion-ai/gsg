@@ -3,6 +3,7 @@ package gcp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"gsutil-go/bar"
 	"gsutil-go/common"
@@ -326,24 +327,92 @@ func DownloadObject(
 	MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 }
 
-// AttemptLock attempts to write a remote lock file
-func AttemptLock(bucket, object string) {
+// DoAttemptUnlock takes generation as input and returns potential error
+func DoAttemptUnlock(bucket, object string, generation int64) error {
+	client := storageClient()
+	o := client.Bucket(bucket).Object(object)
+	//delete fails means other client has acquired lock
+	logger.Debug("DoAttemptUnlock: unlock with generation:%d", generation)
+	return o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background())
+}
+
+// AttemptUnLock attempts to release a remote lock file
+func AttemptUnLock(bucket, object string) {
+	cacheFileName := common.GenTempFileName(bucket, "/", object)
+	generationBytes, e := os.ReadFile(cacheFileName)
+	if e != nil {
+		logger.Debug("failed to read lock cache: %+v", cacheFileName)
+		common.Finish()
+	}
+	generation := binary.LittleEndian.Uint64(generationBytes)
+	if e := DoAttemptUnlock(bucket, object, int64(generation)); e != nil {
+		logger.Debug("unlock error: %+v", e)
+		common.Finish()
+	}
+}
+
+// DoAttemptLock returns generation and potential error
+func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 	// write lock
 	client := storageClient()
 	o := client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-	if _, err := wc.Write([]byte("1")); err != nil {
-		logger.Info("attemp lock failed when write with %s", err)
+	var e0 error
+	wc.Write([]byte("1"))
+	if e0 = wc.Close(); e0 != nil {
+		//upon failure, get object metadata
+		attrs, e1 := o.Attrs(context.Background())
+		if e1 != nil {
+			return 0, e1
+		}
+		//logger.Debug("DoAttemptLock expire: %+v, current: %+v, ttl:%+v", attrs.CustomTime, time.Now(), ttl)
+		if attrs.CustomTime.Before(time.Now()) {
+			//logger.Debug("DoAttemptLock expired. delete and try lock again")
+			_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
+			//try acquire lock again
+			wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
+			wc.Write([]byte("1"))
+			if e2 := wc.Close(); e2 != nil {
+				return 0, e2
+			}
+		} else {
+			//lock acquire failure, quit with error
+			return 0, e0
+		}
+	}
+	//upon sucessful write, store ttl in CustomTime metadata
+	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
+	if _, e3 := o.Update(context.Background(), storage.ObjectAttrsToUpdate{CustomTime: time.Now().Add(ttl)}); e3 != nil {
+		return 0, e3
+	}
+	//upon sucessful write, store generation in /tmp
+	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
+	attrs, e4 := o.Attrs(context.Background())
+	if e4 != nil {
+		return 0, e4
+		//logger.Debug("DoAttempLock storing generation: %+v", attrs.Generation)
+	}
+	return attrs.Generation, nil
+
+}
+
+// AttemptLock attempts to write a remote lock file
+func AttemptLock(bucket, object string, ttl time.Duration) {
+	generation, e := DoAttemptLock(bucket, object, ttl)
+	if e != nil {
+		logger.Info("attemp lock failed: %s", e)
 		common.Exit()
 	}
 
-	// it is observed that when preconditions (such as DoesNotExist) failed, err will only be thrown at writer close(). so we check and exit here.
-	defer func() {
-		if err := wc.Close(); err != nil {
-			logger.Info("attemp lock failed when close with %s", err)
-			common.Exit()
-		}
-	}()
+	//upon sucessful write, store generation in /tmp
+	logger.Debug("AttemptLock: storing generation: %+v", generation)
+	cacheFileName := common.GenTempFileName(bucket, "/", object)
+	generationBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(generationBytes, uint64(generation))
+	if e1 := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); e1 != nil {
+		logger.Info("AttemptLock: cache lock generation failed: %s", e1)
+		common.Exit()
+	}
 }
 
 // UploadObject uploads an object from a file

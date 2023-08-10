@@ -100,6 +100,7 @@ func Execute() error {
 	err := rootCmd.Execute()
 	if err != nil {
 		logger.Debug("failed with err %s", err)
+		common.Exit()
 	}
 
 	pool.Close()

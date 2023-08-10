@@ -96,17 +96,19 @@ func GetFileSize(path string) int64 {
 	}
 	return fi.Size()
 }
+// GenTempFileName generate /tmp/%x files where %x is md5 value of all parts concate together
+func GenTempFileName(parts ...string) string {
+	var buf bytes.Buffer
+	for _, part := range parts {
+		buf.WriteString(part)
+	}
+	return fmt.Sprintf("/tmp/%x", md5.Sum(buf.Bytes()))
+
+}
 
 func readOrComputeCRC32c(path string) uint32 {
 	result := uint32(0)
-	var buf bytes.Buffer
-	buf.WriteString(path)
-	buf.WriteString("-")
-	buf.WriteString(GetFileModificationTime(path).String())
-	buf.WriteString("-crc32c")
-	bufStr := string(buf.Bytes())
-	logger.Debug("cacheFilePathStr: %s", bufStr)
-	cacheFileName := fmt.Sprintf("/tmp/%x", md5.Sum([]byte(bufStr)))
+	cacheFileName := GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
 
 	b, e := os.ReadFile(cacheFileName)
 	if e == nil {
