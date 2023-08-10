@@ -2,9 +2,10 @@ package cmd
 
 import (
 	"encoding/base64"
-	"gsg/common"
-	"gsg/gcp"
-	"gsg/logger"
+
+	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/gcp"
+	"github.com/nextbillion-ai/gsg/logger"
 
 	"github.com/spf13/cobra"
 )

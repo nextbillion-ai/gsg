@@ -1,4 +1,4 @@
-module gsg
+module github.com/nextbillion-ai/gsg
 
 go 1.18
 

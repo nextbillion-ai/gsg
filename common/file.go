@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
-	"gsg/logger"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -13,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 const (

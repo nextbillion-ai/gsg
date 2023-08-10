@@ -1,12 +1,13 @@
 package linux
 
 import (
-	"gsg/common"
-	"gsg/logger"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 // FileAttrs holds attributes of a file

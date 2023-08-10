@@ -1,9 +1,10 @@
 package common
 
 import (
-	"gsg/logger"
 	"strconv"
 	"strings"
+
+	"github.com/nextbillion-ai/gsg/logger"
 
 	"code.cloudfoundry.org/bytefmt"
 )

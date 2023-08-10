@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"gsg/logger"
+	"github.com/nextbillion-ai/gsg/logger"
 
 	"github.com/spf13/cobra"
 )
@@ -17,6 +17,6 @@ var versionCmd = &cobra.Command{
 	Short: "Print the version number of gsg",
 	Long:  "Print the version number of gsg",
 	Run: func(_ *cobra.Command, _ []string) {
-		logger.Info("gsg version %s", version)
+		logger.Info("github.com/nextbillion-ai/gsg version %s", version)
 	},
 }
