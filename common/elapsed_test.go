@@ -1,9 +1,10 @@
 package common
 
 import (
-	"gsg/logger"
 	"testing"
 	"time"
+
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 func TestElapsed(t *testing.T) {

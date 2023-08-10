@@ -1,9 +1,10 @@
 package common
 
 import (
-	"gsg/logger"
 	"os"
 	"runtime/debug"
+
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 // Recovery recovers from exceptions

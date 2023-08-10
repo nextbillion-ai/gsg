@@ -1,8 +1,9 @@
 package common
 
 import (
-	"gsg/logger"
 	"time"
+
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 // Elapsed gets time elapsed

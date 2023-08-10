@@ -1,10 +1,11 @@
 package worker
 
 import (
-	"gsg/common"
-	"gsg/logger"
 	"sync"
 	"time"
+
+	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 // Pool is the worker pool

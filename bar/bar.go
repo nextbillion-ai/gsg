@@ -2,13 +2,14 @@ package bar
 
 import (
 	"fmt"
-	"gsg/logger"
 	"math"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nextbillion-ai/gsg/logger"
 
 	"github.com/sethgrid/curse"
 	"golang.org/x/sys/unix"

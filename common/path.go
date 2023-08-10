@@ -1,10 +1,11 @@
 package common
 
 import (
-	"gsg/logger"
 	"net/url"
 	"path/filepath"
 	"strings"
+
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 // ParseURL parses url into scheme, bucket, prefix

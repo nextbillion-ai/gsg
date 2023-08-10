@@ -1,7 +1,7 @@
 package main
 
 import (
-	"gsg/cmd"
+	"github.com/nextbillion-ai/gsg/cmd"
 )
 
 func main() {

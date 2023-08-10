@@ -1,12 +1,13 @@
 package cmd
 
 import (
-	"gsg/common"
-	"gsg/gcp"
-	"gsg/linux"
-	"gsg/logger"
 	"strconv"
 	"strings"
+
+	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/gcp"
+	"github.com/nextbillion-ai/gsg/linux"
+	"github.com/nextbillion-ai/gsg/logger"
 
 	"github.com/spf13/cobra"
 )
