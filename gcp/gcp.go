@@ -340,11 +340,11 @@ func DoAttemptUnlock(bucket, object string, generation int64) error {
 func AttemptUnLock(bucket, object string) {
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
 	generationBytes, e := os.ReadFile(cacheFileName)
-	generation := binary.LittleEndian.Uint64(generationBytes)
 	if e != nil {
 		logger.Debug("failed to read lock cache: %+v", cacheFileName)
 		common.Finish()
 	}
+	generation := binary.LittleEndian.Uint64(generationBytes)
 	if e := DoAttemptUnlock(bucket, object, int64(generation)); e != nil {
 		logger.Debug("unlock error: %+v", e)
 		common.Finish()
