@@ -2,7 +2,7 @@ package bar
 
 import (
 	"fmt"
-	"gsutil-go/logger"
+	"gsg/logger"
 	"math"
 	"os"
 	"strconv"

@@ -5,7 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
-	"gsutil-go/logger"
+	"gsg/logger"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -96,6 +96,7 @@ func GetFileSize(path string) int64 {
 	}
 	return fi.Size()
 }
+
 // GenTempFileName generate /tmp/%x files where %x is md5 value of all parts concate together
 func GenTempFileName(parts ...string) string {
 	var buf bytes.Buffer

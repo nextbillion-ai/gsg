@@ -1,8 +1,8 @@
 package linux
 
 import (
-	"gsutil-go/common"
-	"gsutil-go/logger"
+	"gsg/common"
+	"gsg/logger"
 	"os/exec"
 	"path/filepath"
 	"strings"

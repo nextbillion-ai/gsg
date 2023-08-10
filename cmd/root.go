@@ -1,10 +1,10 @@
 package cmd
 
 import (
-	"gsutil-go/bar"
-	"gsutil-go/common"
-	"gsutil-go/logger"
-	"gsutil-go/worker"
+	"gsg/bar"
+	"gsg/common"
+	"gsg/logger"
+	"gsg/worker"
 	"os"
 	"time"
 

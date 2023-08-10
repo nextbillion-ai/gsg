@@ -1,7 +1,7 @@
 package common
 
 import (
-	"gsutil-go/logger"
+	"gsg/logger"
 	"strconv"
 	"strings"
 

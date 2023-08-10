@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"gsutil-go/logger"
+	"gsg/logger"
 
 	"github.com/spf13/cobra"
 )
