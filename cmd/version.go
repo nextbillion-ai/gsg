@@ -17,6 +17,6 @@ var versionCmd = &cobra.Command{
 	Short: "Print the version number of gsg",
 	Long:  "Print the version number of gsg",
 	Run: func(_ *cobra.Command, _ []string) {
-		logger.Info("github.com/nextbillion-ai/gsg version %s", version)
+		logger.Info("gsg version %s", version)
 	},
 }
