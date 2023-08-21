@@ -358,7 +358,7 @@ func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 	client := storageClient()
 	o := client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-	wc.Write([]byte("1"))
+	_, _ = wc.Write([]byte("1"))
 	e0 := wc.Close()
 	attrs, e1 := o.Attrs(context.Background())
 	if e1 != nil {
@@ -371,7 +371,7 @@ func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 			_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
 			//try acquire lock again
 			wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-			wc.Write([]byte("1"))
+			_, _ = wc.Write([]byte("1"))
 			if e2 := wc.Close(); e2 != nil {
 				return 0, e2
 			}

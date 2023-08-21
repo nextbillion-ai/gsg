@@ -16,6 +16,7 @@ func Recovery() {
 	}
 }
 
+// Finish exits the program with zero status code
 func Finish() {
 	os.Exit(0)
 }
