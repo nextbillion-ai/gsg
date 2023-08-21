@@ -417,12 +417,16 @@ func UploadObject(srcFile, bucket, object string, bars *bar.Container) {
 
 	// progress bar
 	size := common.GetFileSize(srcFile)
+	modTime := common.GetFileModificationTime(srcFile)
 	pb := bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
 
 	// upload file
 	client := storageClient()
 	o := client.Bucket(bucket).Object(object)
 	wc := o.NewWriter(context.Background())
+	wc.Metadata = map[string]string{
+		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
+	}
 	if _, err = io.Copy(io.MultiWriter(wc, pb), f); err != nil {
 		logger.Info("upload object failed when copy file with %s", err)
 		common.Exit()
@@ -500,7 +504,7 @@ func ParseFileModificationTimeMetadata(attrs *storage.ObjectAttrs) time.Time {
 			if err != nil {
 				return time.Time{}
 			}
-			return time.Unix(ts, 0)
+			return time.Unix(0, ts)
 		}
 	}
 	return time.Time{}

@@ -29,6 +29,7 @@ var hashCmd = &cobra.Command{
 				common.Exit()
 			}
 			logger.Info("%-20s%d", "Hash (CRC32C):", attrs.CRC32C)
+			logger.Info("%-20s%s", "ModTime:", gcp.GetFileModificationTime(attrs).UTC().String())
 		case "":
 			attrs := linux.GetObjectAttributes(prefix)
 			if attrs == nil {
@@ -36,6 +37,7 @@ var hashCmd = &cobra.Command{
 				common.Exit()
 			}
 			logger.Info("%-20s%d", "Hash (CRC32C):", attrs.CRC32C)
+			logger.Info("%-20s%s", "ModTime:", attrs.ModTime.UTC().String())
 		default:
 			logger.Info("Not supported yet")
 		}
