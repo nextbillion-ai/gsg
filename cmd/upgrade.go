@@ -15,7 +15,7 @@ import (
 const (
 	upgradeBucket   = "static.nextbillion.io"
 	upgradePrefix   = "tools/gsg"
-	upgradeName     = "github.com/nextbillion-ai/gsg"
+	upgradeName     = "gsg"
 	upgradeVersions = "latest"
 )
 

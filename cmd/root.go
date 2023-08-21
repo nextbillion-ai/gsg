@@ -56,7 +56,7 @@ func getMultiThread() int {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "github.com/nextbillion-ai/gsg",
+	Use:   "gsg",
 	Short: "A Golang application that lets you access Cloud Storage from the command line.",
 	Long: `You can use gsg (Gsutil Go) to do a wide range of bucket and object management tasks, including:
 - Calculating hash value of objects.
