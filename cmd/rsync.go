@@ -34,6 +34,7 @@ var rsyncCmd = &cobra.Command{
 		switch srcScheme + "-" + dstScheme {
 		case "gs-":
 			if gcp.IsDirectory(srcBucket, srcPrefix) {
+				deleteTempFiles(dstPrefix, isRec)
 				srcAttrs := gcpAttrsToLinuxAttrs(srcPrefix, gcp.GetObjectsAttributes(srcBucket, srcPrefix, isRec))
 				dstAttrs := linux.GetObjectsAttributes(dstPrefix, isRec)
 				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
@@ -178,4 +179,11 @@ func getCopyAndDeleteLists(
 		}
 	}
 	return
+}
+
+func deleteTempFiles(dir string, isRec bool) {
+	objs := linux.ListTempFiles(dir, isRec)
+	for _, obj := range objs {
+		linux.DeleteObject(obj)
+	}
 }
