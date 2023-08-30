@@ -127,6 +127,31 @@ func ListObjects(dir string, isRec bool) []string {
 	return objs
 }
 
+// ListTempFiles lists objects under a prefix
+func ListTempFiles(dir string, isRec bool) []string {
+	dir = GetRealPath(dir)
+	var stdout []byte
+	var err error
+	if isRec {
+		stdout, err = exec.Command("find", dir, "-type", "f").Output()
+	} else {
+		stdout, err = exec.Command("find", dir, "-type", "f", "-maxdepth", "1").Output()
+	}
+	if err != nil {
+		logger.Debug("failed with %s", err)
+		return []string{}
+	}
+	res := strings.Split(string(stdout), "\n")
+	objs := []string{}
+	for _, v := range res {
+		v = strings.Trim(v, " \t\n")
+		if len(v) > 0 && common.IsTempFile(v) {
+			objs = append(objs, v)
+		}
+	}
+	return objs
+}
+
 // GetDiskUsageObjects gets disk usage of objects under a prefix
 func GetDiskUsageObjects(dir string) []string {
 	dir = GetRealPath(dir)
