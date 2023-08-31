@@ -15,6 +15,7 @@ import (
 var (
 	debugging         bool
 	enableMultiThread bool
+	mockFail          bool
 	multiThread       int
 	bars              *bar.Container
 	pool              *worker.Pool
@@ -32,6 +33,10 @@ func init() {
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
 		"enable debugging mode to print more logs",
+	)
+	rootCmd.PersistentFlags().Bool(
+		"mock-fail", false,
+		"enable mocking mode to fail all operations",
 	)
 	rootCmd.PersistentFlags().BoolVar(
 		&bar.Pretty, "pretty", false,
@@ -76,6 +81,9 @@ func initFlags() {
 			debugging = true
 			logger.Debugging = true
 		}
+		if v == "--mock-fail" {
+			mockFail = true
+		}
 	}
 }
 
@@ -94,9 +102,13 @@ func Execute() error {
 	pool.Run()
 
 	logger.Debug(
-		"enableMultiThread=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d",
-		enableMultiThread, multiThread, selectedMultiThread, screenCols, screenLines,
+		"enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d",
+		enableMultiThread, mockFail, multiThread, selectedMultiThread, screenCols, screenLines,
 	)
+
+	if mockFail {
+		common.Exit()
+	}
 
 	err := rootCmd.Execute()
 	if err != nil {
