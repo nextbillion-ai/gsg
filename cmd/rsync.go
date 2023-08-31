@@ -14,6 +14,7 @@ func init() {
 	rsyncCmd.Flags().BoolP("r", "r", false, "rsync an entire directory tree")
 	rsyncCmd.Flags().BoolP("d", "d", false, "delete objects if not exists")
 	rsyncCmd.Flags().BoolP("v", "v", false, "force checksum after command operated, raise error if failed")
+	rsyncCmd.Flags().BoolP("z", "z", false, "proactively fail with nonzero exit status for debugging")
 	rootCmd.AddCommand(rsyncCmd)
 }
 
@@ -23,6 +24,10 @@ var rsyncCmd = &cobra.Command{
 	Long:  "Rsync files and objects to destination",
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
+		isFail, _ := cmd.Flags().GetBool("z")
+		if isFail {
+			common.Exit()
+		}
 		isRec, _ := cmd.Flags().GetBool("r")
 		isDel, _ := cmd.Flags().GetBool("d")
 		forceChecksum, _ := cmd.Flags().GetBool("v")
