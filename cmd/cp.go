@@ -84,7 +84,6 @@ func cloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
 			dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
 			pool.Add(func() { src.System.Copy(src.Bucket, obj.Prefix, dst.Bucket, dstPath) })
 		}
-		break
 	case system.FileType_Object:
 		dstPrefix := dst.Prefix
 		if dst.FileType() == system.FileType_Directory {
@@ -92,11 +91,9 @@ func cloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
 			dstPrefix = common.JoinPath(dst.Prefix, name)
 		}
 		pool.Add(func() { src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dstPrefix) })
-		break
 	case system.FileType_Invalid:
 		logger.Info(module, "Invalid bucket[%s] with prefix[%s]", src.Bucket, src.Prefix)
 		common.Exit()
-		break
 	}
 }
 
