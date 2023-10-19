@@ -18,7 +18,7 @@ func ToByteSize(s string) string {
 	s = strings.ToUpper(s)
 	b, err := bytefmt.ToBytes(s)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return s
 	}
 	return strconv.FormatUint(b, 10)
@@ -28,7 +28,7 @@ func ToByteSize(s string) string {
 func FromByteSize(s string) string {
 	b, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return s
 	}
 	return bytefmt.ByteSize(uint64(b))

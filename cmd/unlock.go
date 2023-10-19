@@ -2,8 +2,9 @@ package cmd
 
 import (
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
+	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -19,15 +20,16 @@ var unlockCmd = &cobra.Command{
 	Args:  cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		dst := args[0]
-		dstScheme, dstBucket, dstPrefix := common.ParseURL(dst)
-		if dstScheme != "gs" {
-			logger.Info("only gcs locks are supported")
+		fo := system.ParseFileObject(dst)
+		if fo.System.Scheme() != "gs" {
+			logger.Info(module, "only gcs locks are supported")
 			common.Exit()
 		}
-		if gcp.IsDirectory(dstBucket, dstPrefix) {
-			logger.Info("lock destination is a directory")
+		if fo.FileType() != system.FileType_Object {
+			logger.Info(module, "lock destination is not an object")
 			common.Exit()
 		}
-		pool.Add(func() { gcp.AttemptUnLock(dstBucket, dstPrefix) })
+		gcs := fo.System.(*gcs.GCS)
+		pool.Add(func() { gcs.AttemptUnLock(fo.Bucket, fo.Prefix) })
 	},
 }

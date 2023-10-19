@@ -18,7 +18,7 @@ type Pool struct {
 
 func (p *Pool) log(s string, vs ...any) {
 	if p.enableLog {
-		logger.Debug(s, vs...)
+		logger.Debug("pool", s, vs...)
 	}
 }
 

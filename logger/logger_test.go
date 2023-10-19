@@ -12,19 +12,19 @@ func TestOutput(t *testing.T) {
 
 func TestDebug(t *testing.T) {
 	assert.False(t, Debugging)
-	Debug("test debug %d abc", 1)
+	Debug("", "test debug %d abc", 1)
 	Debugging = true
-	Debug("test debug %d abc", 1)
+	Debug("", "test debug %d abc", 1)
 }
 
 func TestInfo(t *testing.T) {
-	Info("test info %d abc", 1)
+	Info("", "test info %d abc", 1)
 }
 
 func TestWarn(t *testing.T) {
-	Warn("test warn %d abc", 1)
+	Warn("", "test warn %d abc", 1)
 }
 
 func TestError(t *testing.T) {
-	Error("test error %d abc", 1)
+	Error("", "test error %d abc", 1)
 }

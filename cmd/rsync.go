@@ -2,11 +2,10 @@ package cmd
 
 import (
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
 	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
-	"cloud.google.com/go/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -15,6 +14,90 @@ func init() {
 	rsyncCmd.Flags().BoolP("d", "d", false, "delete objects if not exists")
 	rsyncCmd.Flags().BoolP("v", "v", false, "force checksum after command operated, raise error if failed")
 	rootCmd.AddCommand(rsyncCmd)
+}
+
+func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	deleteTempFiles(dst.Prefix, isRec)
+	srcFiles := listRelatively(src, isRec)
+	dstFiles := listRelatively(dst, isRec)
+	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
+	if len(copyList)+len(deleteList) == 0 {
+		logger.Info(module, "No diff detected")
+		return
+	}
+	logger.Info(module, "Starting synchronization...")
+	for _, fo := range copyList {
+		fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars})
+	}
+	if isDel {
+		for _, fo := range deleteList {
+			pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
+		}
+	}
+}
+
+func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	srcFiles := listRelatively(src, isRec)
+	dstFiles := listRelatively(dst, isRec)
+	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
+	if len(copyList)+len(deleteList) == 0 {
+		logger.Info(module, "No diff detected")
+		return
+	}
+	logger.Info(module, "Starting synchronization...")
+	for _, fo := range copyList {
+		from := fo.Prefix
+		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+		pool.Add(func() { system.Lookup("gs").Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
+	}
+	if isDel {
+		for _, fo := range deleteList {
+			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+			pool.Add(func() { fo.System.Delete(dst.Bucket, dstPath) })
+		}
+	}
+}
+
+func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	srcFiles := listRelatively(src, isRec)
+	dstFiles := listRelatively(dst, isRec)
+	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
+	if len(copyList)+len(deleteList) == 0 {
+		logger.Info(module, "No diff detected")
+		return
+	}
+	logger.Info(module, "Starting synchronization...")
+	for _, fo := range copyList {
+		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+		pool.Add(func() { fo.System.Copy(fo.Bucket, fo.Prefix, dst.Bucket, dstPath) })
+	}
+	if isDel {
+		for _, fo := range deleteList {
+			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+			pool.Add(func() { fo.System.Delete(dst.Bucket, dstPath) })
+		}
+	}
+}
+
+func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	srcFiles := listRelatively(src, isRec)
+	dstFiles := listRelatively(dst, isRec)
+	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
+	if len(copyList)+len(deleteList) == 0 {
+		logger.Info(module, "No diff detected")
+		return
+	}
+	logger.Info(module, "Starting synchronization...")
+	for _, fo := range copyList {
+		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+		pool.Add(func() { fo.System.Copy(fo.Bucket, fo.Prefix, dst.Bucket, dstPath) })
+	}
+	if isDel {
+		for _, fo := range deleteList {
+			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+			pool.Add(func() { fo.System.Delete(dst.Bucket, dstPath) })
+		}
+	}
 }
 
 var rsyncCmd = &cobra.Command{
@@ -26,156 +109,87 @@ var rsyncCmd = &cobra.Command{
 		isRec, _ := cmd.Flags().GetBool("r")
 		isDel, _ := cmd.Flags().GetBool("d")
 		forceChecksum, _ := cmd.Flags().GetBool("v")
-		srcScheme, srcBucket, srcPrefix := common.ParseURL(args[0])
-		dstScheme, dstBucket, dstPrefix := common.ParseURL(args[1])
-
-		logger.Info("Building synchronization state...")
-
-		switch srcScheme + "-" + dstScheme {
-		case "gs-":
-			if gcp.IsDirectory(srcBucket, srcPrefix) {
-				deleteTempFiles(dstPrefix, isRec)
-				srcAttrs := gcpAttrsToLinuxAttrs(srcPrefix, gcp.GetObjectsAttributes(srcBucket, srcPrefix, isRec))
-				dstAttrs := linux.GetObjectsAttributes(dstPrefix, isRec)
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
-				logger.Info("Starting synchronization...")
-				for _, obj := range copyList {
-					srcPath := common.JoinPath(srcPrefix, obj.RelativePath)
-					dstPath := common.JoinPath(dstPrefix, obj.RelativePath)
-					gcp.DownloadObjectWithWorkerPool(srcBucket, srcPath, dstPath, pool, bars, forceChecksum)
-				}
-				if isDel {
-					for _, obj := range deleteList {
-						dstPath := obj.FullPath
-						pool.Add(func() { linux.DeleteObject(dstPath) })
-					}
-				}
-			} else {
-				logger.Info(
-					"Invalid bucket[%s] with prefix[%s], arg does not name a directory, bucket, or bucket subdir",
-					srcBucket, srcPrefix,
-				)
-				common.Exit()
-			}
-		case "-gs":
-			if linux.IsDirectory(srcPrefix) {
-				srcAttrs := linux.GetObjectsAttributes(srcPrefix, isRec)
-				dstAttrs := gcpAttrsToLinuxAttrs(dstPrefix, gcp.GetObjectsAttributes(dstBucket, dstPrefix, isRec))
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
-				logger.Info("Starting synchronization...")
-				for _, obj := range copyList {
-					srcPath := obj.FullPath
-					dstPath := common.JoinPath(dstPrefix, obj.RelativePath)
-					pool.Add(func() { gcp.UploadObject(srcPath, dstBucket, dstPath, bars) })
-				}
-				if isDel {
-					for _, obj := range deleteList {
-						dstPath := obj.FullPath
-						pool.Add(func() { gcp.DeleteObject(dstBucket, dstPath) })
-					}
-				}
-			} else {
-				logger.Info("Invalid prefix[%s], arg does not name a directory, bucket, or bucket subdir", srcPrefix)
-				common.Exit()
-			}
-		case "gs-gs":
-			if gcp.IsDirectory(srcBucket, srcPrefix) {
-				srcAttrs := gcpAttrsToLinuxAttrs(srcPrefix, gcp.GetObjectsAttributes(srcBucket, srcPrefix, isRec))
-				dstAttrs := gcpAttrsToLinuxAttrs(dstPrefix, gcp.GetObjectsAttributes(dstBucket, dstPrefix, isRec))
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
-				logger.Info("Starting synchronization...")
-				for _, attrs := range copyList {
-					srcPath := attrs.FullPath
-					dstPath := common.JoinPath(dstPrefix, attrs.RelativePath)
-					pool.Add(func() { gcp.CopyObject(srcBucket, srcPath, dstBucket, dstPath) })
-				}
-				if isDel {
-					for _, attrs := range deleteList {
-						dstPath := attrs.FullPath
-						pool.Add(func() { gcp.DeleteObject(dstBucket, dstPath) })
-					}
-				}
-			} else {
-				logger.Info(
-					"Invalid bucket[%s] with prefix[%s], arg does not name a directory, bucket, or bucket subdir",
-					srcBucket, srcPrefix,
-				)
-				common.Exit()
-			}
-		case "-":
-			if linux.IsDirectory(srcPrefix) {
-				srcAttrs := linux.GetObjectsAttributes(srcPrefix, isRec)
-				dstAttrs := linux.GetObjectsAttributes(dstPrefix, isRec)
-				copyList, deleteList := getCopyAndDeleteLists(srcAttrs, dstAttrs, forceChecksum)
-				logger.Info("Starting synchronization...")
-				for _, attrs := range copyList {
-					srcPath := attrs.FullPath
-					dstPath := common.JoinPath(dstPrefix, attrs.RelativePath)
-					pool.Add(func() { linux.CopyObject(srcPath, dstPath) })
-				}
-				if isDel {
-					for _, attrs := range deleteList {
-						dstPath := attrs.FullPath
-						pool.Add(func() { linux.DeleteObject(dstPath) })
-					}
-				}
-			} else {
-				logger.Info("Invalid prefix[%s], arg does not name a directory, bucket, or bucket subdir", srcPrefix)
-				common.Exit()
-			}
+		src := system.ParseFileObject(args[0])
+		dst := system.ParseFileObject(args[1])
+		switch src.FileType() {
+		case system.FileType_Invalid:
+			logger.Info(
+				module,
+				"Invalid bucket[%s] with prefix[%s]",
+				src.Bucket, src.Prefix,
+			)
+			common.Exit()
+			break
+		case system.FileType_Object:
+			logger.Info(
+				module,
+				"Invalid bucket[%s] with prefix[%s], arg does not name a directory, bucket, or bucket subdir",
+				src.Bucket, src.Prefix,
+			)
+			common.Exit()
+			break
 		default:
-			logger.Info("Not supported yet")
+			break
 		}
+
+		logger.Info(module, "Building synchronization state...")
+		if src.Remote && dst.Remote {
+			if src.System.Scheme() != dst.System.Scheme() {
+				logger.Info(
+					module,
+					"rsync from %s to %s is not yet supported",
+					src.System.Scheme(), dst.System.Scheme(),
+				)
+				common.Exit()
+			}
+			cloudSync(src, dst, isRec, isDel, forceChecksum)
+			return
+		}
+		if src.Remote {
+			downsync(src, dst, isRec, isDel, forceChecksum)
+			return
+		}
+		if dst.Remote {
+			upsync(src, dst, isRec, isDel, forceChecksum)
+			return
+		}
+		localSync(src, dst, isRec, isDel, forceChecksum)
 	},
 }
 
-func gcpAttrsToLinuxAttrs(prefix string, attrs []*storage.ObjectAttrs) []*linux.FileAttrs {
-	res := []*linux.FileAttrs{}
-	for _, attr := range attrs {
-		_, name := common.ParseFile(attr.Name)
-		res = append(res, &linux.FileAttrs{
-			FullPath:     attr.Name,
-			RelativePath: common.GetRelativePath(prefix, attr.Name),
-			Name:         name,
-			Size:         attr.Size,
-			CRC32C:       attr.CRC32C,
-			ModTime:      gcp.GetFileModificationTime(attr),
-		})
+func listRelatively(base *system.FileObject, isRec bool) map[string]*system.FileObject {
+	fos := base.System.List(base.Bucket, base.Prefix, isRec)
+	r := map[string]*system.FileObject{}
+	for _, fo := range fos {
+		fo.Attributes.RelativePath = common.GetRelativePath(base.Prefix, fo.Prefix)
+		r[fo.Attributes.RelativePath] = fo
 	}
-	return res
+	return r
 }
-
-func getCopyAndDeleteLists(
-	srcAttrs, dstAttrs []*linux.FileAttrs,
-	forceChecksum bool,
-) (
-	copyList, deleteList []*linux.FileAttrs,
-) {
-	// create srcAttrsMap
-	srcAttrsMap := map[string]*linux.FileAttrs{}
-	for _, attrs := range srcAttrs {
-		srcAttrsMap[attrs.RelativePath] = attrs
-	}
-
-	// create dstAttrsMap
-	dstAttrsMap := map[string]*linux.FileAttrs{}
-	for _, attrs := range dstAttrs {
-		dstAttrsMap[attrs.RelativePath] = attrs
-	}
-
-	// create copyList
-	for _, attrs := range srcAttrs {
-		dstAttrs, ok := dstAttrsMap[attrs.RelativePath]
-		if ok && attrs.Same(dstAttrs, forceChecksum) {
+func diffs(srcFiles, dstFiles map[string]*system.FileObject, forceChecksum bool) (copyList, deleteList []*system.FileObject) {
+	for rp, sf := range srcFiles {
+		df, ok := dstFiles[rp]
+		if ok && sf.Attributes != nil && sf.Attributes.Same(df.Attributes, forceChecksum) {
 			continue
 		}
-		copyList = append(copyList, attrs)
+		copyList = append(copyList, sf)
 	}
-
-	// create deleteList
-	for _, attrs := range dstAttrs {
-		if _, ok := srcAttrsMap[attrs.RelativePath]; !ok {
-			deleteList = append(deleteList, attrs)
+	for rp, df := range dstFiles {
+		_, ok := srcFiles[rp]
+		if !ok {
+			deleteList = append(deleteList, df)
+		}
+	}
+	if debugging && len(copyList) > 0 {
+		logger.Debug("diff", "copyList:")
+		for _, item := range copyList {
+			logger.Debug("diff", "%s", item.Prefix)
+		}
+	}
+	if debugging && len(deleteList) > 0 {
+		logger.Debug("diff", "deleteList:")
+		for _, item := range deleteList {
+			logger.Debug("diff", "%s", item.Prefix)
 		}
 	}
 	return
@@ -183,7 +197,8 @@ func getCopyAndDeleteLists(
 
 func deleteTempFiles(dir string, isRec bool) {
 	objs := linux.ListTempFiles(dir, isRec)
+	l := system.Lookup("")
 	for _, obj := range objs {
-		linux.DeleteObject(obj)
+		l.Delete("", obj)
 	}
 }

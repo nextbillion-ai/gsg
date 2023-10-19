@@ -2,9 +2,8 @@ package cmd
 
 import (
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
-	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -23,35 +22,30 @@ var rmCmd = &cobra.Command{
 		isRec, _ := cmd.Flags().GetBool("r")
 
 		for _, arg := range args {
-			scheme, bucket, prefix := common.ParseURL(arg)
-
-			switch scheme {
-			case "gs":
-				if gcp.IsDirectory(bucket, prefix) {
-					if isRec {
-						objs := gcp.ListObjects(bucket, prefix, isRec)
-						for _, obj := range objs {
-							path := obj
-							pool.Add(func() { gcp.DeleteObject(bucket, path) })
-						}
-					} else {
-						logger.Info("Omitting bucket[%s] prefix[%s]. (Did you mean to do rm -r?)", bucket, prefix)
-						common.Exit()
+			fo := system.ParseFileObject(arg)
+			if fo.FileType() == system.FileType_Invalid {
+				logger.Info("Invalid prefix[%s]", fo.Prefix)
+				common.Exit()
+			}
+			switch fo.Remote {
+			case true:
+				switch fo.FileType() {
+				case system.FileType_Directory:
+					objs := fo.System.List(fo.Bucket, fo.Prefix, isRec)
+					for _, obj := range objs {
+						bucket := obj.Bucket
+						prefix := obj.Prefix
+						pool.Add(func() { fo.System.Delete(bucket, prefix) })
 					}
-				} else if gcp.IsObject(bucket, prefix) {
-					pool.Add(func() { gcp.DeleteObject(bucket, prefix) })
-				} else {
-					logger.Info("Invalid bucket[%s] with prefix[%s]", bucket, prefix)
-					common.Exit()
+					break
+				case system.FileType_Object:
+					pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
+					break
 				}
-			case "":
-				if !linux.IsDirectoryOrObject(prefix) {
-					logger.Info("Invalid prefix[%s]", prefix)
-					common.Exit()
-				}
-				pool.Add(func() { linux.DeleteObject(prefix) })
-			default:
-				logger.Info("Not supported yet")
+				break
+			case false:
+				pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
+				break
 			}
 		}
 	},

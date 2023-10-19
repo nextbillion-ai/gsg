@@ -8,11 +8,15 @@ import (
 	"github.com/nextbillion-ai/gsg/logger"
 )
 
+const (
+	module = "COMMON"
+)
+
 // ParseURL parses url into scheme, bucket, prefix
 func ParseURL(input string) (string, string, string) {
 	u, err := url.Parse(input)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug("parseurl", "failed with %s", err)
 	}
 	// from gs or s3
 	if len(u.Scheme) > 0 {

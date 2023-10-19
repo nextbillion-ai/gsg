@@ -1,4 +1,4 @@
-package gcp
+package gcs
 
 import (
 	"testing"
@@ -12,8 +12,9 @@ func TestConfigPath(t *testing.T) {
 }
 
 func TestEuqalCRC32C(t *testing.T) {
-	assert.True(t, equalCRC32C("invalid", "invalid", "invalid"))
-	assert.False(t, equalCRC32C("gcp.go", "invalid", "invalid"))
+	g := GCS{}
+	assert.True(t, g.equalCRC32C("invalid", "invalid", "invalid"))
+	assert.False(t, g.equalCRC32C("gcs.go", "invalid", "invalid"))
 	// assert.True(t, equalCRC32C("usa.geojson", "maaas", "borders/usa.geojson"))
 	// assert.False(t, equalCRC32C("invalid", "maaas", "borders/usa.geojson"))
 }

@@ -24,7 +24,7 @@ const (
 func GetFileModificationTime(path string) time.Time {
 	file, err := os.Stat(path)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return time.Time{}
 	}
 	return file.ModTime()
@@ -34,7 +34,7 @@ func GetFileModificationTime(path string) time.Time {
 func SetFileModificationTime(path string, mt time.Time) {
 	err := os.Chtimes(path, mt, mt)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 	}
 }
 
@@ -42,7 +42,7 @@ func SetFileModificationTime(path string, mt time.Time) {
 func GetWorkDir() string {
 	ex, err := os.Executable()
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 	}
 	path := filepath.Dir(ex)
 	return path
@@ -115,12 +115,12 @@ func readOrComputeCRC32c(path string) uint32 {
 	b, e := os.ReadFile(cacheFileName)
 	if e == nil {
 		result = binary.LittleEndian.Uint32(b)
-		logger.Debug("loaded crc32c [%s] from catch: %d", cacheFileName, result)
+		logger.Debug(module, "loaded crc32c [%s] from catch: %d", cacheFileName, result)
 		return result
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return 0
 	}
 	defer func() { _ = file.Close() }()
@@ -128,14 +128,14 @@ func readOrComputeCRC32c(path string) uint32 {
 	h32 := crc32.New(crc32q)
 	_, err = io.Copy(h32, file)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 	}
 	result = h32.Sum32()
 	crcBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(crcBytes, result)
 	err = os.WriteFile(cacheFileName, crcBytes, fs.ModePerm)
 	if err != nil {
-		logger.Debug("write crc32c cachefile failed with %s", err)
+		logger.Debug(module, "write crc32c cachefile failed with %s", err)
 	} else {
 		logger.Debug("wrote crc32c cachefile : %s", cacheFileName)
 	}
@@ -158,14 +158,14 @@ func GetFileMD5(path string) []byte {
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return nil
 	}
 	defer func() { _ = file.Close() }()
 	hash := md5.New()
 	_, err = io.Copy(hash, file)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return nil
 	}
 	return hash.Sum(nil)
@@ -188,7 +188,7 @@ func GetTempFile(path string) string {
 func CreateFolder(path string) {
 	err := os.MkdirAll(path, 0755)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 	}
 }
 
@@ -196,14 +196,14 @@ func CreateFolder(path string) {
 func CreateFile(path string, size int64) {
 	f, err := os.Create(path)
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Debug(module, "failed with %s", err)
 		return
 	}
 	defer func() { _ = f.Close() }()
 	if size > 0 {
 		err = f.Truncate(size)
 		if err != nil {
-			logger.Debug("failed with %s", err)
+			logger.Debug(module, "failed with %s", err)
 			return
 		}
 	}

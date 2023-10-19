@@ -1,13 +1,11 @@
 package cmd
 
 import (
-	"strconv"
-	"strings"
+	"fmt"
 
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
-	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -24,54 +22,27 @@ var duCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		isHuman, _ := cmd.Flags().GetBool("h")
-		scheme, bucket, prefix := common.ParseURL(args[0])
-
-		switch scheme {
-		case "gs":
-			objs := gcp.GetDiskUsageObjects(bucket, prefix, true)
-			if len(objs) == 0 {
-				logger.Info("Invalid bucket[%s] with prefix[%s]", bucket, prefix)
-				common.Exit()
-			}
-			shift := 0
-			for _, obj := range objs {
-				parts := strings.Split(obj, " ")
-				if len(parts[0]) > shift {
-					shift = len(parts[0])
-				}
-			}
-			for _, obj := range objs {
-				parts := strings.Split(obj, " ")
-				size := parts[0]
-				if isHuman {
-					size = common.FromByteSize(size)
-				}
-				logger.Info("%-"+strconv.Itoa(shift+3)+"s %s://%s/%s", size, scheme, bucket, parts[1])
-			}
-		case "":
-			objs := linux.GetDiskUsageObjects(prefix)
-			if len(objs) == 0 {
-				logger.Info("Invalid prefix[%s]", prefix)
-				common.Exit()
-			}
-			shift := 0
-			for _, obj := range objs {
-				parts := strings.Split(obj, "\t")
-				if len(parts[0]) > shift {
-					shift = len(parts[0])
-				}
-			}
-			for _, obj := range objs {
-				parts := strings.Split(obj, "\t")
-				size := common.ToByteSize(parts[0])
-				if isHuman {
-					size = common.FromByteSize(size)
-				}
-				logger.Info("%-"+strconv.Itoa(shift+3)+"s %s", size, parts[1])
-			}
-		default:
-			logger.Info("Not supported yet")
+		fo := system.ParseFileObject(args[0])
+		if fo.FileType() == system.FileType_Invalid {
+			logger.Info("Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
+		}
+		objs := fo.System.DiskUsage(fo.Bucket, fo.Prefix, true)
+		scheme := ""
+		if len(fo.System.Scheme()) > 0 {
+			scheme = fmt.Sprintf("%s://", fo.System.Scheme())
+		}
+		bucket := ""
+		if len(fo.Bucket) > 0 {
+			bucket = fmt.Sprintf("%s/", fo.Bucket)
+		}
+		for _, obj := range objs {
+			size := fmt.Sprintf("%d", obj.Size)
+			if isHuman {
+				size = common.FromByteSize(size)
+			}
+
+			logger.Info("", "%-10s %s%s%s", size, scheme, bucket, obj.Name)
 		}
 	},
 }

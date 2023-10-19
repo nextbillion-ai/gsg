@@ -1,10 +1,11 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
-	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -21,34 +22,18 @@ var lsCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		isRec, _ := cmd.Flags().GetBool("r")
-		scheme, bucket, prefix := common.ParseURL(args[0])
-
-		switch scheme {
-		case "gs":
-			objs := gcp.GetObjectsAttributes(bucket, prefix, isRec)
-			if len(objs) == 0 {
-				logger.Info("Invalid bucket[%s] with prefix[%s]", bucket, prefix)
-				common.Exit()
-			}
-			for _, obj := range objs {
-				if len(obj.Name) > 0 {
-					logger.Info("%s://%s/%s", scheme, bucket, obj.Name)
-				} else if len(obj.Prefix) > 0 {
-					logger.Info("%s://%s/%s", scheme, bucket, obj.Prefix)
-				}
-			}
-		case "":
-			objs := linux.ListObjects(prefix, isRec)
-			if len(objs) == 0 {
-				logger.Info("Invalid prefix[%s]", prefix)
-				common.Exit()
-			}
-			for _, obj := range objs {
-				logger.Info(obj)
-			}
-		default:
-			logger.Info("Not supported yet")
+		fo := system.ParseFileObject(args[0])
+		objs := fo.System.List(fo.Bucket, fo.Prefix, isRec)
+		if len(objs) == 0 {
+			logger.Info("Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
+		}
+		for _, obj := range objs {
+			if len(fo.System.Scheme()) > 0 {
+				logger.Output(fmt.Sprintf("%s://%s/%s\n", fo.System.Scheme(), obj.Bucket, obj.Prefix))
+			} else {
+				logger.Output(fmt.Sprintf("%s\n", obj.Prefix))
+			}
 		}
 	},
 }

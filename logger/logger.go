@@ -11,28 +11,32 @@ func Output(s string) {
 }
 
 // Debug debug level log
-func Debug(s string, vs ...any) {
+func Debug(module, s string, vs ...any) {
 	if !Debugging {
 		return
 	}
 	s = fmt.Sprintf(s, vs...)
-	fmt.Printf("[DEBUG] %s\n", s)
+	fmt.Printf("[DEBUG] %s: %s\n", module, s)
 }
 
 // Info info level log
-func Info(s string, vs ...any) {
+func Info(module, s string, vs ...any) {
 	s = fmt.Sprintf(s, vs...)
-	fmt.Printf("%s\n", s)
+	if len(module) != 0 {
+		fmt.Printf("%s: %s\n", module, s)
+	} else {
+		fmt.Printf("%s\n", s)
+	}
 }
 
 // Warn warn level log
-func Warn(s string, vs ...any) {
+func Warn(module, s string, vs ...any) {
 	s = fmt.Sprintf(s, vs...)
-	fmt.Printf("[WARN] %s\n", s)
+	fmt.Printf("[WARN] %s: %s\n", module, s)
 }
 
 // Error error level log
-func Error(s string, vs ...any) {
+func Error(module, s string, vs ...any) {
 	s = fmt.Sprintf(s, vs...)
-	fmt.Printf("[ERROR] %s\n", s)
+	fmt.Printf("[ERROR] %s: %s\n", module, s)
 }
