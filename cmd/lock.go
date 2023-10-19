@@ -38,7 +38,7 @@ var lockCmd = &cobra.Command{
 			logger.Info(module, "only gcs locks are supported")
 			common.Exit()
 		}
-		if fo.FileType() != system.FileType_Directory {
+		if fo.FileType() == system.FileType_Directory {
 			logger.Info(module, "lock destination is a directory")
 			common.Exit()
 		}
