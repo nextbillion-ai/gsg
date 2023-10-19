@@ -25,12 +25,11 @@ var mvCmd = &cobra.Command{
 		case system.FileType_Directory:
 			objs := src.System.List(src.Bucket, src.Prefix, isRec)
 			for _, obj := range objs {
-				pool.Add(func() { src.System.Delete(src.Bucket, obj.Prefix) })
+				prefix := obj.Prefix
+				pool.Add(func() { src.System.Delete(src.Bucket, prefix) })
 			}
-			break
 		case system.FileType_Object:
 			src.System.Delete(src.Bucket, src.Prefix)
-			break
 		}
 
 	},

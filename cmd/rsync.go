@@ -31,7 +31,10 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	}
 	if isDel {
 		for _, fo := range deleteList {
-			pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
+			system := fo.System
+			bucket := fo.Bucket
+			prefix := fo.Prefix
+			pool.Add(func() { system.Delete(bucket, prefix) })
 		}
 	}
 }
@@ -53,7 +56,8 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	if isDel {
 		for _, fo := range deleteList {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-			pool.Add(func() { fo.System.Delete(dst.Bucket, dstPath) })
+			system := fo.System
+			pool.Add(func() { system.Delete(dst.Bucket, dstPath) })
 		}
 	}
 }
@@ -69,12 +73,16 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-		pool.Add(func() { fo.System.Copy(fo.Bucket, fo.Prefix, dst.Bucket, dstPath) })
+		system := fo.System
+		bucket := fo.Bucket
+		prefix := fo.Prefix
+		pool.Add(func() { system.Copy(bucket, prefix, dst.Bucket, dstPath) })
 	}
 	if isDel {
 		for _, fo := range deleteList {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-			pool.Add(func() { fo.System.Delete(dst.Bucket, dstPath) })
+			system := fo.System
+			pool.Add(func() { system.Delete(dst.Bucket, dstPath) })
 		}
 	}
 }
@@ -90,12 +98,16 @@ func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-		pool.Add(func() { fo.System.Copy(fo.Bucket, fo.Prefix, dst.Bucket, dstPath) })
+		system := fo.System
+		bucket := fo.Bucket
+		prefix := fo.Prefix
+		pool.Add(func() { system.Copy(bucket, prefix, dst.Bucket, dstPath) })
 	}
 	if isDel {
 		for _, fo := range deleteList {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-			pool.Add(func() { fo.System.Delete(dst.Bucket, dstPath) })
+			system := fo.System
+			pool.Add(func() { system.Delete(dst.Bucket, dstPath) })
 		}
 	}
 }
@@ -119,7 +131,6 @@ var rsyncCmd = &cobra.Command{
 				src.Bucket, src.Prefix,
 			)
 			common.Exit()
-			break
 		case system.FileType_Object:
 			logger.Info(
 				module,
@@ -127,7 +138,6 @@ var rsyncCmd = &cobra.Command{
 				src.Bucket, src.Prefix,
 			)
 			common.Exit()
-			break
 		default:
 			break
 		}

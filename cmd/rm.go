@@ -37,15 +37,11 @@ var rmCmd = &cobra.Command{
 						prefix := obj.Prefix
 						pool.Add(func() { fo.System.Delete(bucket, prefix) })
 					}
-					break
 				case system.FileType_Object:
 					pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
-					break
 				}
-				break
 			case false:
 				pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
-				break
 			}
 		}
 	},

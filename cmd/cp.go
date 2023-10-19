@@ -21,9 +21,9 @@ func upload(src, dst *system.FileObject, forceChecksum, isRec bool) {
 		if isRec {
 			objs := src.System.List(src.Bucket, src.Prefix, isRec)
 			for _, obj := range objs {
-				path := obj.Prefix
-				dstPath := common.GetDstPath(linux.GetRealPath(src.Prefix), path, dst.Prefix)
-				pool.Add(func() { dst.System.Upload(path, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
+				op := obj.Prefix
+				dstPath := common.GetDstPath(linux.GetRealPath(src.Prefix), op, dst.Prefix)
+				pool.Add(func() { dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
 			}
 		} else {
 			logger.Info(module, "Omitting prefix[%s]. (Did you mean to do cp -r?)", src.Prefix)
@@ -81,8 +81,9 @@ func cloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
 		}
 		objs := src.System.List(src.Bucket, src.Prefix, isRec)
 		for _, obj := range objs {
-			dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
-			pool.Add(func() { src.System.Copy(src.Bucket, obj.Prefix, dst.Bucket, dstPath) })
+			op := obj.Prefix
+			dstPath := common.GetDstPath(src.Prefix, op, dst.Prefix)
+			pool.Add(func() { src.System.Copy(src.Bucket, op, dst.Bucket, dstPath) })
 		}
 	case system.FileType_Object:
 		dstPrefix := dst.Prefix
