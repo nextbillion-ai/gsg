@@ -46,6 +46,16 @@ assert() {
     fi
 }
 
+assert_not() {
+    if asset $1 $2
+    then
+        echo FATAL: assert_not failed for file $1
+        exit 1
+    else
+        echo OK: $1 does not exists
+    fi
+}
+
 start "building gsg binary"
 go build
 finish
@@ -79,13 +89,6 @@ assert $ftu/a/2.txt remote
 assert $ftu/a/b/c/3.txt remote
 finish
 
-start "test rsync a local folder to remote"
-echo "whocares" > $ftu/a/1.txt
-../gsg rsync -r $ftu gs://gsg-uat/$testid/$ftu
-gsutil cp gs://gsg-uat/$testid/$ftu/a/1.txt $ftu/a/1_remote.txt
-same $ftu/a/1.txt $ftu/a/1_remote.txt
-finish
-
 start "test download"
 
 start "test download single file"
@@ -110,11 +113,38 @@ assert $ftd/a/2.txt
 assert $ftd/a/b/c/3.txt
 finish
 
+
+start "testing rsync"
+ftr="folder_to_rsync"
+
+start "test rsync a local folder to remote"
+mkdir -p $ftr/a/b/c
+touch $ftr/a/1.txt
+touch $ftr/a/2.txt
+touch $ftr/a/b/c/3.txt
+../gsg rsync -r $ftr gs://gsg-uat/$testid/$ftr
+assert $ftr/a/1.txt remote
+assert $ftr/a/2.txt remote
+assert $ftr/a/b/c/3.txt remote
+echo "whocares" > $ftr/a/1.txt
+../gsg rsync -r $ftr gs://gsg-uat/$testid/$ftr
+gsutil cp gs://gsg-uat/$testid/$ftr/a/1.txt $ftr/a/1_remote.txt
+same $ftr/a/1.txt $ftr/a/1_remote.txt
+finish
+
 start "test rsync a remote folder to local"
-cp $ftd/a/1.txt rsync_a_1.txt
-echo "whocares" > $ftd/a/1.txt
-../gsg rsync -r gs://gsg-uat/$testid/$ftd $ftd
-same $ftd/a/1.txt rsync_a_1.txt
+rm -rf $ftr
+../gsg rsync -r gs://gsg-uat/$testid/$ftr $ftr
+assert $ftr/a/1.txt remote
+assert $ftr/a/2.txt remote
+assert $ftr/a/b/c/3.txt remote
+finish
+
+start "test rsync with -d and non-existing src"
+../gsg rsync -d whocares gs://gsg-uat/$testid/$ftr
+assert_not $ftr/a/1.txt remote
+assert_not $ftr/a/2.txt remote
+assert_not $ftr/a/b/c/3.txt remote
 finish
 
 

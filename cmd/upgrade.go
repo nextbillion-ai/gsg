@@ -39,7 +39,7 @@ var upgradeCmd = &cobra.Command{
 		g := system.Lookup("gs")
 		srcObj := g.Attributes(upgradeBucket, srcPath)
 		if srcObj == nil {
-			logger.Info("gsg release not found: %s", srcPath)
+			logger.Info(module, "gsg release not found: %s", srcPath)
 			common.Exit()
 		}
 
@@ -51,7 +51,7 @@ var upgradeCmd = &cobra.Command{
 		l := system.Lookup("")
 		dstObj := l.Attributes("", dstPath)
 		if dstObj == nil {
-			logger.Info("Not found file: %s", dstPath)
+			logger.Info(module, "File not found: %s", dstPath)
 			common.Exit()
 		}
 

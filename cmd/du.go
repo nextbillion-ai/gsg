@@ -24,7 +24,7 @@ var duCmd = &cobra.Command{
 		isHuman, _ := cmd.Flags().GetBool("h")
 		fo := system.ParseFileObject(args[0])
 		if fo.FileType() == system.FileType_Invalid {
-			logger.Info("Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
+			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
 		}
 		objs := fo.System.DiskUsage(fo.Bucket, fo.Prefix, true)

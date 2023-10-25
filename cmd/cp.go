@@ -52,7 +52,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool) {
 				src.System.Download(src.Bucket, obj.Prefix, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool})
 			}
 		} else {
-			logger.Info("Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", src.Bucket, src.Prefix)
+			logger.Info(module, "Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", src.Bucket, src.Prefix)
 			common.Exit()
 		}
 	case system.FileType_Object:

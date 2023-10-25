@@ -25,7 +25,7 @@ var lsCmd = &cobra.Command{
 		fo := system.ParseFileObject(args[0])
 		objs := fo.System.List(fo.Bucket, fo.Prefix, isRec)
 		if len(objs) == 0 {
-			logger.Info("Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
+			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
 		}
 		for _, obj := range objs {

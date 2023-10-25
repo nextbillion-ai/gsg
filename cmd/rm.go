@@ -24,7 +24,7 @@ var rmCmd = &cobra.Command{
 		for _, arg := range args {
 			fo := system.ParseFileObject(arg)
 			if fo.FileType() == system.FileType_Invalid {
-				logger.Info("Invalid prefix[%s]", fo.Prefix)
+				logger.Info(module, "Invalid prefix[%s]", fo.Prefix)
 				common.Exit()
 			}
 			switch fo.Remote {

@@ -63,7 +63,7 @@ func (fa *FileAttrs) Same(other *FileAttrs, forceChecksum bool) bool {
 	if other.CRC32C <= 0 {
 		other.CRC32C = common.GetFileCRC32C(other.FullPath)
 	}
-	logger.Info("CRC32C checking of [%s] and [%s] are [%d] with [%d].", fa.FullPath, other.FullPath, fa.CRC32C, other.CRC32C)
+	logger.Info(module, "CRC32C checking of [%s] and [%s] are [%d] with [%d].", fa.FullPath, other.FullPath, fa.CRC32C, other.CRC32C)
 	return fa.CRC32C == other.CRC32C
 }
 

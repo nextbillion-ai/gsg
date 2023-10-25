@@ -15,8 +15,27 @@ func init() {
 	rsyncCmd.Flags().BoolP("v", "v", false, "force checksum after command operated, raise error if failed")
 	rootCmd.AddCommand(rsyncCmd)
 }
+func deleteDst(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) bool {
+	if src.FileType() == system.FileType_Invalid && isDel {
+		if dst.FileType() == system.FileType_Directory {
+			fos := dst.System.List(dst.Bucket, dst.Prefix, true)
+			for _, fo := range fos {
+				bucket := fo.Bucket
+				prefix := fo.Prefix
+				system := fo.System
+				pool.Add(func() { system.Delete(bucket, prefix) })
+			}
+		}
+		return true
+	}
+	return false
+}
 
 func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	if deleteDst(src, dst, isRec, isDel, forceChecksum) {
+		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
+		return
+	}
 	deleteTempFiles(dst.Prefix, isRec)
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
@@ -40,6 +59,10 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 }
 
 func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	if deleteDst(src, dst, isRec, isDel, forceChecksum) {
+		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
+		return
+	}
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
 	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
@@ -63,6 +86,15 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 }
 
 func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	if deleteDst(src, dst, isRec, isDel, forceChecksum) {
+		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
+		return
+	}
+	if src.FileType() == system.FileType_Invalid && isDel {
+		if dst.FileType() == system.FileType_Directory {
+
+		}
+	}
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
 	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
@@ -88,6 +120,10 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 }
 
 func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
+	if deleteDst(src, dst, isRec, isDel, forceChecksum) {
+		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
+		return
+	}
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
 	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
@@ -125,12 +161,14 @@ var rsyncCmd = &cobra.Command{
 		dst := system.ParseFileObject(args[1])
 		switch src.FileType() {
 		case system.FileType_Invalid:
-			logger.Info(
-				module,
-				"Invalid bucket[%s] with prefix[%s]",
-				src.Bucket, src.Prefix,
-			)
-			common.Exit()
+			if !isDel {
+				logger.Info(
+					module,
+					"Invalid bucket[%s] with prefix[%s]",
+					src.Bucket, src.Prefix,
+				)
+				common.Exit()
+			}
 		case system.FileType_Object:
 			logger.Info(
 				module,

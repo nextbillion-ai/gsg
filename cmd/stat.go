@@ -23,7 +23,7 @@ var statCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		fo := system.ParseFileObject(args[0])
 		if fo.FileType() != system.FileType_Object {
-			logger.Info("Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
+			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
 		}
 		if fo.System.Scheme() != "gs" {

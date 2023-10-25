@@ -325,7 +325,7 @@ func (g *GCS) AttemptUnLock(bucket, object string) {
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
 	generationBytes, e := os.ReadFile(cacheFileName)
 	if e != nil {
-		logger.Debug("failed to read lock cache: %+v", cacheFileName)
+		logger.Debug(module, "failed to read lock cache: %+v", cacheFileName)
 		common.Finish()
 	}
 	generation := binary.LittleEndian.Uint64(generationBytes)
@@ -526,5 +526,5 @@ func (g *GCS) MustEqualCRC32C(flag bool, localPath, bucket, object string) {
 		logger.Info(module, "CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 		common.Exit()
 	}
-	logger.Info("CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 }

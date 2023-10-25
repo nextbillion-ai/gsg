@@ -52,7 +52,7 @@ func GetWorkDir() string {
 func Chmod(path string, mod os.FileMode) {
 	err := os.Chmod(path, mod)
 	if err != nil {
-		logger.Debug("failed with %s", path)
+		logger.Debug(module, "failed with %s", path)
 	}
 }
 
@@ -69,7 +69,7 @@ func IsPathExist(path string) bool {
 func IsPathDirectory(path string) bool {
 	fi, err := os.Stat(path)
 	if err != nil {
-		logger.Debug("failed with %s", path)
+		logger.Debug(module, "failed with %s", path)
 		return false
 	}
 	return fi.IsDir()
@@ -79,7 +79,7 @@ func IsPathDirectory(path string) bool {
 func IsPathFile(path string) bool {
 	fi, err := os.Stat(path)
 	if err != nil {
-		logger.Debug("failed with %s", path)
+		logger.Debug(module, "failed with %s", path)
 		return false
 	}
 	return !fi.IsDir()
@@ -92,7 +92,7 @@ func GetFileSize(path string) int64 {
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		logger.Debug("failed with %s", path)
+		logger.Debug(module, "failed with %s", path)
 		return 0
 	}
 	return fi.Size()
@@ -137,7 +137,7 @@ func readOrComputeCRC32c(path string) uint32 {
 	if err != nil {
 		logger.Debug(module, "write crc32c cachefile failed with %s", err)
 	} else {
-		logger.Debug("wrote crc32c cachefile : %s", cacheFileName)
+		logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
 	}
 	return result
 }
