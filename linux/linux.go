@@ -31,42 +31,6 @@ type FileAttrs struct {
 	ModTime      time.Time
 }
 
-// Same check if two attributes are same file storing differently
-// - refer to gsutil logic:
-// - - https://cloud.google.com/storage/docs/gsutil/commands/rsync
-func (fa *FileAttrs) Same(other *FileAttrs, forceChecksum bool) bool {
-	if other == nil {
-		return false
-	}
-
-	// compare file name
-	if fa.RelativePath != other.RelativePath {
-		return false
-	}
-
-	// compare file size
-	if fa.Size != other.Size {
-		return false
-	}
-
-	if !forceChecksum {
-		// compare modification time
-		if !fa.ModTime.Equal(time.Time{}) && !other.ModTime.Equal(time.Time{}) {
-			return fa.ModTime.Equal(other.ModTime)
-		}
-	}
-
-	// compare crc32
-	if fa.CRC32C <= 0 {
-		fa.CRC32C = common.GetFileCRC32C(fa.FullPath)
-	}
-	if other.CRC32C <= 0 {
-		other.CRC32C = common.GetFileCRC32C(other.FullPath)
-	}
-	logger.Info(module, "CRC32C checking of [%s] and [%s] are [%d] with [%d].", fa.FullPath, other.FullPath, fa.CRC32C, other.CRC32C)
-	return fa.CRC32C == other.CRC32C
-}
-
 // GetRealPath gets real path of a directory
 func GetRealPath(dir string) string {
 	r, e := filepath.Abs(dir)

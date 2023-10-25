@@ -453,10 +453,7 @@ func (g *GCS) Cat(bucket, prefix string) []byte {
 // case 3: gs://abc/def/ -> gs://abc/def/ : false
 // case 4: gs://abc/def -> gs://abc/def : true
 func (g *GCS) IsObject(bucket, prefix string) bool {
-	if g.GCSAttrs(bucket, prefix) != nil {
-		return true
-	}
-	return false
+	return g.GCSAttrs(bucket, prefix) != nil
 }
 
 // IsDirectory checks if is a directory
