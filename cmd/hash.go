@@ -2,9 +2,8 @@ package cmd
 
 import (
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
-	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -19,27 +18,13 @@ var hashCmd = &cobra.Command{
 	Long:  "Get checksum value of objects",
 	Args:  cobra.ExactArgs(1),
 	Run: func(_ *cobra.Command, args []string) {
-		scheme, bucket, prefix := common.ParseURL(args[0])
-
-		switch scheme {
-		case "gs":
-			attrs := gcp.GetObjectAttributes(bucket, prefix)
-			if attrs == nil {
-				logger.Info("Invalid bucket[%s] with prefix[%s]", bucket, prefix)
-				common.Exit()
-			}
-			logger.Info("%-20s%d", "Hash (CRC32C):", attrs.CRC32C)
-			logger.Info("%-20s%s", "ModTime:", gcp.GetFileModificationTime(attrs).UTC().String())
-		case "":
-			attrs := linux.GetObjectAttributes(prefix)
-			if attrs == nil {
-				logger.Info("Invalid prefix[%s]", prefix)
-				common.Exit()
-			}
-			logger.Info("%-20s%d", "Hash (CRC32C):", attrs.CRC32C)
-			logger.Info("%-20s%s", "ModTime:", attrs.ModTime.UTC().String())
-		default:
-			logger.Info("Not supported yet")
+		fo := system.ParseFileObject(args[0])
+		attrs := fo.System.Attributes(fo.Bucket, fo.Prefix)
+		if attrs == nil {
+			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
+			common.Exit()
 		}
+		logger.Info("", "%-20s%d", "Hash (CRC32C):", attrs.CRC32)
+		logger.Info("", "%-20s%s", "ModTime:", attrs.ModTime.UTC().String())
 	},
 }

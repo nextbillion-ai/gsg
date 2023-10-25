@@ -6,6 +6,8 @@
 *.dylib
 build
 vendor
+gsg
+uat_temp
 
 # Test binary, built with `go test -c`
 *.test

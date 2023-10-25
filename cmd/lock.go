@@ -5,8 +5,9 @@ import (
 	"time"
 
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
+	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -26,21 +27,22 @@ var lockCmd = &cobra.Command{
 		var ttlErr error
 		if len(args) >= 2 {
 			if ttlInSec, ttlErr = strconv.Atoi(args[1]); ttlErr != nil {
-				logger.Info("invalid ttl")
+				logger.Info(module, "invalid ttl")
 				common.Exit()
 			}
 		} else {
 			ttlInSec = 24 * 3600
 		}
-		dstScheme, dstBucket, dstPrefix := common.ParseURL(dst)
-		if dstScheme != "gs" {
-			logger.Info("only gcs locks are supported")
+		fo := system.ParseFileObject(dst)
+		if fo.System.Scheme() != "gs" {
+			logger.Info(module, "only gcs locks are supported")
 			common.Exit()
 		}
-		if gcp.IsDirectory(dstBucket, dstPrefix) {
-			logger.Info("lock destination is a directory")
+		if fo.FileType() == system.FileType_Directory {
+			logger.Info(module, "lock destination is a directory")
 			common.Exit()
 		}
-		pool.Add(func() { gcp.AttemptLock(dstBucket, dstPrefix, time.Duration(int64(time.Second)*int64(ttlInSec))) })
+		gcs := fo.System.(*gcs.GCS)
+		pool.Add(func() { gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))) })
 	},
 }

@@ -2,9 +2,8 @@ package cmd
 
 import (
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
-	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -19,24 +18,10 @@ var catCmd = &cobra.Command{
 	Long:  "Output the content to stdout",
 	Args:  cobra.ExactArgs(1),
 	Run: func(_ *cobra.Command, args []string) {
-		scheme, bucket, prefix := common.ParseURL(args[0])
-
-		switch scheme {
-		case "gs":
-			obj := gcp.OutputObject(bucket, prefix)
-			if obj == nil {
-				common.Exit()
-			}
-			logger.Output(string(obj))
-		case "":
-			obj := linux.OutputObject(prefix)
-			if obj == nil {
-				common.Exit()
-			}
-			logger.Output(string(obj))
-		default:
-			logger.Info("Not supported yet")
+		fo := system.ParseFileObject(args[0])
+		if fo == nil {
 			common.Exit()
 		}
+		logger.Output(string(fo.System.Cat(fo.Bucket, fo.Prefix)))
 	},
 }

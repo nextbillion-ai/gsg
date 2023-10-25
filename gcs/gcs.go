@@ -1,4 +1,4 @@
-package gcp
+package gcs
 
 import (
 	"bytes"
@@ -15,7 +15,7 @@ import (
 	"github.com/nextbillion-ai/gsg/bar"
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
-	"github.com/nextbillion-ai/gsg/worker"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -25,11 +25,7 @@ import (
 
 const (
 	googleApplicationCredentialsEnv = "GOOGLE_APPLICATION_CREDENTIALS"
-)
-
-var (
-	_client         *storage.Client
-	_initClientOnce sync.Once
+	module                          = "GCS"
 )
 
 // ConfigPath gets gcp config path from env
@@ -37,51 +33,91 @@ func ConfigPath() string {
 	return os.Getenv(googleApplicationCredentialsEnv)
 }
 
-// storageClient gets or creates a gcp storage client
-func storageClient() *storage.Client {
-	_initClientOnce.Do(func() {
-		path := ConfigPath()
-		if path == "" {
-			logger.Info("not set environment variable [%s]", googleApplicationCredentialsEnv)
-			common.Exit()
-		}
-		if _, err := os.Stat(path); err != nil {
-			logger.Info("failed in loading [%s=%s] with error: %s", googleApplicationCredentialsEnv, path, err)
-			common.Exit()
-		}
-		var err error
-		_client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(path))
-		if err != nil {
-			logger.Info("get client failed with %s", err)
-			common.Exit()
-		}
-	})
-	return _client
+type GCS struct {
+	client *storage.Client
 }
 
-// GetObjectAttributes gets the attributes of an object
-func GetObjectAttributes(bucket, prefix string) *storage.ObjectAttrs {
-	client := storageClient()
-	attrs, err := client.Bucket(bucket).Object(prefix).Attrs(context.Background())
+func (g *GCS) Scheme() string {
+	return "gs"
+}
+
+func (g *GCS) toAttrs(attrs *storage.ObjectAttrs) *system.Attrs {
+	if attrs == nil {
+		return nil
+	}
+	return &system.Attrs{
+		Size:    attrs.Size,
+		CRC32:   attrs.CRC32C,
+		ModTime: GetFileModificationTime(attrs),
+	}
+}
+
+func (g *GCS) toFileObject(attrs *storage.ObjectAttrs) *system.FileObject {
+	if attrs == nil {
+		return nil
+	}
+	name := attrs.Prefix
+	if len(name) == 0 {
+		name = attrs.Name
+	}
+	fo := &system.FileObject{
+		System: g,
+		Bucket: attrs.Bucket,
+		Prefix: name,
+		Remote: true,
+	}
+	fo.SetAttributes(g.toAttrs(attrs))
+	return fo
+}
+
+// storageClient gets or creates a gcp storage client
+func (g *GCS) init() {
+	if g.client != nil {
+		return
+	}
+	path := ConfigPath()
+	if path == "" {
+		logger.Info(module, "gcs: expected env-var [%s] not found", googleApplicationCredentialsEnv)
+		common.Exit()
+	}
+	if _, err := os.Stat(path); err != nil {
+		logger.Info(module, "gcs: failed in loading [%s=%s] with error: %s", googleApplicationCredentialsEnv, path, err)
+		common.Exit()
+	}
+	var err error
+	g.client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(path))
 	if err != nil {
-		logger.Debug("failed with %s", err)
+		logger.Info(module, "get client failed with %s", err)
+		common.Exit()
+	}
+}
+
+func (g *GCS) GCSAttrs(bucket, prefix string) *storage.ObjectAttrs {
+	g.init()
+	attrs, err := g.client.Bucket(bucket).Object(prefix).Attrs(context.Background())
+	if err != nil {
+		logger.Debug(module, "failed with gs://%s/%s %s", bucket, prefix, err)
 		return nil
 	}
 	return attrs
 }
 
-// GetObjectsAttributes gets the attributes of all the objects under a prefix
-func GetObjectsAttributes(bucket, prefix string, recursive bool) []*storage.ObjectAttrs {
-	if !IsObject(bucket, prefix) {
+// GetObjectAttributes gets the attributes of an object
+func (g *GCS) Attributes(bucket, prefix string) *system.Attrs {
+	return g.toAttrs(g.GCSAttrs(bucket, prefix))
+}
+
+func (g *GCS) batchAttrs(bucket, prefix string, recursive bool) []*storage.ObjectAttrs {
+	g.init()
+	if !g.IsObject(bucket, prefix) {
 		prefix = common.SetPrefixAsDirectory(prefix)
 	}
 	res := []*storage.ObjectAttrs{}
-	client := storageClient()
 	delimiter := "/"
 	if recursive {
 		delimiter = ""
 	}
-	it := client.Bucket(bucket).Objects(
+	it := g.client.Bucket(bucket).Objects(
 		context.Background(),
 		&storage.Query{
 			Delimiter:  delimiter,
@@ -95,7 +131,7 @@ func GetObjectsAttributes(bucket, prefix string, recursive bool) []*storage.Obje
 			break
 		}
 		if err != nil {
-			logger.Info("get objects attributes failed with %s", err)
+			logger.Info(module, "get objects attributes failed with %s", err)
 			common.Exit()
 		}
 		if len(attrs.Name) > 0 && common.IsSubPath(attrs.Name, prefix) {
@@ -107,93 +143,94 @@ func GetObjectsAttributes(bucket, prefix string, recursive bool) []*storage.Obje
 	return res
 }
 
-// ListObjects lists objects under a prefix
-func ListObjects(bucket, prefix string, recursive bool) []string {
-	res := []string{}
-	objs := GetObjectsAttributes(bucket, prefix, recursive)
-	for _, obj := range objs {
-		if len(obj.Name) > 0 {
-			res = append(res, obj.Name)
-		} else if len(obj.Prefix) > 0 {
-			res = append(res, obj.Prefix)
-		}
+// GetObjectsAttributes gets the attributes of all the objects under a prefix
+func (g *GCS) BatchAttributes(bucket, prefix string, recursive bool) []*system.Attrs {
+	res := []*system.Attrs{}
+	for _, attr := range g.batchAttrs(bucket, prefix, recursive) {
+		res = append(res, g.toAttrs(attr))
 	}
 	return res
 }
 
+// List objects under a prefix
+func (g *GCS) List(bucket, prefix string, recursive bool) []*system.FileObject {
+	fos := []*system.FileObject{}
+	for _, attr := range g.batchAttrs(bucket, prefix, recursive) {
+		fos = append(fos, g.toFileObject(attr))
+	}
+	return fos
+}
+
 // GetDiskUsageObjects gets disk usage of objects under a prefix
-func GetDiskUsageObjects(bucket, prefix string, recursive bool) []string {
-	res := []string{}
+func (g *GCS) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsage {
+	res := []system.DiskUsage{}
 	// is object
-	obj := GetObjectAttributes(bucket, prefix)
+	obj := g.GCSAttrs(bucket, prefix)
 	if obj != nil {
-		res = append(res, fmt.Sprintf("%d %s", obj.Size, obj.Name))
+		res = append(res, system.DiskUsage{Size: obj.Size, Name: obj.Name})
 		return res
 	}
 	// is directory
 	total := int64(0)
-	objs := GetObjectsAttributes(bucket, prefix, recursive)
+	objs := g.batchAttrs(bucket, prefix, recursive)
 	for _, obj := range objs {
 		if len(obj.Name) > 0 {
-			res = append(res, fmt.Sprintf("%d %s", obj.Size, obj.Name))
+			res = append(res, system.DiskUsage{Size: obj.Size, Name: obj.Name})
 		} else if len(obj.Prefix) > 0 {
-			res = append(res, fmt.Sprintf("%d %s", obj.Size, obj.Prefix))
+			res = append(res, system.DiskUsage{Size: obj.Size, Name: obj.Prefix})
 		}
 		total += obj.Size
 	}
 	if len(res) > 0 {
-		res = append(res, fmt.Sprintf("%d %s", total, common.SetPrefixAsDirectory(prefix)))
+		res = append(res, system.DiskUsage{Size: total, Name: common.SetPrefixAsDirectory(prefix)})
 	}
 	return res
 }
 
 // DeleteObject deletes an object
-func DeleteObject(bucket, prefix string) {
-	client := storageClient()
-	err := client.Bucket(bucket).Object(prefix).Delete(context.Background())
+func (g *GCS) Delete(bucket, prefix string) {
+	g.init()
+	err := g.client.Bucket(bucket).Object(prefix).Delete(context.Background())
 	if err != nil {
-		logger.Info("delete object failed with %s", err)
+		logger.Info(module, "delete object failed with %s", err)
 		common.Exit()
 	}
-	logger.Info("Removing bucket[%s] prefix[%s]", bucket, prefix)
+	logger.Info(module, "Removing bucket[%s] prefix[%s]", bucket, prefix)
 }
 
 // CopyObject copies an object
-func CopyObject(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
+func (g *GCS) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 	// check object
-	attrs := GetObjectAttributes(srcBucket, srcPrefix)
-	if attrs == nil {
-		logger.Debug("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
+	if g.GCSAttrs(srcBucket, srcPrefix) == nil {
+		logger.Debug(module, "failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
 		return
 	}
 
 	// copy object
-	client := storageClient()
-	src := client.Bucket(srcBucket).Object(srcPrefix)
-	dst := client.Bucket(dstBucket).Object(dstPrefix)
+	src := g.client.Bucket(srcBucket).Object(srcPrefix)
+	dst := g.client.Bucket(dstBucket).Object(dstPrefix)
 	_, err := dst.CopierFrom(src).Run(context.Background())
 	if err != nil {
-		logger.Info("copy object failed with %s", err)
+		logger.Info(module, "copy object failed with %s", err)
 		common.Exit()
 	}
 	logger.Info(
+		module,
 		"Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
 		srcBucket, srcPrefix, dstBucket, dstPrefix,
 	)
-
 }
 
 // DownloadObjectWithWorkerPool downloads a specific byte range of an object to a file.
-func DownloadObjectWithWorkerPool(
+func (g *GCS) Download(
 	bucket, prefix, dstFile string,
-	pool *worker.Pool,
-	bars *bar.Container,
 	forceChecksum bool,
+	ctx system.RunContext,
 ) {
 	// check object
-	attrs := GetObjectAttributes(bucket, prefix)
+	attrs := g.GCSAttrs(bucket, prefix)
 	if attrs == nil {
-		logger.Debug("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
+		logger.Debug(module, "failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
 		return
 	}
 
@@ -208,7 +245,6 @@ func DownloadObjectWithWorkerPool(
 	var pb *bar.ProgressBar
 	var wg sync.WaitGroup
 	var once sync.Once
-	client := storageClient()
 	dstFileTemp := common.GetTempFile(dstFile)
 	for i := 0; i < chunkNumber; i++ {
 
@@ -220,13 +256,13 @@ func DownloadObjectWithWorkerPool(
 		}
 
 		wg.Add(1)
-		pool.Add(
+		ctx.Pool.Add(
 			func() {
 				defer wg.Done()
 
 				// create folder and temp file if not exist
 				once.Do(func() {
-					pb = bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
+					pb = ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
 					folder, _ := common.ParseFile(dstFile)
 					if !common.IsPathExist(folder) {
 						common.CreateFolder(folder)
@@ -235,11 +271,11 @@ func DownloadObjectWithWorkerPool(
 				})
 
 				// create reader with offset and length of object
-				rc, err := client.Bucket(bucket).Object(prefix).NewRangeReader(
+				rc, err := g.client.Bucket(bucket).Object(prefix).NewRangeReader(
 					context.Background(), startByte, length,
 				)
 				if err != nil {
-					logger.Info("download object failed when create reader with %s", err)
+					logger.Info(module, "download object failed when create reader with %s", err)
 					common.Exit()
 				}
 				defer func() { _ = rc.Close() }()
@@ -248,14 +284,14 @@ func DownloadObjectWithWorkerPool(
 				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
 				_, err = fl.Seek(startByte, 0)
 				if err != nil {
-					logger.Info("download object failed when seek for offset with %s", err)
+					logger.Info(module, "download object failed when seek for offset with %s", err)
 					common.Exit()
 				}
 				defer func() { _ = fl.Close() }()
 
 				// write data with offset and length to file
 				if _, err := io.Copy(io.MultiWriter(fl, pb), rc); err != nil {
-					logger.Info("download object failed when write to offet with %s", err)
+					logger.Info(module, "download object failed when write to offet with %s", err)
 					common.Exit()
 				}
 			},
@@ -263,100 +299,47 @@ func DownloadObjectWithWorkerPool(
 	}
 
 	// move back the temp file
-	pool.Add(func() {
+	ctx.Pool.Add(func() {
 		wg.Wait()
 		err := os.Rename(dstFileTemp, dstFile)
 		if err != nil {
-			logger.Info("download object failed when rename file with %s", err)
+			logger.Info(module, "download object failed when rename file with %s", err)
 			common.Exit()
 		}
 		common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-		MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
+		g.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 	})
 }
 
-// DownloadObject downloads an object to a file
-func DownloadObject(
-	bucket, prefix, dstFile string,
-	bars *bar.Container,
-	forceChecksum bool,
-) {
-	// check object
-	attrs := GetObjectAttributes(bucket, prefix)
-	if attrs == nil {
-		logger.Debug("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
-		return
-	}
-
-	// create target folder
-	folder, _ := common.ParseFile(dstFile)
-	if !common.IsPathExist(folder) {
-		common.CreateFolder(folder)
-	}
-
-	// create temp file
-	dstFileTemp := common.GetTempFile(dstFile)
-	f, err := os.Create(dstFileTemp)
-	if err != nil {
-		logger.Info("download object failed when create file with %s", err)
-		common.Exit()
-	}
-
-	// create reader
-	client := storageClient()
-	rc, err := client.Bucket(bucket).Object(prefix).NewReader(context.Background())
-	if err != nil {
-		logger.Info("download object failed with when create reader %s", err)
-		common.Exit()
-	}
-	defer func() { _ = rc.Close() }()
-
-	// write to file
-	pb := bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
-	if _, err := io.Copy(io.MultiWriter(f, pb), rc); err != nil {
-		logger.Info("download object failed when write to file with %s", err)
-		common.Exit()
-	}
-
-	// move back temp file
-	err = os.Rename(dstFileTemp, dstFile)
-	if err != nil {
-		logger.Info("download object failed when rename file with %s", err)
-		common.Exit()
-	}
-	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-	MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
-}
-
 // DoAttemptUnlock takes generation as input and returns potential error
-func DoAttemptUnlock(bucket, object string, generation int64) error {
-	client := storageClient()
-	o := client.Bucket(bucket).Object(object)
+func (g *GCS) DoAttemptUnlock(bucket, object string, generation int64) error {
+	g.init()
+	o := g.client.Bucket(bucket).Object(object)
 	//delete fails means other client has acquired lock
-	logger.Debug("DoAttemptUnlock: unlock with generation:%d", generation)
+	logger.Debug(module, "DoAttemptUnlock: unlock with generation:%d", generation)
 	return o.If(storage.Conditions{GenerationMatch: int64(generation)}).Delete(context.Background())
 }
 
 // AttemptUnLock attempts to release a remote lock file
-func AttemptUnLock(bucket, object string) {
+func (g *GCS) AttemptUnLock(bucket, object string) {
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
 	generationBytes, e := os.ReadFile(cacheFileName)
 	if e != nil {
-		logger.Debug("failed to read lock cache: %+v", cacheFileName)
+		logger.Debug(module, "failed to read lock cache: %+v", cacheFileName)
 		common.Finish()
 	}
 	generation := binary.LittleEndian.Uint64(generationBytes)
-	if e := DoAttemptUnlock(bucket, object, int64(generation)); e != nil {
-		logger.Debug("unlock error: %+v", e)
+	if e := g.DoAttemptUnlock(bucket, object, int64(generation)); e != nil {
+		logger.Debug(module, "unlock error: %+v", e)
 		common.Finish()
 	}
 }
 
 // DoAttemptLock returns generation and potential error
-func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
+func (g *GCS) DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 	// write lock
-	client := storageClient()
-	o := client.Bucket(bucket).Object(object)
+	g.init()
+	o := g.client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
 	_, _ = wc.Write([]byte("1"))
 	e0 := wc.Close()
@@ -383,34 +366,34 @@ func DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
 	//upon sucessful write, store generation in /tmp
 	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
 	return attrs.Generation, nil
-
 }
 
 // AttemptLock attempts to write a remote lock file
-func AttemptLock(bucket, object string, ttl time.Duration) {
-	generation, e := DoAttemptLock(bucket, object, ttl)
+func (g *GCS) AttemptLock(bucket, object string, ttl time.Duration) {
+	generation, e := g.DoAttemptLock(bucket, object, ttl)
 	if e != nil {
-		logger.Info("attemp lock failed: %s", e)
+		logger.Info(module, "attemp lock failed: %s", e)
 		common.Exit()
 	}
 
 	//upon sucessful write, store generation in /tmp
-	logger.Debug("AttemptLock: storing generation: %+v", generation)
+	logger.Debug(module, "AttemptLock: storing generation: %+v", generation)
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
 	generationBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(generationBytes, uint64(generation))
 	if e1 := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); e1 != nil {
-		logger.Info("AttemptLock: cache lock generation failed: %s", e1)
+		logger.Info(module, "AttemptLock: cache lock generation failed: %s", e1)
 		common.Exit()
 	}
 }
 
 // UploadObject uploads an object from a file
-func UploadObject(srcFile, bucket, object string, bars *bar.Container) {
+func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) {
+	g.init()
 	// open source file
 	f, err := os.Open(srcFile)
 	if err != nil {
-		logger.Info("upload object failed when open file with %s", err)
+		logger.Info(module, "upload object failed when open file with %s", err)
 		common.Exit()
 	}
 	defer func() { _ = f.Close() }()
@@ -418,38 +401,37 @@ func UploadObject(srcFile, bucket, object string, bars *bar.Container) {
 	// progress bar
 	size := common.GetFileSize(srcFile)
 	modTime := common.GetFileModificationTime(srcFile)
-	pb := bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
+	pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
 
 	// upload file
-	client := storageClient()
-	o := client.Bucket(bucket).Object(object)
+	o := g.client.Bucket(bucket).Object(object)
 	wc := o.NewWriter(context.Background())
 	wc.Metadata = map[string]string{
 		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
 	}
 	if _, err = io.Copy(io.MultiWriter(wc, pb), f); err != nil {
-		logger.Info("upload object failed when copy file with %s", err)
+		logger.Info(module, "upload object failed when copy file with %s", err)
 		common.Exit()
 	}
 	defer func() { _ = wc.Close() }()
 }
 
 // MoveObject moves an object
-func MoveObject(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
+func (g *GCS) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 	if srcBucket == dstBucket && srcPrefix == dstPrefix {
 		return
 	}
-	CopyObject(srcBucket, srcPrefix, dstBucket, dstPrefix)
-	DeleteObject(srcBucket, srcPrefix)
+	g.Copy(srcBucket, srcPrefix, dstBucket, dstPrefix)
+	g.Delete(srcBucket, srcPrefix)
 }
 
 // OutputObject outputs an object
-func OutputObject(bucket, prefix string) []byte {
+func (g *GCS) Cat(bucket, prefix string) []byte {
 	// create reader
-	client := storageClient()
-	rc, err := client.Bucket(bucket).Object(prefix).NewReader(context.Background())
+	g.init()
+	rc, err := g.client.Bucket(bucket).Object(prefix).NewReader(context.Background())
 	if err != nil {
-		logger.Info("output object failed when create reader with %s", err)
+		logger.Info(module, "output object failed when create reader with %s", err)
 		common.Exit()
 	}
 	defer func() { _ = rc.Close() }()
@@ -458,7 +440,7 @@ func OutputObject(bucket, prefix string) []byte {
 	buf := new(bytes.Buffer)
 	_, err = buf.ReadFrom(rc)
 	if err != nil {
-		logger.Info("output object failed when write to buffer with %s", err)
+		logger.Info(module, "output object failed when write to buffer with %s", err)
 		common.Exit()
 	}
 	bs := buf.Bytes()
@@ -470,11 +452,8 @@ func OutputObject(bucket, prefix string) []byte {
 // case 2: gs://abc/de -> gs://abc/def/ : false
 // case 3: gs://abc/def/ -> gs://abc/def/ : false
 // case 4: gs://abc/def -> gs://abc/def : true
-func IsObject(bucket, prefix string) bool {
-	if GetObjectAttributes(bucket, prefix) != nil {
-		return true
-	}
-	return false
+func (g *GCS) IsObject(bucket, prefix string) bool {
+	return g.GCSAttrs(bucket, prefix) != nil
 }
 
 // IsDirectory checks if is a directory
@@ -482,8 +461,8 @@ func IsObject(bucket, prefix string) bool {
 // case 2: gs://abc/de -> gs://abc/def/ : false
 // case 3: gs://abc/def/ -> gs://abc/def/ : true
 // case 4: gs://abc/def -> gs://abc/def : false
-func IsDirectory(bucket, prefix string) bool {
-	objs := GetObjectsAttributes(bucket, prefix, false)
+func (g *GCS) IsDirectory(bucket, prefix string) bool {
+	objs := g.batchAttrs(bucket, prefix, false)
 	if len(objs) == 1 {
 		if len(objs[0].Name) > len(prefix) {
 			return true
@@ -521,14 +500,14 @@ func GetFileModificationTime(attrs *storage.ObjectAttrs) time.Time {
 
 // equalCRC32C return true if CRC32C values are the same
 // - compare a local file with an object from gcp
-func equalCRC32C(localPath, bucket, object string) bool {
+func (g *GCS) equalCRC32C(localPath, bucket, object string) bool {
 	localCRC32C := common.GetFileCRC32C(localPath)
 	gcpCRC32C := uint32(0)
-	attr := GetObjectAttributes(bucket, object)
+	attr := g.GCSAttrs(bucket, object)
 	if attr != nil {
 		gcpCRC32C = attr.CRC32C
 	}
-	logger.Info("CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
+	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
 		localPath, bucket, object, localCRC32C, gcpCRC32C)
 	return localCRC32C == gcpCRC32C
 }
@@ -536,13 +515,13 @@ func equalCRC32C(localPath, bucket, object string) bool {
 // MustEqualCRC32C compare CRC32C values if flag is set
 // - compare a local file with an object from gcp
 // - exit process if values are different
-func MustEqualCRC32C(flag bool, localPath, bucket, object string) {
+func (g *GCS) MustEqualCRC32C(flag bool, localPath, bucket, object string) {
 	if !flag {
 		return
 	}
-	if !equalCRC32C(localPath, bucket, object) {
-		logger.Info("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+	if !g.equalCRC32C(localPath, bucket, object) {
+		logger.Info(module, "CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 		common.Exit()
 	}
-	logger.Info("CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 }

@@ -5,9 +5,8 @@ import (
 	"runtime"
 
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
-	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -37,9 +36,10 @@ var upgradeCmd = &cobra.Command{
 			fmt.Sprintf("%s-%s", os, arch),
 			upgradeName,
 		)
-		srcObj := gcp.GetObjectAttributes(upgradeBucket, srcPath)
+		g := system.Lookup("gs")
+		srcObj := g.Attributes(upgradeBucket, srcPath)
 		if srcObj == nil {
-			logger.Info("Not found file: %s", srcPath)
+			logger.Info(module, "gsg release not found: %s", srcPath)
 			common.Exit()
 		}
 
@@ -48,20 +48,21 @@ var upgradeCmd = &cobra.Command{
 			common.GetWorkDir(),
 			upgradeName,
 		)
-		dstObj := linux.GetObjectAttributes(dstPath)
+		l := system.Lookup("")
+		dstObj := l.Attributes("", dstPath)
 		if dstObj == nil {
-			logger.Info("Not found file: %s", dstPath)
+			logger.Info(module, "File not found: %s", dstPath)
 			common.Exit()
 		}
 
 		// check version
-		if dstObj.CRC32C == srcObj.CRC32C {
-			logger.Info("Already the latest version")
+		if dstObj.CRC32 == srcObj.CRC32 {
+			logger.Info(module, "Already the latest version")
 			return
 		}
 
 		// upgrade local version
-		gcp.DownloadObject(upgradeBucket, srcPath, dstPath, bars, true)
+		g.Download(upgradeBucket, srcPath, srcPath, true, system.RunContext{Bars: bars, Pool: pool})
 		common.Chmod(dstPath, 0766)
 	},
 }

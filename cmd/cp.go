@@ -2,9 +2,9 @@ package cmd
 
 import (
 	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
 	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -15,6 +15,113 @@ func init() {
 	rootCmd.AddCommand(cpCmd)
 }
 
+func upload(src, dst *system.FileObject, forceChecksum, isRec bool) {
+	switch src.FileType() {
+	case system.FileType_Directory:
+		if isRec {
+			objs := src.System.List(src.Bucket, src.Prefix, isRec)
+			for _, obj := range objs {
+				op := obj.Prefix
+				dstPath := common.GetDstPath(linux.GetRealPath(src.Prefix), op, dst.Prefix)
+				pool.Add(func() { dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
+			}
+		} else {
+			logger.Info(module, "Omitting prefix[%s]. (Did you mean to do cp -r?)", src.Prefix)
+			common.Exit()
+		}
+	case system.FileType_Object:
+		dstPrefix := dst.Prefix
+		if dst.FileType() == system.FileType_Directory {
+			_, name := common.ParseFile(src.Prefix)
+			dstPrefix = common.JoinPath(dstPrefix, name)
+		}
+		pool.Add(func() { dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars}) })
+	case system.FileType_Invalid:
+		logger.Info(module, "Invalid prefix[%s]", src.Prefix)
+		common.Exit()
+	}
+}
+
+func download(src, dst *system.FileObject, forceChecksum, isRec bool) {
+	switch src.FileType() {
+	case system.FileType_Directory:
+		if isRec {
+			objs := src.System.List(src.Bucket, src.Prefix, isRec)
+			for _, obj := range objs {
+				dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
+				src.System.Download(src.Bucket, obj.Prefix, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool})
+			}
+		} else {
+			logger.Info(module, "Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", src.Bucket, src.Prefix)
+			common.Exit()
+		}
+	case system.FileType_Object:
+		dstPrefix := dst.Prefix
+		if dst.FileType() == system.FileType_Directory {
+			_, name := common.ParseFile(src.Prefix)
+			dstPrefix = common.JoinPath(dst.Prefix, name)
+		}
+		src.System.Download(src.Bucket, src.Prefix, dstPrefix, forceChecksum, system.RunContext{Bars: bars, Pool: pool})
+	case system.FileType_Invalid:
+		logger.Info(module, "Invalid bucket[%s] with prefix[%s]", src.Bucket, src.Prefix)
+		common.Exit()
+	}
+}
+
+func cloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
+	if src.System != dst.System {
+		logger.Info(module, "inter cloud copy not supported. [%s] => [%s]", src.Bucket, dst.Bucket)
+		common.Exit()
+	}
+	switch src.FileType() {
+	case system.FileType_Directory:
+		if !isRec {
+			logger.Info(module, "Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", src.Bucket, src.Prefix)
+			common.Exit()
+		}
+		objs := src.System.List(src.Bucket, src.Prefix, isRec)
+		for _, obj := range objs {
+			op := obj.Prefix
+			dstPath := common.GetDstPath(src.Prefix, op, dst.Prefix)
+			pool.Add(func() { src.System.Copy(src.Bucket, op, dst.Bucket, dstPath) })
+		}
+	case system.FileType_Object:
+		dstPrefix := dst.Prefix
+		if dst.FileType() == system.FileType_Directory {
+			_, name := common.ParseFile(src.Prefix)
+			dstPrefix = common.JoinPath(dst.Prefix, name)
+		}
+		pool.Add(func() { src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dstPrefix) })
+	case system.FileType_Invalid:
+		logger.Info(module, "Invalid bucket[%s] with prefix[%s]", src.Bucket, src.Prefix)
+		common.Exit()
+	}
+}
+
+func localCopy(src, dst *system.FileObject, forceChecksum, recursive bool) {
+	if src.FileType() == system.FileType_Invalid {
+		logger.Info(module, "Invalid local path: [%s]", src.Prefix)
+		common.Exit()
+	}
+	pool.Add(func() { src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dst.Prefix) })
+}
+
+func doCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
+	if dst.Remote {
+		if !src.Remote {
+			upload(src, dst, forceChecksum, isRec)
+		} else {
+			cloudCopy(src, dst, forceChecksum, isRec)
+		}
+	} else {
+		if !src.Remote {
+			localCopy(src, dst, forceChecksum, isRec)
+		} else {
+			download(src, dst, forceChecksum, isRec)
+		}
+	}
+}
+
 var cpCmd = &cobra.Command{
 	Use:   "cp [-v] [-r] [source url]... [destination url]",
 	Short: "Copy files and objects",
@@ -23,89 +130,11 @@ var cpCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		isRec, _ := cmd.Flags().GetBool("r")
 		forceChecksum, _ := cmd.Flags().GetBool("v")
-		dstScheme, dstBucket, dstPrefix := common.ParseURL(args[len(args)-1])
+		dst := system.ParseFileObject(args[len(args)-1])
 
 		for i := 0; i < len(args)-1; i++ {
-			srcScheme, srcBucket, srcPrefix := common.ParseURL(args[i])
-
-			switch srcScheme + "-" + dstScheme {
-			case "gs-":
-				if gcp.IsDirectory(srcBucket, srcPrefix) {
-					if isRec {
-						objs := gcp.ListObjects(srcBucket, srcPrefix, isRec)
-						for _, obj := range objs {
-							dstPath := common.GetDstPath(srcPrefix, obj, dstPrefix)
-							gcp.DownloadObjectWithWorkerPool(srcBucket, obj, dstPath, pool, bars, forceChecksum)
-						}
-					} else {
-						logger.Info("Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", srcBucket, srcPrefix)
-						common.Exit()
-					}
-				} else if gcp.IsObject(srcBucket, srcPrefix) {
-					if linux.IsDirectory(dstPrefix) {
-						_, name := common.ParseFile(srcPrefix)
-						dstPrefix = common.JoinPath(dstPrefix, name)
-					}
-					gcp.DownloadObjectWithWorkerPool(srcBucket, srcPrefix, dstPrefix, pool, bars, forceChecksum)
-				} else {
-					logger.Info("Invalid bucket[%s] with prefix[%s]", srcBucket, srcPrefix)
-					common.Exit()
-				}
-			case "-gs":
-				if linux.IsDirectory(srcPrefix) {
-					if isRec {
-						objs := linux.ListObjects(srcPrefix, isRec)
-						for _, obj := range objs {
-							lobj := obj
-							dstPath := common.GetDstPath(linux.GetRealPath(srcPrefix), lobj, dstPrefix)
-							pool.Add(func() { gcp.UploadObject(lobj, dstBucket, dstPath, bars) })
-						}
-					} else {
-						logger.Info("Omitting prefix[%s]. (Did you mean to do cp -r?)", srcBucket)
-						common.Exit()
-					}
-				} else if linux.IsObject(srcPrefix) {
-					if gcp.IsDirectory(dstBucket, dstPrefix) {
-						_, name := common.ParseFile(srcPrefix)
-						dstPrefix = common.JoinPath(dstPrefix, name)
-					}
-					pool.Add(func() { gcp.UploadObject(srcPrefix, dstBucket, dstPrefix, bars) })
-				} else {
-					logger.Info("Invalid prefix[%s]", srcPrefix)
-					common.Exit()
-				}
-			case "gs-gs":
-				if gcp.IsDirectory(srcBucket, srcPrefix) {
-					if isRec {
-						objs := gcp.ListObjects(srcBucket, srcPrefix, isRec)
-						for _, obj := range objs {
-							srcPath := obj
-							dstPath := common.GetDstPath(srcPrefix, obj, dstPrefix)
-							pool.Add(func() { gcp.CopyObject(srcBucket, srcPath, dstBucket, dstPath) })
-						}
-					} else {
-						logger.Info("Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", srcBucket, srcPrefix)
-						common.Exit()
-					}
-				} else if gcp.IsObject(srcBucket, srcPrefix) {
-					if gcp.IsDirectory(dstBucket, dstPrefix) {
-						_, name := common.ParseFile(srcPrefix)
-						dstPrefix = common.JoinPath(dstPrefix, name)
-					}
-					pool.Add(func() { gcp.CopyObject(srcBucket, srcPrefix, dstBucket, dstPrefix) })
-				} else {
-					logger.Info("Invalid bucket[%s] with prefix[%s]", srcBucket, srcPrefix)
-					common.Exit()
-				}
-			case "-":
-				if !linux.IsDirectoryOrObject(srcPrefix) {
-					logger.Info("Invalid prefix[%s]", srcPrefix)
-					common.Exit()
-				}
-				pool.Add(func() { linux.CopyObject(srcPrefix, dstPrefix) })
-			default:
-				logger.Info("Not supported yet")
-			}
+			src := system.ParseFileObject(args[i])
+			doCopy(src, dst, forceChecksum, isRec)
 		}
 	},
 }

@@ -1,9 +1,10 @@
 package cmd
 
 import (
-	"github.com/nextbillion-ai/gsg/common"
-	"github.com/nextbillion-ai/gsg/gcp"
+	"strings"
+
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
 )
@@ -22,11 +23,11 @@ var versionsCmd = &cobra.Command{
 	Short: "List the versions of gsg",
 	Long:  "List the versions of gsg",
 	Run: func(_ *cobra.Command, _ []string) {
-		vs := gcp.ListObjects(versionsBucket, versionsPrefix, true)
+		g := system.Lookup("gs")
+		vs := g.List(versionsBucket, versionsPrefix, true)
 		for _, v := range vs {
-			_, n := common.ParseFile(v)
-			if n != "install.sh" {
-				logger.Info("https://%s/%s", versionsBucket, v)
+			if !strings.HasSuffix(v.Prefix, "/install.sh") {
+				logger.Info(module, "https://%s/%s", versionsBucket, v.Prefix)
 			}
 		}
 	},

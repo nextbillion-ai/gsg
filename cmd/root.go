@@ -6,10 +6,17 @@ import (
 
 	"github.com/nextbillion-ai/gsg/bar"
 	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/gcs"
+	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/system"
 	"github.com/nextbillion-ai/gsg/worker"
 
 	"github.com/spf13/cobra"
+)
+
+const (
+	module = ""
 )
 
 var (
@@ -22,6 +29,8 @@ var (
 )
 
 func init() {
+	system.Register(&gcs.GCS{})
+	system.Register(&linux.Linux{})
 	rootCmd.PersistentFlags().BoolP(
 		"m", "m", false,
 		"enabel concurrency of execution workers",
@@ -102,7 +111,7 @@ func Execute() error {
 	pool.Run()
 
 	logger.Debug(
-		"enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d",
+		module, "enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d",
 		enableMultiThread, mockFail, multiThread, selectedMultiThread, screenCols, screenLines,
 	)
 
@@ -112,7 +121,7 @@ func Execute() error {
 
 	err := rootCmd.Execute()
 	if err != nil {
-		logger.Debug("failed with err %s", err)
+		logger.Debug(module, "failed with err %s", err)
 		common.Exit()
 	}
 
