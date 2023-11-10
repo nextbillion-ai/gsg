@@ -5,14 +5,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/nextbillion-ai/gsg/bar"
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
+	"google.golang.org/api/googleapi"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -237,40 +240,70 @@ func (s *S3) Download(
 		logger.Debug(module, "failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
 		return
 	}
-	gi := s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(prefix),
-	}
-	if forceChecksum {
-		gi.ChecksumMode = types.ChecksumModeEnabled
-	}
-	oo, oe := s.client.GetObject(context.TODO(), &gi)
-	if oe != nil {
-		logger.Info(module, "download object failed when create reader with %s", oe)
-		common.Exit()
+	chunkSize := int64(googleapi.DefaultUploadChunkSize)
+	chunkNumber := int(math.Ceil(float64(attrs.S3Attrs.ObjectSize) / float64(chunkSize)))
+	if chunkNumber <= 0 {
+		chunkNumber = 1
 	}
 
+	var pb *bar.ProgressBar
 	var wg sync.WaitGroup
+	var once sync.Once
 	dstFileTemp := common.GetTempFile(dstFile)
+	for i := 0; i < chunkNumber; i++ {
 
-	wg.Add(1)
-	ctx.Pool.Add(
-		func() {
-			defer wg.Done()
-			folder, _ := common.ParseFile(dstFile)
-			if !common.IsPathExist(folder) {
-				common.CreateFolder(folder)
-			}
-			common.CreateFile(dstFileTemp, oo.ContentLength)
-			file, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
-			defer file.Close()
-			_, ce := io.Copy(file, oo.Body)
-			if ce != nil {
-				logger.Info(module, "io Copy failed with: %s", ce)
-				common.Exit()
-			}
-		},
-	)
+		// decide offset and length
+		startByte := int64(i) * chunkSize
+		length := chunkSize
+		if i == chunkNumber-1 {
+			length = attrs.S3Attrs.ObjectSize - startByte
+		}
+
+		wg.Add(1)
+		ctx.Pool.Add(
+			func() {
+				defer wg.Done()
+
+				// create folder and temp file if not exist
+				once.Do(func() {
+					pb = ctx.Bars.New(attrs.S3Attrs.ObjectSize, fmt.Sprintf("Downloading [%s]:", prefix))
+					folder, _ := common.ParseFile(dstFile)
+					if !common.IsPathExist(folder) {
+						common.CreateFolder(folder)
+					}
+					common.CreateFile(dstFileTemp, attrs.S3Attrs.ObjectSize)
+				})
+				gi := s3.GetObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(prefix),
+					Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startByte, startByte+length)),
+				}
+				if forceChecksum {
+					gi.ChecksumMode = types.ChecksumModeEnabled
+				}
+				oo, oe := s.client.GetObject(context.TODO(), &gi)
+				if oe != nil {
+					logger.Info(module, "download object failed when create reader with %s", oe)
+					common.Exit()
+				}
+
+				// create write with offset and length of file
+				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				_, se := fl.Seek(startByte, 0)
+				if se != nil {
+					logger.Info(module, "download object failed when seek for offset with %s", se)
+					common.Exit()
+				}
+				defer func() { _ = fl.Close() }()
+
+				// write data with offset and length to file
+				if _, we := io.Copy(io.MultiWriter(fl, pb), oo.Body); we != nil {
+					logger.Info(module, "download object failed when write to offet with %s", we)
+					common.Exit()
+				}
+			},
+		)
+	}
 
 	// move back the temp file
 	ctx.Pool.Add(func() {

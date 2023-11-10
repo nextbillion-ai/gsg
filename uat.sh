@@ -28,17 +28,54 @@ same() {
 assert() {
     if [[ "$2" == "remote" ]]
     then
-        if gsutil ls $remote_base/$1 &>/dev/null
-        then
-            echo OK: $1 exists remotely.
-        else
-            echo FATAL: required file $1 does not exists remotely.
+        case $mode in
+        gs)
+            if gsutil ls $remote_base/$1 &>/dev/null
+            then
+                content="$(gsutil cat $remote_base/$1 2>/dev/null)"
+                if [[ "$content" == "$testid" ]]
+                then
+                    echo OK: $1 exists with correct content remotely.
+                else
+                    echo FATAL: required file $1 does not have correct content remotely.
+                    exit 1
+                fi
+            else
+                echo FATAL: required file $1 does not exists remotely.
+                exit 1
+            fi
+            ;;
+        s3)
+            if aws s3 cp $remote_base/$1 .temp &>/dev/null 
+            then
+                content="$(cat .temp)"
+                if [[ "$content" == "$testid" ]]
+                then
+                    echo OK: $1 exists with correct content remotely.
+                else
+                    echo FATAL: required file $1 does not have correct content remotely.
+                    exit 1
+                fi
+            else
+                echo FATAL: required file $1 does not exists remotely.
+                exit 1
+            fi
+            ;;
+        *)
             exit 1
-        fi
+            ;;
+        esac
     else
-        if ls $1 &>/dev/null
+        if ls $1 &>/dev/null 
         then
-            echo OK: $1 exists locally.
+            content=$(cat $1)
+            if [[ "$content" == "$testid" ]]
+            then
+                echo OK: $1 exists with correct content locally.
+            else
+                echo FATAL: required file $1 does not have correct content locally.
+                exit 1
+            fi
         else
             echo FATAL: required file $1 does not exists locally.
             exit 1
@@ -47,27 +84,54 @@ assert() {
 }
 
 assert_not() {
-    if asset $1 $2
+    if [[ "$2" == "remote" ]]
     then
-        echo FATAL: assert_not failed for file $1
-        exit 1
+        case $mode in
+        gs)
+            if gsutil ls $remote_base/$1 &>/dev/null
+            then
+                echo FATAL: required file $1 does exists remotely.
+                exit 1
+            else
+                echo OK: required file $1 does not exists remotely.
+            fi
+            ;;
+        s3)
+            if aws s3 cp $remote_base/$1 .temp &>/dev/null 
+            then
+                echo FATAL: required file $1 does exists remotely.
+                exit 1
+            else
+                echo OK: required file $1 does not exists remotely.
+            fi
+            ;;
+        *)
+            exit 1
+            ;;
+        esac
     else
-        echo OK: $1 does not exists
+        if ls $1 &>/dev/null 
+        then
+            echo FATAL: required file $1 does exists locally.
+            exit 1
+        else
+            echo OK: required file $1 does not exists locally.
+        fi
     fi
 }
 
 remote_copy() {
     local r=""
-    case $1 in
+    case $mode in
     gs)
-        if [[ "$2" == "true" ]]
+        if [[ "$1" == "true" ]]
         then
             r=" -r"
         fi
         echo "gsutil cp $r"
         ;;
     s3)
-        if [[ "$2" == "true" ]]
+        if [[ "$1" == "true" ]]
         then
             r=" --recursive"
         fi
@@ -77,6 +141,10 @@ remote_copy() {
         exit 1
         ;;
     esac
+}
+
+prepare_file() {
+    echo "$testid" > $1
 }
 
 do_test() {
@@ -95,7 +163,7 @@ do_test() {
 
     start "test upload"
     start "test upload single file"
-    touch to_upload
+    prepare_file to_upload
     ../gsg cp to_upload $remote_base/to_upload
     assert to_upload remote
     finish
@@ -103,9 +171,9 @@ do_test() {
 
     start "test upload a folder"
     mkdir -p $ftu/a/b/c
-    touch $ftu/a/1.txt
-    touch $ftu/a/2.txt
-    touch $ftu/a/b/c/3.txt
+    prepare_file $ftu/a/1.txt
+    prepare_file $ftu/a/2.txt
+    prepare_file $ftu/a/b/c/3.txt
     ../gsg cp -r $ftu $remote_base/$ftu
     assert $ftu/a/1.txt remote
     assert $ftu/a/2.txt remote
@@ -115,8 +183,8 @@ do_test() {
     start "test download"
 
     start "test download single file"
-    touch to_download
-    $(remote_copy $mode) to_download $remote_base/to_download
+    prepare_file to_download
+    $(remote_copy) to_download $remote_base/to_download
     rm to_download
     ../gsg cp $remote_base/to_download to_download
     assert to_download
@@ -125,10 +193,10 @@ do_test() {
     ftd="folder_to_download"
     start "test download a folder"
     mkdir -p $ftd/a/b/c
-    touch $ftd/a/1.txt
-    touch $ftd/a/2.txt
-    touch $ftd/a/b/c/3.txt
-    $(remote_copy $mode true) $ftd $remote_base/$ftd
+    prepare_file $ftd/a/1.txt
+    prepare_file $ftd/a/2.txt
+    prepare_file $ftd/a/b/c/3.txt
+    $(remote_copy true) $ftd $remote_base/$ftd
     rm -rf $ftd
     ../gsg cp -r $remote_base/$ftd $ftd
     assert $ftd/a/1.txt
@@ -142,25 +210,27 @@ do_test() {
 
     start "test rsync a local folder to remote"
     mkdir -p $ftr/a/b/c
-    touch $ftr/a/1.txt
-    touch $ftr/a/2.txt
-    touch $ftr/a/b/c/3.txt
+    prepare_file $ftr/a/1.txt
+    prepare_file $ftr/a/2.txt
+    prepare_file $ftr/a/b/c/3.txt
     ../gsg rsync -r $ftr $remote_base/$ftr
     assert $ftr/a/1.txt remote
     assert $ftr/a/2.txt remote
     assert $ftr/a/b/c/3.txt remote
     echo "whocares" > $ftr/a/1.txt
     ../gsg rsync -r $ftr $remote_base/$ftr
-    $(remote_copy $mode) $remote_base/$ftr/a/1.txt $ftr/a/1_remote.txt
+    $(remote_copy) $remote_base/$ftr/a/1.txt $ftr/a/1_remote.txt
     same $ftr/a/1.txt $ftr/a/1_remote.txt
     finish
 
     start "test rsync a remote folder to local"
+    prepare_file $ftr/a/1.txt
+    $(remote_copy) $ftr/a/1.txt $remote_base/$ftr/a/1.txt
     rm -rf $ftr
     ../gsg rsync -r $remote_base/$ftr $ftr
-    assert $ftr/a/1.txt remote
-    assert $ftr/a/2.txt remote
-    assert $ftr/a/b/c/3.txt remote
+    assert $ftr/a/1.txt
+    assert $ftr/a/2.txt
+    assert $ftr/a/b/c/3.txt
     finish
 
     start "test rsync with -d and non-existing src"
