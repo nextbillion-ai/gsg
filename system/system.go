@@ -140,6 +140,7 @@ func ParseFileObject(path string) *FileObject {
 				Prefix: strings.TrimLeft(u.Path, "/"),
 				Remote: true,
 			}
+			logger.Debug("parse", "fo: %+v", fo)
 			return fo
 		}
 	}
