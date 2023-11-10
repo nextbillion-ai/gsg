@@ -52,7 +52,7 @@ func (g *GCS) toAttrs(attrs *storage.ObjectAttrs) *system.Attrs {
 	}
 }
 
-func (g *GCS) toFileObject(attrs *storage.ObjectAttrs) *system.FileObject {
+func (g *GCS) toFileObject(attrs *storage.ObjectAttrs, bucket string) *system.FileObject {
 	if attrs == nil {
 		return nil
 	}
@@ -62,7 +62,7 @@ func (g *GCS) toFileObject(attrs *storage.ObjectAttrs) *system.FileObject {
 	}
 	fo := &system.FileObject{
 		System: g,
-		Bucket: attrs.Bucket,
+		Bucket: bucket,
 		Prefix: name,
 		Remote: true,
 	}
@@ -94,6 +94,9 @@ func (g *GCS) init() {
 
 func (g *GCS) GCSAttrs(bucket, prefix string) *storage.ObjectAttrs {
 	g.init()
+	if prefix == "" {
+		return nil
+	}
 	attrs, err := g.client.Bucket(bucket).Object(prefix).Attrs(context.Background())
 	if err != nil {
 		logger.Debug(module, "failed with gs://%s/%s %s", bucket, prefix, err)
@@ -156,7 +159,7 @@ func (g *GCS) BatchAttributes(bucket, prefix string, recursive bool) []*system.A
 func (g *GCS) List(bucket, prefix string, recursive bool) []*system.FileObject {
 	fos := []*system.FileObject{}
 	for _, attr := range g.batchAttrs(bucket, prefix, recursive) {
-		fos = append(fos, g.toFileObject(attr))
+		fos = append(fos, g.toFileObject(attr, bucket))
 	}
 	return fos
 }

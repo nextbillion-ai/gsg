@@ -74,7 +74,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	for _, fo := range copyList {
 		from := fo.Prefix
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-		pool.Add(func() { system.Lookup("gs").Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
+		pool.Add(func() { dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
 	}
 	if isDel {
 		for _, fo := range deleteList {
