@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,6 +128,7 @@ func (s *S3) Attributes(bucket, prefix string) *system.Attrs {
 	return s.toAttrs(s.S3Attrs(bucket, prefix))
 }
 
+/*
 var (
 	subFileTest   = regexp.MustCompile(`^/?[^/]+$`)
 	subFolderTest = regexp.MustCompile(`^/?([^/]+/).*`)
@@ -146,6 +146,7 @@ func matchImmediateSubPath(prefix, path string) string {
 	}
 	return ""
 }
+*/
 
 func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []string {
 	s.init()
