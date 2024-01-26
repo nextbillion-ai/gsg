@@ -7,7 +7,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +47,9 @@ func (s *S3) toAttrs(attrs *S3Attributes) *system.Attrs {
 	if attrs == nil {
 		return nil
 	}
+	if attrs.S3Attrs == nil {
+		return nil
+	}
 	var crc32c uint64 = 0
 	if attrs.S3Attrs.Checksum != nil && attrs.S3Attrs.Checksum.ChecksumCRC32C != nil {
 		crc32c, _ = strconv.ParseUint(*attrs.S3Attrs.Checksum.ChecksumCRC32C, 10, 32)
@@ -70,6 +75,7 @@ func (s *S3) toFileObject(attrs *S3Attributes) *system.FileObject {
 	if attrs == nil {
 		return nil
 	}
+
 	fo := &system.FileObject{
 		System: s,
 		Bucket: attrs.Bucket,
@@ -77,6 +83,7 @@ func (s *S3) toFileObject(attrs *S3Attributes) *system.FileObject {
 		Remote: true,
 	}
 	fo.SetAttributes(s.toAttrs(attrs))
+
 	return fo
 }
 
@@ -122,27 +129,77 @@ func (s *S3) Attributes(bucket, prefix string) *system.Attrs {
 	return s.toAttrs(s.S3Attrs(bucket, prefix))
 }
 
-func (s *S3) batchAttrs(bucket, prefix string, recursive bool) []*S3Attributes {
+var (
+	subFileTest   = regexp.MustCompile(`^/?[^/]+$`)
+	subFolderTest = regexp.MustCompile(`^/?([^/]+/).*`)
+)
+
+func matchImmediateSubPath(prefix, path string) string {
+	testPath := strings.Replace(path, prefix, "", 1)
+	if match := subFileTest.FindStringSubmatch(testPath); len(match) > 0 {
+		//fmt.Printf("subFile: %s, %s, %s\n", prefix, path, testPath)
+		return path
+	}
+	if match := subFolderTest.FindStringSubmatch(testPath); len(match) > 0 {
+		//fmt.Printf("subFolder: %s, %s, %s, %s\n", prefix, path, testPath, match[1])
+		return prefix + match[1]
+	}
+	return ""
+}
+
+func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []string {
 	s.init()
 	if !s.IsObject(bucket, prefix) {
 		prefix = common.SetPrefixAsDirectory(prefix)
 	}
 	li := s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
+		Bucket:    aws.String(bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String(""),
 	}
-	if !recursive {
-		li.Delimiter = aws.String("/")
-	}
+
 	lo, le := s.client.ListObjectsV2(context.TODO(), &li)
 	if le != nil {
 		logger.Info(module, "get objects attributes failed with %s", le)
 		common.Exit()
 	}
-	res := []*S3Attributes{}
+	subPaths := []string{}
+	subPathMap := map[string]bool{}
+
 	for _, o := range lo.Contents {
-		res = append(res, s.S3Attrs(bucket, *o.Key))
+		if !recursive {
+			subPath := matchImmediateSubPath(prefix, *o.Key)
+			if subPath != "" && !subPathMap[subPath] {
+				subPaths = append(subPaths, subPath)
+				subPathMap[subPath] = true
+			}
+			continue
+		}
+		subPaths = append(subPaths, *o.Key)
+
 	}
+	return subPaths
+}
+
+func (s *S3) batchAttrs(bucket, prefix string, recursive bool) []*S3Attributes {
+	subPaths := s.listObjectsAndSubPaths(bucket, prefix, recursive)
+	res := make([]*S3Attributes, len(subPaths))
+	var wg sync.WaitGroup
+	for index, subPath := range subPaths {
+		if strings.HasSuffix(subPath, "/") {
+			res[index] = &S3Attributes{
+				Bucket: bucket,
+				Prefix: subPath,
+			}
+			continue
+		}
+		wg.Add(1)
+		go func(index int, subPath string) {
+			defer wg.Done()
+			res[index] = s.S3Attrs(bucket, subPath)
+		}(index, subPath)
+	}
+	wg.Wait()
 	return res
 
 }
@@ -387,13 +444,12 @@ func (s *S3) IsObject(bucket, prefix string) bool {
 
 // IsDirectory checks if is a directory
 func (s *S3) IsDirectory(bucket, prefix string) bool {
-	objs := s.batchAttrs(bucket, prefix, true)
-	if len(objs) == 1 {
-		if len(objs[0].Prefix) > len(prefix) {
-			return true
-		}
-	} else if len(objs) > 1 {
+	objs := s.listObjectsAndSubPaths(bucket, prefix, true)
+	if len(objs) > 1 {
 		return true
+	}
+	if len(objs) == 1 {
+		return len(objs[0]) > len(prefix)
 	}
 	return false
 }
