@@ -163,11 +163,17 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []str
 	var lo *s3.ListObjectsV2Output
 	var le error
 	objects := []types.Object{}
+	commonPrefixes := map[string]struct{}{}
 	index := 0
 	for {
 		if lo, le = s.client.ListObjectsV2(context.TODO(), &li); le != nil {
 			logger.Info(module, "get objects attributes failed with %s", le)
 			common.Exit()
+		}
+		if !recursive {
+			for _, cp := range lo.CommonPrefixes {
+				commonPrefixes[*cp.Prefix] = struct{}{}
+			}
 		}
 		if len(lo.Contents) == 0 {
 			break
@@ -182,9 +188,9 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []str
 	for _, o := range objects {
 		subPaths = append(subPaths, *o.Key)
 	}
-	if recursive {
-		for _, cp := range lo.CommonPrefixes {
-			subPaths = append(subPaths, *cp.Prefix)
+	if !recursive {
+		for cp := range commonPrefixes {
+			subPaths = append(subPaths, cp)
 		}
 	}
 	return subPaths
