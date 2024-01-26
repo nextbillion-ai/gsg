@@ -90,11 +90,12 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
 		return
 	}
-	if src.FileType() == system.FileType_Invalid && isDel {
-		if dst.FileType() == system.FileType_Directory {
-
+	/*
+		if src.FileType() == system.FileType_Invalid && isDel {
+			if dst.FileType() == system.FileType_Directory {
+			}
 		}
-	}
+	*/
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
 	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
