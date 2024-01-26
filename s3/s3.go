@@ -157,26 +157,35 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []str
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String(""),
 	}
-
-	lo, le := s.client.ListObjectsV2(context.TODO(), &li)
-	if le != nil {
-		logger.Info(module, "get objects attributes failed with %s", le)
-		common.Exit()
+	if !recursive {
+		li.Delimiter = aws.String("/")
 	}
-	subPaths := []string{}
-	subPathMap := map[string]bool{}
-
-	for _, o := range lo.Contents {
-		if !recursive {
-			subPath := matchImmediateSubPath(prefix, *o.Key)
-			if subPath != "" && !subPathMap[subPath] {
-				subPaths = append(subPaths, subPath)
-				subPathMap[subPath] = true
-			}
-			continue
+	var lo *s3.ListObjectsV2Output
+	var le error
+	objects := []types.Object{}
+	index := 0
+	for {
+		if lo, le = s.client.ListObjectsV2(context.TODO(), &li); le != nil {
+			logger.Info(module, "get objects attributes failed with %s", le)
+			common.Exit()
 		}
-		subPaths = append(subPaths, *o.Key)
+		if len(lo.Contents) == 0 {
+			break
+		}
+		index++
+		objects = append(objects, lo.Contents...)
+		li.StartAfter = objects[len(objects)-1].Key
+	}
 
+	subPaths := []string{}
+
+	for _, o := range objects {
+		subPaths = append(subPaths, *o.Key)
+	}
+	if recursive {
+		for _, cp := range lo.CommonPrefixes {
+			subPaths = append(subPaths, *cp.Prefix)
+		}
 	}
 	return subPaths
 }
