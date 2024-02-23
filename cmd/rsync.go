@@ -46,6 +46,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	}
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
+		println(dst.Prefix, fo.Attributes.RelativePath)
 		fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars})
 	}
 	if isDel {
@@ -211,6 +212,9 @@ func listRelatively(base *system.FileObject, isRec bool) map[string]*system.File
 	r := map[string]*system.FileObject{}
 	for _, fo := range fos {
 		fo.Attributes.RelativePath = common.GetRelativePath(base.Prefix, fo.Prefix)
+		if fo.Attributes.RelativePath == "" {
+			continue
+		}
 		r[fo.Attributes.RelativePath] = fo
 	}
 	return r
