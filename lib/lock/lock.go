@@ -43,6 +43,5 @@ func (d *Distributed) Unlock() error {
 	if d.generation == 0 {
 		return fmt.Errorf("unlock failed with generation value == 0. didn't lock first?")
 	}
-	g.AttemptUnLock(d.bucket, d.prefix)
-	return nil
+	return g.DoAttemptUnlock(d.bucket, d.prefix, d.generation)
 }
