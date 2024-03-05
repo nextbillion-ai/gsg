@@ -84,7 +84,6 @@ func (s *S3) toFileObject(attrs *S3Attributes) *system.FileObject {
 		Remote: true,
 	}
 	fo.SetAttributes(s.toAttrs(attrs))
-
 	return fo
 }
 
@@ -214,8 +213,9 @@ func (s *S3) batchAttrs(bucket, prefix string, recursive bool) []*S3Attributes {
 	for index, subPath := range subPaths {
 		if strings.HasSuffix(subPath, "/") {
 			res[index] = &S3Attributes{
-				Bucket: bucket,
-				Prefix: subPath,
+				S3Attrs: &s3.GetObjectAttributesOutput{},
+				Bucket:  bucket,
+				Prefix:  subPath,
 			}
 			continue
 		}

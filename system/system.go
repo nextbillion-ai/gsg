@@ -92,7 +92,11 @@ func (fo *FileObject) SetAttributes(attrs *Attrs) {
 		logger.Error(module, "invalid overwriting fileType from %d to %d", fo.fileType, FileType_Object)
 		common.Exit()
 	}
-	fo.fileType = FileType_Object
+	if strings.HasSuffix(fo.Prefix, "/") {
+		fo.fileType = FileType_Directory
+	} else {
+		fo.fileType = FileType_Object
+	}
 	fo.Attributes = attrs
 }
 
