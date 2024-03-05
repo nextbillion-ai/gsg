@@ -119,7 +119,7 @@ func (p *ProgressBar) drawSimple() {
 			)
 		})
 	}
-	return
+	//return
 }
 
 func humanizeBytes(s float64) string {

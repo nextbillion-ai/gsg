@@ -22,6 +22,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
 const (
@@ -87,12 +89,20 @@ func (s *S3) toFileObject(attrs *S3Attributes) *system.FileObject {
 }
 
 // storageClient gets or creates a gcp storage client
-func (s *S3) init() {
+func (s *S3) init(bucket string) {
 	if s.client != nil {
 		return
 	}
 
-	cfg, e1 := config.LoadDefaultConfig(context.TODO())
+	cfg, e1 := config.LoadDefaultConfig(context.TODO(), func(options *config.LoadOptions) error {
+		var region string
+		var err error
+		if region, err = s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, "ap-southeast-1"); err != nil {
+			return nil
+		}
+		options.Region = region
+		return nil
+	})
 	if e1 != nil {
 		logger.Info(module, "failed in loading defaultConfig with error: %s", e1)
 		common.Exit()
@@ -102,7 +112,7 @@ func (s *S3) init() {
 }
 
 func (s *S3) S3Attrs(bucket, prefix string) *S3Attributes {
-	s.init()
+	s.init(bucket)
 	var oat types.ObjectAttributes
 	if prefix == "" {
 		return nil
@@ -149,7 +159,7 @@ func matchImmediateSubPath(prefix, path string) string {
 */
 
 func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []string {
-	s.init()
+	s.init(bucket)
 	if !s.IsObject(bucket, prefix) {
 		prefix = common.SetPrefixAsDirectory(prefix)
 	}
@@ -240,29 +250,35 @@ func (s *S3) List(bucket, prefix string, recursive bool) []*system.FileObject {
 
 // GetDiskUsageObjects gets disk usage of objects under a prefix
 func (s *S3) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsage {
-	res := []system.DiskUsage{}
 	// is object
 	obj := s.S3Attrs(bucket, prefix)
 	if obj != nil {
-		res = append(res, system.DiskUsage{Size: obj.S3Attrs.ObjectSize, Name: obj.Prefix})
-		return res
+		return []system.DiskUsage{{Size: obj.S3Attrs.ObjectSize, Name: obj.Prefix}}
 	}
 	// is directory
-	total := int64(0)
+	root := system.NewDUTree(prefix, 0, true)
 	objs := s.batchAttrs(bucket, prefix, recursive)
 	for _, obj := range objs {
-		res = append(res, system.DiskUsage{Size: obj.S3Attrs.ObjectSize, Name: obj.Prefix})
-		total += obj.S3Attrs.ObjectSize
+		du := system.NewDUTree(obj.Prefix, obj.S3Attrs.ObjectSize, false)
+		dirs := system.GetAllParents(du.Name, prefix)
+		runningRoot := root
+		for _, dir := range dirs[1:] {
+			var pu *system.DUTree
+			var exists bool
+			if pu, exists = runningRoot.Children[dir]; !exists {
+				pu = system.NewDUTree(dir, 0, true)
+				runningRoot.Children[dir] = pu
+			}
+			runningRoot = pu
+		}
+		runningRoot.Children[du.Name] = du
 	}
-	if len(res) > 0 {
-		res = append(res, system.DiskUsage{Size: total, Name: common.SetPrefixAsDirectory(prefix)})
-	}
-	return res
+	return root.ToDiskUsages()
 }
 
 // DeleteObject deletes an object
 func (s *S3) Delete(bucket, prefix string) {
-	s.init()
+	s.init(bucket)
 	_, de := s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket: &bucket,
 		Key:    &prefix,
@@ -276,7 +292,7 @@ func (s *S3) Delete(bucket, prefix string) {
 
 // CopyObject copies an object
 func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
-	s.init()
+	s.init(srcBucket)
 	// check object
 	if s.S3Attrs(srcBucket, srcPrefix) == nil {
 		logger.Debug(module, "failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
@@ -306,7 +322,7 @@ func (s *S3) Download(
 	forceChecksum bool,
 	ctx system.RunContext,
 ) {
-	s.init()
+	s.init(bucket)
 	// check object
 	attrs := s.S3Attrs(bucket, prefix)
 	if attrs == nil {
@@ -392,7 +408,7 @@ func (s *S3) Download(
 
 // UploadObject uploads an object from a file
 func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) {
-	s.init()
+	s.init(bucket)
 	// open source file
 	f, err := os.Open(srcFile)
 	if err != nil {
@@ -428,7 +444,7 @@ func (s *S3) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 // OutputObject outputs an object
 func (s *S3) Cat(bucket, prefix string) []byte {
 	// create reader
-	s.init()
+	s.init(bucket)
 	o, ge := s.client.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
