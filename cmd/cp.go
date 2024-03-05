@@ -1,6 +1,12 @@
 package cmd
 
 import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"time"
+
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
@@ -133,8 +139,27 @@ var cpCmd = &cobra.Command{
 		dst := system.ParseFileObject(args[len(args)-1])
 
 		for i := 0; i < len(args)-1; i++ {
-			src := system.ParseFileObject(args[i])
+			src := system.ParseFileObject(parseStdIn(args[i]))
 			doCopy(src, dst, forceChecksum, isRec)
 		}
 	},
+}
+
+func parseStdIn(src string) string {
+	if src != "-" {
+		return src
+	}
+	reader := bufio.NewReader(os.Stdin)
+	var data []byte
+	var err error
+	if data, err = io.ReadAll(reader); err != nil {
+		logger.Error("failed to read stdin for - arg: %s", err.Error())
+		common.Exit()
+	}
+	tmpFile := fmt.Sprintf("/tmp/%d", time.Now().UnixNano())
+	if err = os.WriteFile(tmpFile, data, 0600); err != nil {
+		logger.Error("failed write tempfile from stdin: %s", err.Error())
+		common.Exit()
+	}
+	return tmpFile
 }
