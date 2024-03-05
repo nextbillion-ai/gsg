@@ -8,7 +8,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -164,28 +166,119 @@ func (g *GCS) List(bucket, prefix string, recursive bool) []*system.FileObject {
 	return fos
 }
 
+type duTree struct {
+	Name     string
+	Size     int64
+	Children map[string]*duTree
+}
+
+func (t *duTree) size() int64 {
+	total := t.Size
+	for _, v := range t.Children {
+		total += v.size()
+	}
+	return total
+}
+
+func (t *duTree) toDiskUsages() []system.DiskUsage {
+	var res []system.DiskUsage
+	childrenSlice := []*duTree{}
+	for _, v := range t.Children {
+		childrenSlice = append(childrenSlice, v)
+	}
+	if len(childrenSlice) > 0 {
+		slices.SortFunc[[]*duTree](childrenSlice, func(a, b *duTree) int {
+			if len(a.Children) > 0 && len(b.Children) == 0 {
+				return 1
+			}
+			if len(a.Children) == 0 && len(b.Children) > 0 {
+				return -1
+			}
+			return strings.Compare(a.Name, b.Name)
+			/*
+				until := len(a.Name)
+				if until > len(b.Name) {
+					until = len(b.Name)
+				}
+				for i := 0; i < until; i++ {
+					if a.Name[i] != b.Name[i] {
+						return int(a.Name[i]) - int(b.Name[i])
+					}
+				}
+				return len(a.Name) - len(b.Name)
+			*/
+		})
+		for _, c := range childrenSlice {
+			res = append(res, c.toDiskUsages()...)
+		}
+	}
+	res = append(res, system.DiskUsage{Name: t.Name, Size: t.size()})
+	return res
+}
+
+func newTree(name string, size int64, folder bool) *duTree {
+	if folder {
+		if name[len(name)-1] != '/' {
+			name += "/"
+		}
+	}
+	return &duTree{
+		Name:     name,
+		Size:     size,
+		Children: map[string]*duTree{},
+	}
+}
+
 // GetDiskUsageObjects gets disk usage of objects under a prefix
 func (g *GCS) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsage {
-	res := []system.DiskUsage{}
 	// is object
 	obj := g.GCSAttrs(bucket, prefix)
 	if obj != nil {
-		res = append(res, system.DiskUsage{Size: obj.Size, Name: obj.Name})
-		return res
+		return []system.DiskUsage{{Size: obj.Size, Name: obj.Name}}
 	}
+	root := newTree(prefix, 0, true)
 	// is directory
-	total := int64(0)
 	objs := g.batchAttrs(bucket, prefix, recursive)
 	for _, obj := range objs {
+		var du *duTree
 		if len(obj.Name) > 0 {
-			res = append(res, system.DiskUsage{Size: obj.Size, Name: obj.Name})
+			du = newTree(obj.Name, obj.Size, false)
 		} else if len(obj.Prefix) > 0 {
-			res = append(res, system.DiskUsage{Size: obj.Size, Name: obj.Prefix})
+			du = newTree(obj.Prefix, obj.Size, false)
 		}
-		total += obj.Size
+		dirs := getAllParents(du.Name, prefix)
+		runningRoot := root
+		for _, dir := range dirs[1:] {
+			var pu *duTree
+			var exists bool
+			if pu, exists = runningRoot.Children[dir]; !exists {
+				pu = newTree(dir, 0, true)
+				runningRoot.Children[dir] = pu
+			}
+			runningRoot = pu
+		}
+		runningRoot.Children[du.Name] = du
 	}
-	if len(res) > 0 {
-		res = append(res, system.DiskUsage{Size: total, Name: common.SetPrefixAsDirectory(prefix)})
+
+	return root.toDiskUsages()
+}
+
+func getAllParents(path, base string) []string {
+	res := []string{}
+	if base[len(base)-1] == '/' {
+		base = base + "/"
+	}
+	for {
+		if li := strings.LastIndex(path, "/"); li != -1 {
+			parent := path[:li] + "/"
+			if parent == base {
+				break
+			}
+			res = append([]string{parent}, res...)
+			path = path[:li]
+			continue
+		}
+		break
 	}
 	return res
 }

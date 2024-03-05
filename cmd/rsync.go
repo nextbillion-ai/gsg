@@ -15,7 +15,7 @@ func init() {
 	rsyncCmd.Flags().BoolP("v", "v", false, "force checksum after command operated, raise error if failed")
 	rootCmd.AddCommand(rsyncCmd)
 }
-func deleteDst(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) bool {
+func deleteDst(src, dst *system.FileObject, _, isDel, _ bool) bool {
 	if src.FileType() == system.FileType_Invalid && isDel {
 		if dst.FileType() == system.FileType_Directory {
 			fos := dst.System.List(dst.Bucket, dst.Prefix, true)
