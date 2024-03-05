@@ -15,7 +15,7 @@ func init() {
 	rootCmd.AddCommand(cpCmd)
 }
 
-func upload(src, dst *system.FileObject, forceChecksum, isRec bool) {
+func upload(src, dst *system.FileObject, _, isRec bool) {
 	switch src.FileType() {
 	case system.FileType_Directory:
 		if isRec {
@@ -68,7 +68,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool) {
 	}
 }
 
-func cloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
+func cloudCopy(src, dst *system.FileObject, _, isRec bool) {
 	if src.System != dst.System {
 		logger.Info(module, "inter cloud copy not supported. [%s] => [%s]", src.Bucket, dst.Bucket)
 		common.Exit()
@@ -98,7 +98,7 @@ func cloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
 	}
 }
 
-func localCopy(src, dst *system.FileObject, forceChecksum, recursive bool) {
+func localCopy(src, dst *system.FileObject, _, _ bool) {
 	if src.FileType() == system.FileType_Invalid {
 		logger.Info(module, "Invalid local path: [%s]", src.Prefix)
 		common.Exit()

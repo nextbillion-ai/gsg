@@ -12,16 +12,18 @@ import (
 
 func init() {
 	duCmd.Flags().BoolP("h", "h", false, "print object sizes in human-readable format")
+	duCmd.Flags().BoolP("s", "s", false, "print total size only")
 	rootCmd.AddCommand(duCmd)
 }
 
 var duCmd = &cobra.Command{
-	Use:   "du [-h] [url]",
+	Use:   "du [-sh] [url]",
 	Short: "Get disk usage of objects",
 	Long:  "Get disk usage objects",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		isHuman, _ := cmd.Flags().GetBool("h")
+		isSum, _ := cmd.Flags().GetBool("s")
 		fo := system.ParseFileObject(args[0])
 		if fo.FileType() == system.FileType_Invalid {
 			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
@@ -36,13 +38,14 @@ var duCmd = &cobra.Command{
 		if len(fo.Bucket) > 0 {
 			bucket = fmt.Sprintf("%s/", fo.Bucket)
 		}
-		for _, obj := range objs {
+		for index, obj := range objs {
 			size := fmt.Sprintf("%d", obj.Size)
 			if isHuman {
 				size = common.FromByteSize(size)
 			}
-
-			logger.Info("", "%-10s %s%s%s", size, scheme, bucket, obj.Name)
+			if !isSum || index == len(objs)-1 {
+				logger.Info("", "%-10s %s%s%s", size, scheme, bucket, obj.Name)
+			}
 		}
 	},
 }
