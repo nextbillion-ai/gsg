@@ -198,6 +198,11 @@ func (g *GCS) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsag
 	return root.ToDiskUsages()
 }
 
+func (g *GCS) DeleteObject(bucket, prefix string) error {
+	g.init()
+	return g.client.Bucket(bucket).Object(prefix).Delete(context.Background())
+}
+
 // DeleteObject deletes an object
 func (g *GCS) Delete(bucket, prefix string) {
 	g.init()
@@ -230,6 +235,21 @@ func (g *GCS) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 		"Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
 		srcBucket, srcPrefix, dstBucket, dstPrefix,
 	)
+}
+
+func (g *GCS) GetObjectWriter(bucket, prefix string) io.WriteCloser {
+	g.init()
+	return g.client.Bucket(bucket).Object(prefix).NewWriter(context.Background())
+}
+
+func (g *GCS) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
+	g.init()
+	var err error
+	var rc *storage.Reader
+	if rc, err = g.client.Bucket(bucket).Object(prefix).NewReader(context.Background()); err != nil {
+		return nil, err
+	}
+	return rc, nil
 }
 
 // DownloadObjectWithWorkerPool downloads a specific byte range of an object to a file.

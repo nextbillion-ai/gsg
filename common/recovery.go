@@ -7,6 +7,8 @@ import (
 	"github.com/nextbillion-ai/gsg/logger"
 )
 
+var AppMode bool
+
 // Recovery recovers from exceptions
 func Recovery() {
 	if r := recover(); r != nil {
@@ -18,10 +20,14 @@ func Recovery() {
 
 // Finish exits the program with zero status code
 func Finish() {
-	os.Exit(0)
+	if AppMode {
+		os.Exit(0)
+	}
 }
 
 // Exit exits the program with non-zero status code
 func Exit() {
-	os.Exit(1)
+	if AppMode {
+		os.Exit(1)
+	}
 }

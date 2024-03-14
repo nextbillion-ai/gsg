@@ -105,6 +105,7 @@ func Execute() error {
 	defer common.Recovery()
 	defer common.Elapsed("Executed command", time.Now())
 
+	common.AppMode = true
 	initFlags()
 
 	bars, _ = bar.New()
