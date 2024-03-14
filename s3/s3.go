@@ -275,6 +275,15 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsage
 	}
 	return root.ToDiskUsages()
 }
+func (s *S3) DeleteObject(bucket, prefix string) error {
+	s.init(bucket)
+	var err error
+	_, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+		Bucket: &bucket,
+		Key:    &prefix,
+	})
+	return err
+}
 
 // DeleteObject deletes an object
 func (s *S3) Delete(bucket, prefix string) {
@@ -314,6 +323,31 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
 		"Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
 		srcBucket, srcPrefix, dstBucket, dstPrefix,
 	)
+}
+
+func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
+	s.init(bucket)
+	var err error
+	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(prefix),
+		Body:   from,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *S3) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
+	s.init(bucket)
+	var err error
+	var goo *s3.GetObjectOutput
+	if goo, err = s.client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(prefix)}); err != nil {
+		return nil, err
+	}
+	return goo.Body, nil
 }
 
 // DownloadObjectWithWorkerPool downloads a specific byte range of an object to a file.
