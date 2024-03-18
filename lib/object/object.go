@@ -88,12 +88,12 @@ func Delete(url string) error {
 	}
 }
 
-func List(url string, recursive bool) ([]string, error) {
+func List(url string, recursive bool) ([]*system.FileObject, error) {
 	sys, bucket, prefix, err := parseUrl(url)
 	if err != nil {
 		return nil, err
 	}
-	var results []string
+	var results []*system.FileObject
 	var fs []*system.FileObject
 	switch sys {
 	case "s3":
@@ -105,7 +105,7 @@ func List(url string, recursive bool) ([]string, error) {
 	}
 	for _, f := range fs {
 		if f.FileType() == system.FileType_Object {
-			results = append(results, fmt.Sprintf("%s://%s/%s", f.System.Scheme(), f.Bucket, f.Prefix))
+			results = append(results, f)
 		}
 	}
 	return results, nil

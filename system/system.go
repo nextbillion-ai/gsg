@@ -1,6 +1,7 @@
 package system
 
 import (
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,10 @@ type FileObject struct {
 	Remote     bool
 	fileType   int
 	Attributes *Attrs
+}
+
+func (fo *FileObject) GetFullPath() string {
+	return fmt.Sprintf("%s://%s/%s", fo.System.Scheme(), fo.Bucket, fo.Prefix)
 }
 
 func (fo *FileObject) SetAttributes(attrs *Attrs) {
