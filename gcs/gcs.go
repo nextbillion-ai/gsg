@@ -343,9 +343,11 @@ func (g *GCS) Download(
 		}
 
 		wg.Add(1)
-		ctx.Pool.Add(
+		ctx.Pool.AddWithDepth(1,
 			func() {
-				defer wg.Done()
+				defer func() {
+					wg.Done()
+				}()
 
 				// create folder and temp file if not exist
 				once.Do(func() {

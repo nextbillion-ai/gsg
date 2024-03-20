@@ -44,12 +44,9 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
 		return
 	}
-	println("downsync", "afterDeleteDst")
 	deleteTempFiles(dst.Prefix, isRec)
-	println("downsync", "afterDeleteTempFiles")
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
-	println("downsync", "afterListRelatively")
 	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
 	if len(copyList)+len(deleteList) == 0 {
 		logger.Info(module, "No diff detected")
@@ -57,8 +54,6 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	}
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
-		println(dst.Prefix, fo.Attributes.RelativePath)
-
 		if e := fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars}); e != nil {
 			common.Exit()
 		}

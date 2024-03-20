@@ -204,6 +204,23 @@ do_test() {
     assert $ftd/a/b/c/3.txt
     finish
 
+    ftm="folder_to_move"
+    start "test moving a folder"
+    mkdir -p $ftm/a/b/c
+    prepare_file $ftm/a/1.txt
+    prepare_file $ftm/a/2.txt
+    prepare_file $ftm/a/b/c/3.txt
+    $(remote_copy true) $ftm $remote_base/$ftm
+    rm -rf $ftm
+    ../gsg mv -r $remote_base/$ftm $ftm
+    assert $ftm/a/1.txt
+    assert $ftm/a/2.txt
+    assert $ftm/a/b/c/3.txt
+    assert_not $ftm/a/1.txt remote
+    assert_not $ftm/a/2.txt remote
+    assert_not $ftm/a/b/c/3.txt remote
+    finish
+
 
     start "testing rsync"
     ftr="folder_to_rsync"

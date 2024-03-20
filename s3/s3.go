@@ -460,7 +460,7 @@ func (s *S3) Download(
 		}
 
 		wg.Add(1)
-		ctx.Pool.Add(
+		ctx.Pool.AddWithDepth(1,
 			func() {
 				defer wg.Done()
 

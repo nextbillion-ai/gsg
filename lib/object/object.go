@@ -63,7 +63,6 @@ func New(url string) (*Object, error) {
 	if err = obj._system.Init(bucket); err != nil {
 		return nil, err
 	}
-	println(system, bucket, "["+prefix+"]")
 	return obj, nil
 }
 

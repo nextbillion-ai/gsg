@@ -65,7 +65,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 	}
 }
 
-func download(src, dst *system.FileObject, forceChecksum, isRec bool, _ *sync.WaitGroup) {
+func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.WaitGroup) {
 	var err error
 	switch src.FileType() {
 	case system.FileType_Directory:
@@ -76,9 +76,13 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, _ *sync.Wa
 			}
 			for _, obj := range objs {
 				dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
-				if err = src.System.Download(src.Bucket, obj.Prefix, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool}); err != nil {
-					common.Exit()
-				}
+				wg.Add(1)
+				pool.Add(func() {
+					defer wg.Done()
+					if err = src.System.Download(src.Bucket, obj.Prefix, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+						common.Exit()
+					}
+				})
 			}
 		} else {
 			logger.Info(module, "Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", src.Bucket, src.Prefix)
