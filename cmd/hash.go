@@ -27,6 +27,7 @@ var hashCmd = &cobra.Command{
 		if attrs == nil {
 			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
+			return
 		}
 		logger.Info("", "%-20s%d", "Hash (CRC32C):", attrs.CRC32)
 		logger.Info("", "%-20s%s", "ModTime:", attrs.ModTime.UTC().String())

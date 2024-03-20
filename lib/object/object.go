@@ -13,10 +13,11 @@ import (
 )
 
 var urlRe = regexp.MustCompile(`(s3|gs|S3|GS)://([^/]+)(/.*)?`)
-var _gs = &gcs.GCS{}
-var _s3 = &s3.S3{}
 
-type Object struct {
+var ErrObjectNotFound = fmt.Errorf("Object Not Found")
+var ErrObjectURLInvalid = fmt.Errorf("Object URL Not supported")
+
+type ObjectResult struct {
 	Url     string
 	ModTime time.Time
 }
@@ -33,23 +34,74 @@ func parseUrl(url string) (system, bucket, prefix string, err error) {
 	return strings.ToLower(match[1]), match[2], match[3], nil
 }
 
-func Read(url string, to io.Writer) error {
-	system, bucket, prefix, err := parseUrl(url)
-	if err != nil {
-		return err
+type Object struct {
+	_system system.ISystem
+	system  string
+	bucket  string
+	prefix  string
+}
+
+func New(url string) (*Object, error) {
+	var err error
+	var system, bucket, prefix string
+	if system, bucket, prefix, err = parseUrl(url); err != nil {
+		return nil, err
 	}
-	var rc io.ReadCloser
+	obj := &Object{
+		system: system,
+		bucket: bucket,
+		prefix: prefix,
+	}
 	switch system {
 	case "s3":
-		if rc, err = _s3.GetObjectReader(bucket, prefix); err != nil {
+		obj._system = &s3.S3{}
+	case "gs":
+		obj._system = &gcs.GCS{}
+	default:
+		return nil, ErrObjectURLInvalid
+	}
+	if err = obj._system.Init(bucket); err != nil {
+		return nil, err
+	}
+	println(system, bucket, "["+prefix+"]")
+	return obj, nil
+}
+
+func (o *Object) Reset(url string) error {
+	var err error
+	var system, bucket, prefix string
+	if system, bucket, prefix, err = parseUrl(url); err != nil {
+		return err
+	}
+	o.bucket = bucket
+	o.prefix = prefix
+	if o.system == system {
+		if system == "s3" && o.bucket != bucket {
+			if err = o._system.Init(o.bucket); err != nil {
+				return err
+			}
+		}
+	} else {
+		o.system = system
+		if err = o._system.Init(o.bucket); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (o *Object) Read(to io.Writer) error {
+	var err error
+	var rc io.ReadCloser
+	switch o.system {
+	case "s3":
+		if rc, err = o._system.(*s3.S3).GetObjectReader(o.bucket, o.prefix); err != nil {
+			return ErrObjectNotFound
 		}
 	case "gs":
-		if rc, err = _gs.GetObjectReader(bucket, prefix); err != nil {
-			return err
+		if rc, err = o._system.(*gcs.GCS).GetObjectReader(o.bucket, o.prefix); err != nil {
+			return ErrObjectNotFound
 		}
-	default:
-		panic("this is not supposed to happen")
 	}
 	defer rc.Close()
 	if _, err = io.Copy(to, rc); err != nil {
@@ -58,18 +110,14 @@ func Read(url string, to io.Writer) error {
 	return nil
 }
 
-func Write(url string, from io.Reader) error {
-	system, bucket, prefix, err := parseUrl(url)
-	if err != nil {
-		return err
-	}
-	switch system {
+func (o *Object) Write(from io.Reader) error {
+	var err error
+	switch o.system {
 	case "s3":
-		return _s3.PutObject(bucket, prefix, from)
-
+		return o._system.(*s3.S3).PutObject(o.bucket, o.prefix, from)
 	case "gs":
 		var w io.WriteCloser
-		if w, err = _gs.GetObjectWriter(bucket, prefix); err != nil {
+		if w, err = o._system.(*gcs.GCS).GetObjectWriter(o.bucket, o.prefix); err != nil {
 			return err
 		}
 		if _, err = io.Copy(w, from); err != nil {
@@ -77,48 +125,30 @@ func Write(url string, from io.Reader) error {
 			return err
 		}
 		return w.Close()
-	default:
-		panic("this is not supposed to happen")
 	}
+	return nil
 }
 
-func Delete(url string) error {
-	system, bucket, prefix, err := parseUrl(url)
-	if err != nil {
-		return err
-	}
-	switch system {
+func (o *Object) Delete() error {
+	switch o.system {
 	case "s3":
-		return _s3.DeleteObject(bucket, prefix)
+		return o._system.(*s3.S3).DeleteObject(o.bucket, o.prefix)
 	case "gs":
-		return _gs.DeleteObject(bucket, prefix)
-	default:
-		panic("this is not supposed to happen")
+		return o._system.(*gcs.GCS).DeleteObject(o.bucket, o.prefix)
 	}
+	return nil
 }
 
-func List(url string, recursive bool) ([]*Object, error) {
-	sys, bucket, prefix, err := parseUrl(url)
-	if err != nil {
-		return nil, err
-	}
-	var results []*Object
+func (o *Object) List(recursive bool) ([]*ObjectResult, error) {
+	var err error
+	var results []*ObjectResult
 	var fs []*system.FileObject
-	switch sys {
-	case "s3":
-		if fs, err = _s3.List(bucket, prefix, recursive); err != nil {
-			return nil, err
-		}
-	case "gs":
-		if fs, err = _gs.List(bucket, prefix, recursive); err != nil {
-			return nil, err
-		}
-	default:
-		panic("this is not supposed to happen")
+	if fs, err = o._system.List(o.bucket, o.prefix, recursive); err != nil {
+		return nil, ErrObjectNotFound
 	}
 	for _, f := range fs {
 		if f.FileType() == system.FileType_Object {
-			o := &Object{
+			o := &ObjectResult{
 				Url: fmt.Sprintf("%s://%s/%s", f.System.Scheme(), f.Bucket, f.Prefix),
 			}
 			if f.Attributes != nil {

@@ -43,6 +43,8 @@ var lockCmd = &cobra.Command{
 			common.Exit()
 		}
 		gcs := fo.System.(*gcs.GCS)
-		pool.Add(func() { gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))) })
+		if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
+			common.Exit()
+		}
 	},
 }

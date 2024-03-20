@@ -11,17 +11,44 @@ func main() {
 
 	testContent := "test"
 	testUrl := "gs://nb-data/chang/test.write"
+	testUrl2 := "gs://nb-data/chang/test.write2"
 	var err error
+	/*
+		run following when you removed envs or moved all aws credentials away, to test quit early
+		change s3://whocares to gs://whocares if you unset GOOGLE_APPLICATION_CREDENTIALS
+		{
+			if _, err = object.New("s3://whocares"); err == nil {
+				panic("should have error")
+			}
+			println(err.Error())
+
+		}
+	*/
 
 	{
 		buf := bytes.NewBuffer([]byte(testContent))
-		if err = object.Write(testUrl, buf); err != nil {
+		var o *object.Object
+		if o, err = object.New(testUrl); err != nil {
+			panic(err)
+		}
+		if err = o.Write(buf); err != nil {
+			panic(err)
+		}
+		if err = o.Reset(testUrl2); err != nil {
+			panic(err)
+		}
+		buf = bytes.NewBuffer([]byte(testContent))
+		if err = o.Write(buf); err != nil {
 			panic(err)
 		}
 	}
 	{
 		buf := bytes.NewBuffer(nil)
-		if err = object.Read(testUrl, buf); err != nil {
+		var o *object.Object
+		if o, err = object.New(testUrl); err != nil {
+			panic(err)
+		}
+		if err = o.Read(buf); err != nil {
 			panic(err)
 		}
 		if buf.String() != testContent {
@@ -29,8 +56,12 @@ func main() {
 		}
 	}
 	{
-		var files []*object.Object
-		if files, err = object.List(testUrl, false); err != nil {
+		var files []*object.ObjectResult
+		var o *object.Object
+		if o, err = object.New(testUrl); err != nil {
+			panic(err)
+		}
+		if files, err = o.List(false); err != nil {
 			panic(err)
 		}
 		if len(files) != 1 || files[0].Url != testUrl {
@@ -38,7 +69,17 @@ func main() {
 		}
 	}
 	{
-		if err = object.Delete(testUrl); err != nil {
+		var o *object.Object
+		if o, err = object.New(testUrl); err != nil {
+			panic(err)
+		}
+		if err = o.Delete(); err != nil {
+			panic(err)
+		}
+		if err = o.Reset(testUrl2); err != nil {
+			panic(err)
+		}
+		if err = o.Delete(); err != nil {
 			panic(err)
 		}
 	}

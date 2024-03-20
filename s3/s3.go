@@ -397,6 +397,10 @@ func (s *S3) Init(buckets ...string) error {
 		common.Exit()
 		return e1
 	}
+	// Check if credentials are valid
+	if _, err := cfg.Credentials.Retrieve(context.TODO()); err != nil {
+		return err
+	}
 
 	s.client = s3.NewFromConfig(cfg)
 	return nil

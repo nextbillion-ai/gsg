@@ -56,10 +56,12 @@ var upgradeCmd = &cobra.Command{
 		var dstObj *system.Attrs
 		if dstObj, err = l.Attributes("", dstPath); err != nil {
 			common.Exit()
+			return
 		}
 		if dstObj == nil {
 			logger.Info(module, "File not found: %s", dstPath)
 			common.Exit()
+			return
 		}
 
 		// check version

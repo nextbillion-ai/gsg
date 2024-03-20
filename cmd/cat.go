@@ -21,6 +21,7 @@ var catCmd = &cobra.Command{
 		fo := system.ParseFileObject(args[0])
 		if fo == nil {
 			common.Exit()
+			return
 		}
 		var output []byte
 		var err error
