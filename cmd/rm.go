@@ -31,17 +31,33 @@ var rmCmd = &cobra.Command{
 			case true:
 				switch fo.FileType() {
 				case system.FileType_Directory:
-					objs := fo.System.List(fo.Bucket, fo.Prefix, isRec)
+					var err error
+					var objs []*system.FileObject
+					if objs, err = fo.System.List(fo.Bucket, fo.Prefix, isRec); err != nil {
+						common.Exit()
+					}
 					for _, obj := range objs {
 						bucket := obj.Bucket
 						prefix := obj.Prefix
-						pool.Add(func() { fo.System.Delete(bucket, prefix) })
+						pool.Add(func() {
+							if e := fo.System.Delete(bucket, prefix); e != nil {
+								common.Exit()
+							}
+						})
 					}
 				case system.FileType_Object:
-					pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
+					pool.Add(func() {
+						if e := fo.System.Delete(fo.Bucket, fo.Prefix); e != nil {
+							common.Exit()
+						}
+					})
 				}
 			case false:
-				pool.Add(func() { fo.System.Delete(fo.Bucket, fo.Prefix) })
+				pool.Add(func() {
+					if e := fo.System.Delete(fo.Bucket, fo.Prefix); e != nil {
+						common.Exit()
+					}
+				})
 			}
 		}
 	},

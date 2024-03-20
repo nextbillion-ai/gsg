@@ -64,19 +64,20 @@ type DiskUsage struct {
 }
 
 type ISystem interface {
+	Init(buckets ...string) error
 	Scheme() string
-	Attributes(bucket, prefix string) *Attrs
-	BatchAttributes(bucket, prefix string, recursive bool) []*Attrs
-	List(bucket, prefix string, recursive bool) []*FileObject
-	DiskUsage(bucket, prefix string, recursive bool) []DiskUsage
-	Delete(bucket, prefix string)
-	Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string)
-	Download(bucket, prefix, dstFile string, forceChecksum bool, ctx RunContext)
-	Upload(srcFile, bucket, object string, ctx RunContext)
-	Move(srcBucket, srcPrefix, dstBucket, dstPrefix string)
-	Cat(bucket, prefix string) []byte
-	IsObject(bucket, prefix string) bool
-	IsDirectory(bucket, prefix string) bool
+	Attributes(bucket, prefix string) (*Attrs, error)
+	BatchAttributes(bucket, prefix string, recursive bool) ([]*Attrs, error)
+	List(bucket, prefix string, recursive bool) ([]*FileObject, error)
+	DiskUsage(bucket, prefix string, recursive bool) ([]DiskUsage, error)
+	Delete(bucket, prefix string) error
+	Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error
+	Download(bucket, prefix, dstFile string, forceChecksum bool, ctx RunContext) error
+	Upload(srcFile, bucket, object string, ctx RunContext) error
+	Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error
+	Cat(bucket, prefix string) ([]byte, error)
+	IsObject(bucket, prefix string) (bool, error)
+	IsDirectory(bucket, prefix string) (bool, error)
 }
 
 type FileObject struct {
@@ -119,11 +120,11 @@ func (fo *FileObject) FileType() int {
 	}
 	fo.fileType = FileType_Invalid
 	if fo.System != nil {
-		if fo.System.IsDirectory(fo.Bucket, fo.Prefix) {
+		if ok, err := fo.System.IsDirectory(fo.Bucket, fo.Prefix); err == nil && ok {
 			fo.fileType = FileType_Directory
-		} else if fo.System.IsObject(fo.Bucket, fo.Prefix) {
+		} else if ok, err := fo.System.IsObject(fo.Bucket, fo.Prefix); err == nil && ok {
 			fo.fileType = FileType_Object
-			fo.Attributes = fo.System.Attributes(fo.Bucket, fo.Prefix)
+			fo.Attributes, _ = fo.System.Attributes(fo.Bucket, fo.Prefix)
 		}
 	}
 	return fo.fileType

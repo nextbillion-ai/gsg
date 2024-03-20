@@ -29,7 +29,11 @@ var duCmd = &cobra.Command{
 			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()
 		}
-		objs := fo.System.DiskUsage(fo.Bucket, fo.Prefix, true)
+		var objs []system.DiskUsage
+		var err error
+		if objs, err = fo.System.DiskUsage(fo.Bucket, fo.Prefix, true); err != nil {
+			common.Exit()
+		}
 		scheme := ""
 		if len(fo.System.Scheme()) > 0 {
 			scheme = fmt.Sprintf("%s://", fo.System.Scheme())

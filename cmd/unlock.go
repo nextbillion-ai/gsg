@@ -30,6 +30,8 @@ var unlockCmd = &cobra.Command{
 			common.Exit()
 		}
 		gcs := fo.System.(*gcs.GCS)
-		pool.Add(func() { gcs.AttemptUnLock(fo.Bucket, fo.Prefix) })
+		if e := gcs.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
+			common.Exit()
+		}
 	},
 }

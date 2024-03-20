@@ -21,7 +21,13 @@ var catCmd = &cobra.Command{
 		fo := system.ParseFileObject(args[0])
 		if fo == nil {
 			common.Exit()
+			return
 		}
-		logger.Output(string(fo.System.Cat(fo.Bucket, fo.Prefix)))
+		var output []byte
+		var err error
+		if output, err = fo.System.Cat(fo.Bucket, fo.Prefix); err != nil {
+			common.Exit()
+		}
+		logger.Output(string(output))
 	},
 }
