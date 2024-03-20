@@ -506,15 +506,13 @@ func (s *S3) Download(
 	}
 
 	// move back the temp file
-	ctx.Pool.Add(func() {
-		wg.Wait()
-		err := os.Rename(dstFileTemp, dstFile)
-		if err != nil {
-			logger.Info(module, "download object failed when rename file with %s", err)
-			common.Exit()
-		}
-		common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
-	})
+	wg.Wait()
+	err = os.Rename(dstFileTemp, dstFile)
+	if err != nil {
+		logger.Info(module, "download object failed when rename file with %s", err)
+		return err
+	}
+	common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
 	return nil
 }
 

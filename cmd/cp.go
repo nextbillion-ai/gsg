@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/common"
@@ -21,7 +22,7 @@ func init() {
 	rootCmd.AddCommand(cpCmd)
 }
 
-func upload(src, dst *system.FileObject, _, isRec bool) {
+func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 	var err error
 	switch src.FileType() {
 	case system.FileType_Directory:
@@ -33,7 +34,9 @@ func upload(src, dst *system.FileObject, _, isRec bool) {
 			for _, obj := range objs {
 				op := obj.Prefix
 				dstPath := common.GetDstPath(linux.GetRealPath(src.Prefix), op, dst.Prefix)
+				wg.Add(1)
 				pool.Add(func() {
+					defer wg.Done()
 					if e := dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars}); e != nil {
 						common.Exit()
 					}
@@ -49,7 +52,9 @@ func upload(src, dst *system.FileObject, _, isRec bool) {
 			_, name := common.ParseFile(src.Prefix)
 			dstPrefix = common.JoinPath(dstPrefix, name)
 		}
+		wg.Add(1)
 		pool.Add(func() {
+			defer wg.Done()
 			if e := dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars}); e != nil {
 				common.Exit()
 			}
@@ -60,7 +65,7 @@ func upload(src, dst *system.FileObject, _, isRec bool) {
 	}
 }
 
-func download(src, dst *system.FileObject, forceChecksum, isRec bool) {
+func download(src, dst *system.FileObject, forceChecksum, isRec bool, _ *sync.WaitGroup) {
 	var err error
 	switch src.FileType() {
 	case system.FileType_Directory:
@@ -94,7 +99,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool) {
 	}
 }
 
-func cloudCopy(src, dst *system.FileObject, _, isRec bool) {
+func cloudCopy(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 	if src.System != dst.System {
 		logger.Info(module, "inter cloud copy not supported. [%s] => [%s]", src.Bucket, dst.Bucket)
 		common.Exit()
@@ -113,7 +118,9 @@ func cloudCopy(src, dst *system.FileObject, _, isRec bool) {
 		for _, obj := range objs {
 			op := obj.Prefix
 			dstPath := common.GetDstPath(src.Prefix, op, dst.Prefix)
+			wg.Add(1)
 			pool.Add(func() {
+				defer wg.Done()
 				if e := src.System.Copy(src.Bucket, op, dst.Bucket, dstPath); e != nil {
 					common.Exit()
 				}
@@ -125,7 +132,9 @@ func cloudCopy(src, dst *system.FileObject, _, isRec bool) {
 			_, name := common.ParseFile(src.Prefix)
 			dstPrefix = common.JoinPath(dst.Prefix, name)
 		}
+		wg.Add(1)
 		pool.Add(func() {
+			defer wg.Done()
 			if e := src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dstPrefix); e != nil {
 				common.Exit()
 			}
@@ -136,12 +145,14 @@ func cloudCopy(src, dst *system.FileObject, _, isRec bool) {
 	}
 }
 
-func localCopy(src, dst *system.FileObject, _, _ bool) {
+func localCopy(src, dst *system.FileObject, _, _ bool, wg *sync.WaitGroup) {
 	if src.FileType() == system.FileType_Invalid {
 		logger.Info(module, "Invalid local path: [%s]", src.Prefix)
 		common.Exit()
 	}
+	wg.Add(1)
 	pool.Add(func() {
+		defer wg.Done()
 		if e := src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dst.Prefix); e != nil {
 			common.Exit()
 		}
@@ -149,19 +160,21 @@ func localCopy(src, dst *system.FileObject, _, _ bool) {
 }
 
 func doCopy(src, dst *system.FileObject, forceChecksum, isRec bool) {
+	var wg sync.WaitGroup
 	if dst.Remote {
 		if !src.Remote {
-			upload(src, dst, forceChecksum, isRec)
+			upload(src, dst, forceChecksum, isRec, &wg)
 		} else {
-			cloudCopy(src, dst, forceChecksum, isRec)
+			cloudCopy(src, dst, forceChecksum, isRec, &wg)
 		}
 	} else {
 		if !src.Remote {
-			localCopy(src, dst, forceChecksum, isRec)
+			localCopy(src, dst, forceChecksum, isRec, &wg)
 		} else {
-			download(src, dst, forceChecksum, isRec)
+			download(src, dst, forceChecksum, isRec, &wg)
 		}
 	}
+	wg.Wait()
 }
 
 var cpCmd = &cobra.Command{

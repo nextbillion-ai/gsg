@@ -386,18 +386,16 @@ func (g *GCS) Download(
 	}
 
 	// move back the temp file
-	ctx.Pool.Add(func() {
-		wg.Wait()
-		err := os.Rename(dstFileTemp, dstFile)
-		if err != nil {
-			logger.Info(module, "download object failed when rename file with %s", err)
-			common.Exit()
-		}
-		common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-		if err = g.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
-			common.Exit()
-		}
-	})
+	wg.Wait()
+	err = os.Rename(dstFileTemp, dstFile)
+	if err != nil {
+		logger.Info(module, "download object failed when rename file with %s", err)
+		return err
+	}
+	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
+	if err = g.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
+		return err
+	}
 	return nil
 }
 
