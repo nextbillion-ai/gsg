@@ -21,7 +21,8 @@ const (
 )
 
 var (
-	_systems = map[string]ISystem{}
+	_systems          = map[string]ISystem{}
+	ErrObjectNotFound = fmt.Errorf("Object Not Found")
 )
 
 func Register(system ISystem) {

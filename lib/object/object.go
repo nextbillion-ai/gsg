@@ -14,8 +14,22 @@ import (
 
 var urlRe = regexp.MustCompile(`(s3|gs|S3|GS)://([^/]+)(/.*)?`)
 
+var gcsNotFoundRe = regexp.MustCompile(`.*storage: object doesn't exist.*`)
+var s3NotFoundRe = regexp.MustCompile(`.*StatusCode: 404.*`)
+
 var ErrObjectNotFound = fmt.Errorf("Object Not Found")
 var ErrObjectURLInvalid = fmt.Errorf("Object URL Not supported")
+
+func parseError(err error) error {
+	s := err.Error()
+	if gcsNotFoundRe.MatchString(s) {
+		return ErrObjectNotFound
+	}
+	if s3NotFoundRe.MatchString(s) {
+		return ErrObjectNotFound
+	}
+	return err
+}
 
 type ObjectResult struct {
 	Url     string
@@ -95,11 +109,11 @@ func (o *Object) Read(to io.Writer) error {
 	switch o.system {
 	case "s3":
 		if rc, err = o._system.(*s3.S3).GetObjectReader(o.bucket, o.prefix); err != nil {
-			return ErrObjectNotFound
+			return parseError(err)
 		}
 	case "gs":
 		if rc, err = o._system.(*gcs.GCS).GetObjectReader(o.bucket, o.prefix); err != nil {
-			return ErrObjectNotFound
+			return parseError(err)
 		}
 	}
 	defer rc.Close()
@@ -143,6 +157,9 @@ func (o *Object) List(recursive bool) ([]*ObjectResult, error) {
 	var results []*ObjectResult
 	var fs []*system.FileObject
 	if fs, err = o._system.List(o.bucket, o.prefix, recursive); err != nil {
+		return nil, parseError(err)
+	}
+	if len(fs) == 0 {
 		return nil, ErrObjectNotFound
 	}
 	for _, f := range fs {
