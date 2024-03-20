@@ -3,6 +3,7 @@ package cmd
 import (
 	"strings"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
 
@@ -24,7 +25,11 @@ var versionsCmd = &cobra.Command{
 	Long:  "List the versions of gsg",
 	Run: func(_ *cobra.Command, _ []string) {
 		g := system.Lookup("gs")
-		vs := g.List(versionsBucket, versionsPrefix, true)
+		var err error
+		var vs []*system.FileObject
+		if vs, err = g.List(versionsBucket, versionsPrefix, true); err != nil {
+			common.Exit()
+		}
 		for _, v := range vs {
 			if !strings.HasSuffix(v.Prefix, "/install.sh") {
 				logger.Info(module, "https://%s/%s", versionsBucket, v.Prefix)

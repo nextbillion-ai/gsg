@@ -22,6 +22,11 @@ var catCmd = &cobra.Command{
 		if fo == nil {
 			common.Exit()
 		}
-		logger.Output(string(fo.System.Cat(fo.Bucket, fo.Prefix)))
+		var output []byte
+		var err error
+		if output, err = fo.System.Cat(fo.Bucket, fo.Prefix); err != nil {
+			common.Exit()
+		}
+		logger.Output(string(output))
 	},
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/s3"
@@ -14,6 +15,11 @@ import (
 var urlRe = regexp.MustCompile(`(s3|gs|S3|GS)://([^/]+)(/.*)?`)
 var _gs = &gcs.GCS{}
 var _s3 = &s3.S3{}
+
+type Object struct {
+	Url     string
+	ModTime time.Time
+}
 
 func parseUrl(url string) (system, bucket, prefix string, err error) {
 	match := urlRe.FindStringSubmatch(url)
@@ -62,7 +68,10 @@ func Write(url string, from io.Reader) error {
 		return _s3.PutObject(bucket, prefix, from)
 
 	case "gs":
-		w := _gs.GetObjectWriter(bucket, prefix)
+		var w io.WriteCloser
+		if w, err = _gs.GetObjectWriter(bucket, prefix); err != nil {
+			return err
+		}
 		if _, err = io.Copy(w, from); err != nil {
 			_ = w.Close()
 			return err
@@ -88,24 +97,34 @@ func Delete(url string) error {
 	}
 }
 
-func List(url string, recursive bool) ([]*system.FileObject, error) {
+func List(url string, recursive bool) ([]*Object, error) {
 	sys, bucket, prefix, err := parseUrl(url)
 	if err != nil {
 		return nil, err
 	}
-	var results []*system.FileObject
+	var results []*Object
 	var fs []*system.FileObject
 	switch sys {
 	case "s3":
-		fs = _s3.List(bucket, prefix, recursive)
+		if fs, err = _s3.List(bucket, prefix, recursive); err != nil {
+			return nil, err
+		}
 	case "gs":
-		fs = _gs.List(bucket, prefix, recursive)
+		if fs, err = _gs.List(bucket, prefix, recursive); err != nil {
+			return nil, err
+		}
 	default:
 		panic("this is not supposed to happen")
 	}
 	for _, f := range fs {
 		if f.FileType() == system.FileType_Object {
-			results = append(results, f)
+			o := &Object{
+				Url: fmt.Sprintf("%s://%s/%s", f.System.Scheme(), f.Bucket, f.Prefix),
+			}
+			if f.Attributes != nil {
+				o.ModTime = f.Attributes.ModTime
+			}
+			results = append(results, o)
 		}
 	}
 	return results, nil

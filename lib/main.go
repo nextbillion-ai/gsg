@@ -29,11 +29,11 @@ func main() {
 		}
 	}
 	{
-		var files []string
+		var files []*object.Object
 		if files, err = object.List(testUrl, false); err != nil {
 			panic(err)
 		}
-		if len(files) != 1 || files[0] != testUrl {
+		if len(files) != 1 || files[0].Url != testUrl {
 			panic("list not matching")
 		}
 	}

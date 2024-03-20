@@ -19,7 +19,11 @@ var hashCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(_ *cobra.Command, args []string) {
 		fo := system.ParseFileObject(args[0])
-		attrs := fo.System.Attributes(fo.Bucket, fo.Prefix)
+		var err error
+		var attrs *system.Attrs
+		if attrs, err = fo.System.Attributes(fo.Bucket, fo.Prefix); err != nil {
+			common.Exit()
+		}
 		if attrs == nil {
 			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)
 			common.Exit()

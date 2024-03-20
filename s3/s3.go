@@ -87,54 +87,39 @@ func (s *S3) toFileObject(attrs *S3Attributes) *system.FileObject {
 	return fo
 }
 
-// storageClient gets or creates a gcp storage client
-func (s *S3) init(bucket string) {
-	if s.client != nil {
-		return
+func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return nil, err
 	}
-
-	cfg, e1 := config.LoadDefaultConfig(context.TODO(), func(options *config.LoadOptions) error {
-		var region string
-		var err error
-		if region, err = s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, "ap-southeast-1"); err != nil {
-			return nil
-		}
-		options.Region = region
-		return nil
-	})
-	if e1 != nil {
-		logger.Info(module, "failed in loading defaultConfig with error: %s", e1)
-		common.Exit()
-	}
-
-	s.client = s3.NewFromConfig(cfg)
-}
-
-func (s *S3) S3Attrs(bucket, prefix string) *S3Attributes {
-	s.init(bucket)
 	var oat types.ObjectAttributes
 	if prefix == "" {
-		return nil
+		return nil, nil
 	}
-	attrs, err := s.client.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
+	var attrs *s3.GetObjectAttributesOutput
+	if attrs, err = s.client.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
 		Bucket:           aws.String(bucket),
 		Key:              aws.String(prefix),
 		ObjectAttributes: oat.Values(),
-	})
-	if err != nil {
+	}); err != nil {
 		logger.Debug(module, "failed with s3://%s/%s %s", bucket, prefix, err)
-		return nil
+		return nil, nil
 	}
 	return &S3Attributes{
 		S3Attrs: attrs,
 		Bucket:  bucket,
 		Prefix:  prefix,
-	}
+	}, nil
 }
 
 // GetObjectAttributes gets the attributes of an object
-func (s *S3) Attributes(bucket, prefix string) *system.Attrs {
-	return s.toAttrs(s.S3Attrs(bucket, prefix))
+func (s *S3) Attributes(bucket, prefix string) (*system.Attrs, error) {
+	var err error
+	var s3a *S3Attributes
+	if s3a, err = s.S3Attrs(bucket, prefix); err != nil {
+		return nil, err
+	}
+	return s.toAttrs(s3a), nil
 }
 
 /*
@@ -157,9 +142,16 @@ func matchImmediateSubPath(prefix, path string) string {
 }
 */
 
-func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []string {
-	s.init(bucket)
-	if !s.IsObject(bucket, prefix) {
+func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]string, error) {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return nil, err
+	}
+	var ok bool
+	if ok, err = s.IsObject(bucket, prefix); err != nil {
+		return nil, err
+	}
+	if !ok {
 		prefix = common.SetPrefixAsDirectory(prefix)
 	}
 	li := s3.ListObjectsV2Input{
@@ -171,14 +163,13 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []str
 		li.Delimiter = aws.String("/")
 	}
 	var lo *s3.ListObjectsV2Output
-	var le error
 	objects := []types.Object{}
 	commonPrefixes := map[string]struct{}{}
 	index := 0
 	for {
-		if lo, le = s.client.ListObjectsV2(context.TODO(), &li); le != nil {
-			logger.Info(module, "get objects attributes failed with %s", le)
-			common.Exit()
+		if lo, err = s.client.ListObjectsV2(context.TODO(), &li); err != nil {
+			logger.Info(module, "get objects attributes failed with %s", err)
+			return nil, err
 		}
 		if !recursive {
 			for _, cp := range lo.CommonPrefixes {
@@ -203,12 +194,17 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) []str
 			subPaths = append(subPaths, cp)
 		}
 	}
-	return subPaths
+	return subPaths, nil
 }
 
-func (s *S3) batchAttrs(bucket, prefix string, recursive bool) []*S3Attributes {
-	subPaths := s.listObjectsAndSubPaths(bucket, prefix, recursive)
+func (s *S3) batchAttrs(bucket, prefix string, recursive bool) ([]*S3Attributes, error) {
+	var err error
+	var subPaths []string
+	if subPaths, err = s.listObjectsAndSubPaths(bucket, prefix, recursive); err != nil {
+		return nil, err
+	}
 	res := make([]*S3Attributes, len(subPaths))
+	errs := make([]error, len(subPaths))
 	var wg sync.WaitGroup
 	for index, subPath := range subPaths {
 		if strings.HasSuffix(subPath, "/") {
@@ -222,42 +218,66 @@ func (s *S3) batchAttrs(bucket, prefix string, recursive bool) []*S3Attributes {
 		wg.Add(1)
 		go func(index int, subPath string) {
 			defer wg.Done()
-			res[index] = s.S3Attrs(bucket, subPath)
+			s3a, e := s.S3Attrs(bucket, subPath)
+			res[index] = s3a
+			errs[index] = e
 		}(index, subPath)
 	}
 	wg.Wait()
-	return res
+	for _, e := range errs {
+		if e != nil {
+			return nil, e
+		}
+	}
+	return res, nil
 
 }
 
 // GetObjectsAttributes gets the attributes of all the objects under a prefix
-func (s *S3) BatchAttributes(bucket, prefix string, recursive bool) []*system.Attrs {
+func (s *S3) BatchAttributes(bucket, prefix string, recursive bool) ([]*system.Attrs, error) {
 	res := []*system.Attrs{}
-	for _, attr := range s.batchAttrs(bucket, prefix, recursive) {
+	var err error
+	var s3as []*S3Attributes
+	if s3as, err = s.batchAttrs(bucket, prefix, recursive); err != nil {
+		return nil, err
+	}
+	for _, attr := range s3as {
 		res = append(res, s.toAttrs(attr))
 	}
-	return res
+	return res, nil
 }
 
 // List objects under a prefix
-func (s *S3) List(bucket, prefix string, recursive bool) []*system.FileObject {
+func (s *S3) List(bucket, prefix string, recursive bool) ([]*system.FileObject, error) {
 	fos := []*system.FileObject{}
-	for _, attr := range s.batchAttrs(bucket, prefix, recursive) {
+	var err error
+	var s3as []*S3Attributes
+	if s3as, err = s.batchAttrs(bucket, prefix, recursive); err != nil {
+		return nil, err
+	}
+	for _, attr := range s3as {
 		fos = append(fos, s.toFileObject(attr))
 	}
-	return fos
+	return fos, nil
 }
 
 // GetDiskUsageObjects gets disk usage of objects under a prefix
-func (s *S3) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsage {
+func (s *S3) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsage, error) {
 	// is object
-	obj := s.S3Attrs(bucket, prefix)
+	var err error
+	var obj *S3Attributes
+	if obj, err = s.S3Attrs(bucket, prefix); err != nil {
+		return nil, err
+	}
 	if obj != nil {
-		return []system.DiskUsage{{Size: obj.S3Attrs.ObjectSize, Name: obj.Prefix}}
+		return []system.DiskUsage{{Size: obj.S3Attrs.ObjectSize, Name: obj.Prefix}}, nil
 	}
 	// is directory
 	root := system.NewDUTree(prefix, 0, true)
-	objs := s.batchAttrs(bucket, prefix, recursive)
+	var objs []*S3Attributes
+	if objs, err = s.batchAttrs(bucket, prefix, recursive); err != nil {
+		return nil, err
+	}
 	for _, obj := range objs {
 		du := system.NewDUTree(obj.Prefix, obj.S3Attrs.ObjectSize, false)
 		dirs := system.GetAllParents(du.Name, prefix)
@@ -273,11 +293,13 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) []system.DiskUsage
 		}
 		runningRoot.Children[du.Name] = du
 	}
-	return root.ToDiskUsages()
+	return root.ToDiskUsages(), nil
 }
 func (s *S3) DeleteObject(bucket, prefix string) error {
-	s.init(bucket)
 	var err error
+	if err = s.Init(bucket); err != nil {
+		return err
+	}
 	_, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket: &bucket,
 		Key:    &prefix,
@@ -286,48 +308,60 @@ func (s *S3) DeleteObject(bucket, prefix string) error {
 }
 
 // DeleteObject deletes an object
-func (s *S3) Delete(bucket, prefix string) {
-	s.init(bucket)
-	_, de := s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+func (s *S3) Delete(bucket, prefix string) error {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return err
+	}
+	if _, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket: &bucket,
 		Key:    &prefix,
-	})
-	if de != nil {
-		logger.Info(module, "delete object r2://%s/%s failed with %s", bucket, prefix, de)
-		common.Exit()
+	}); err != nil {
+		logger.Info(module, "delete object r2://%s/%s failed with %s", bucket, prefix, err)
+		return err
 	}
 	logger.Info(module, "Removing bucket[%s] prefix[%s]", bucket, prefix)
+	return nil
 }
 
 // CopyObject copies an object
-func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
-	s.init(srcBucket)
+func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
+	var err error
+	if err = s.Init(srcBucket); err != nil {
+		return err
+	}
+	var s3a *S3Attributes
+	if s3a, err = s.S3Attrs(srcBucket, srcPrefix); err != nil {
+		return err
+	}
 	// check object
-	if s.S3Attrs(srcBucket, srcPrefix) == nil {
-		logger.Debug(module, "failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
-		return
+	if s3a == nil {
+		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
+		logger.Debug(module, log)
+		return fmt.Errorf(log)
 	}
 
-	_, ce := s.client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+	if _, err = s.client.CopyObject(context.TODO(), &s3.CopyObjectInput{
 		Bucket:     aws.String(dstBucket),
 		Key:        aws.String(dstPrefix),
 		CopySource: aws.String(fmt.Sprintf("%v/%v", srcBucket, srcPrefix)),
-	})
-
-	if ce != nil {
-		logger.Info(module, "copy object failed with %s", ce)
-		common.Exit()
+	}); err != nil {
+		logger.Info(module, "copy object failed with %s", err)
+		return err
 	}
 	logger.Info(
 		module,
 		"Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
 		srcBucket, srcPrefix, dstBucket, dstPrefix,
 	)
+	return nil
 }
 
 func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
-	s.init(bucket)
 	var err error
+	if err = s.Init(bucket); err != nil {
+		return err
+	}
 	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
@@ -338,9 +372,41 @@ func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 	return nil
 }
 
+func (s *S3) Init(buckets ...string) error {
+	if s.client != nil {
+		return nil
+	}
+	if len(buckets) == 0 {
+		common.Exit()
+		return fmt.Errorf("S3 initialization need target bucket")
+	}
+
+	bucket := buckets[0]
+
+	cfg, e1 := config.LoadDefaultConfig(context.TODO(), func(options *config.LoadOptions) error {
+		var region string
+		var err error
+		if region, err = s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, "ap-southeast-1"); err != nil {
+			return nil
+		}
+		options.Region = region
+		return nil
+	})
+	if e1 != nil {
+		logger.Info(module, "failed in loading defaultConfig with error: %s", e1)
+		common.Exit()
+		return e1
+	}
+
+	s.client = s3.NewFromConfig(cfg)
+	return nil
+}
+
 func (s *S3) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
-	s.init(bucket)
 	var err error
+	if err = s.Init(bucket); err != nil {
+		return nil, err
+	}
 	var goo *s3.GetObjectOutput
 	if goo, err = s.client.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
@@ -355,13 +421,20 @@ func (s *S3) Download(
 	bucket, prefix, dstFile string,
 	forceChecksum bool,
 	ctx system.RunContext,
-) {
-	s.init(bucket)
+) error {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return err
+	}
+	var attrs *S3Attributes
 	// check object
-	attrs := s.S3Attrs(bucket, prefix)
+	if attrs, err = s.S3Attrs(bucket, prefix); err != nil {
+		return err
+	}
 	if attrs == nil {
-		logger.Debug(module, "failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
-		return
+		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
+		logger.Debug(module, log)
+		return fmt.Errorf(log)
 	}
 	chunkSize := int64(googleapi.DefaultUploadChunkSize)
 	chunkNumber := int(math.Ceil(float64(attrs.S3Attrs.ObjectSize) / float64(chunkSize)))
@@ -438,16 +511,20 @@ func (s *S3) Download(
 		}
 		common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
 	})
+	return nil
 }
 
 // UploadObject uploads an object from a file
-func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) {
-	s.init(bucket)
+func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) error {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return err
+	}
 	// open source file
 	f, err := os.Open(srcFile)
 	if err != nil {
 		logger.Info(module, "upload object failed when open file with %s", err)
-		common.Exit()
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -455,48 +532,55 @@ func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) {
 	//modTime := common.GetFileModificationTime(srcFile)
 	logger.Info(module, "uploading %s to %s/%s", srcFile, bucket, prefix)
 	// upload file
-	_, ue := s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
 		Body:   f,
-	})
-	if ue != nil {
-		logger.Info(module, "upload object failed when copy file with %s", ue)
-		common.Exit()
+	}); err != nil {
+		logger.Info(module, "upload object failed when copy file with %s", err)
+		return err
 	}
+	return nil
 }
 
 // MoveObject moves an object
-func (s *S3) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) {
+func (s *S3) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	if srcBucket == dstBucket && srcPrefix == dstPrefix {
-		return
+		return nil
 	}
-	s.Copy(srcBucket, srcPrefix, dstBucket, dstPrefix)
-	s.Delete(srcBucket, srcPrefix)
+	var err error
+	if err = s.Copy(srcBucket, srcPrefix, dstBucket, dstPrefix); err != nil {
+		return err
+	}
+	if err = s.Delete(srcBucket, srcPrefix); err != nil {
+		return err
+	}
+	return nil
 }
 
 // OutputObject outputs an object
-func (s *S3) Cat(bucket, prefix string) []byte {
+func (s *S3) Cat(bucket, prefix string) ([]byte, error) {
+	var err error
 	// create reader
-	s.init(bucket)
-	o, ge := s.client.GetObject(context.TODO(), &s3.GetObjectInput{
+	if err = s.Init(bucket); err != nil {
+		return nil, err
+	}
+	var o *s3.GetObjectOutput
+	if o, err = s.client.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
-	})
-	if ge != nil {
-		logger.Info(module, "output object failed when create reader with %s", ge)
-		common.Exit()
+	}); err != nil {
+		logger.Info(module, "output object failed when create reader with %s", err)
+		return nil, err
 	}
 
 	// write to bytes
 	buf := new(bytes.Buffer)
-	_, re := buf.ReadFrom(o.Body)
-	if re != nil {
-		logger.Info(module, "output object failed when write to buffer with %s", re)
-		common.Exit()
+	if _, err = buf.ReadFrom(o.Body); err != nil {
+		logger.Info(module, "output object failed when write to buffer with %s", err)
+		return nil, err
 	}
-	bs := buf.Bytes()
-	return bs
+	return buf.Bytes(), nil
 }
 
 // IsObject checks if is an object
@@ -504,46 +588,66 @@ func (s *S3) Cat(bucket, prefix string) []byte {
 // case 2: gs://abc/de -> gs://abc/def/ : false
 // case 3: gs://abc/def/ -> gs://abc/def/ : false
 // case 4: gs://abc/def -> gs://abc/def : true
-func (s *S3) IsObject(bucket, prefix string) bool {
-	return s.S3Attrs(bucket, prefix) != nil
+func (s *S3) IsObject(bucket, prefix string) (bool, error) {
+	var err error
+	var s3a *S3Attributes
+	if s3a, err = s.S3Attrs(bucket, prefix); err != nil {
+		return false, err
+	}
+	return s3a != nil, nil
 }
 
 // IsDirectory checks if is a directory
-func (s *S3) IsDirectory(bucket, prefix string) bool {
-	objs := s.listObjectsAndSubPaths(bucket, prefix, true)
+func (s *S3) IsDirectory(bucket, prefix string) (bool, error) {
+	var err error
+	var objs []string
+	if objs, err = s.listObjectsAndSubPaths(bucket, prefix, true); err != nil {
+		return false, err
+	}
 	if len(objs) > 1 {
-		return true
+		return true, nil
 	}
 	if len(objs) == 1 {
-		return len(objs[0]) > len(prefix)
+		return len(objs[0]) > len(prefix), nil
 	}
-	return false
+	return false, nil
 }
 
 // equalCRC32C return true if CRC32C values are the same
 // - compare a local file with an object from gcp
-func (s *S3) equalCRC32C(localPath, bucket, object string) bool {
+func (s *S3) equalCRC32C(localPath, bucket, object string) (bool, error) {
 	localCRC32C := common.GetFileCRC32C(localPath)
 	r2CRC32C := uint32(0)
-	attr := s.S3Attrs(bucket, object)
+	var err error
+	var attr *S3Attributes
+	if attr, err = s.S3Attrs(bucket, object); err != nil {
+		return false, err
+	}
 	if attr != nil {
 		r2CRC32C = s.toAttrs(attr).CRC32
 	}
 	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
 		localPath, bucket, object, localCRC32C, r2CRC32C)
-	return localCRC32C == r2CRC32C
+	return localCRC32C == r2CRC32C, nil
 }
 
 // MustEqualCRC32C compare CRC32C values if flag is set
 // - compare a local file with an object from gcp
 // - exit process if values are different
-func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) {
+func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) error {
 	if !flag {
-		return
+		return nil
 	}
-	if !s.equalCRC32C(localPath, bucket, object) {
-		logger.Info(module, "CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
-		common.Exit()
+	var err error
+	var ok bool
+	if ok, err = s.equalCRC32C(localPath, bucket, object); err != nil {
+		return err
+	}
+	if !ok {
+		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+		logger.Info(module, log)
+		return fmt.Errorf(log)
 	}
 	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
+	return nil
 }

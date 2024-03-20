@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/base64"
 
+	"cloud.google.com/go/storage"
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/logger"
@@ -31,8 +32,11 @@ var statCmd = &cobra.Command{
 			common.Exit()
 		}
 		g := fo.System.(*gcs.GCS)
-
-		attrs := g.GCSAttrs(fo.Bucket, fo.Prefix)
+		var err error
+		var attrs *storage.ObjectAttrs
+		if attrs, err = g.GCSAttrs(fo.Bucket, fo.Prefix); err != nil {
+			common.Exit()
+		}
 		logger.Info(module, "%s://%s/%s:", fo.System.Scheme(), fo.Bucket, fo.Prefix)
 		logger.Info(module, "\t%-s:\t%s", "Creation time", attrs.Created)
 		logger.Info(module, "\t%-s:\t%s", "Update time", attrs.Updated)

@@ -9,7 +9,6 @@ import (
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
-	"github.com/nextbillion-ai/gsg/r2"
 	"github.com/nextbillion-ai/gsg/s3"
 	"github.com/nextbillion-ai/gsg/system"
 	"github.com/nextbillion-ai/gsg/worker"
@@ -33,7 +32,6 @@ var (
 func init() {
 	system.Register(&gcs.GCS{})
 	system.Register(&linux.Linux{})
-	system.Register(&r2.R2{})
 	system.Register(&s3.S3{})
 	rootCmd.PersistentFlags().BoolP(
 		"m", "m", false,

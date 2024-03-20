@@ -18,12 +18,20 @@ func init() {
 func deleteDst(src, dst *system.FileObject, _, isDel, _ bool) bool {
 	if src.FileType() == system.FileType_Invalid && isDel {
 		if dst.FileType() == system.FileType_Directory {
-			fos := dst.System.List(dst.Bucket, dst.Prefix, true)
+			var err error
+			var fos []*system.FileObject
+			if fos, err = dst.System.List(dst.Bucket, dst.Prefix, true); err != nil {
+				common.Exit()
+			}
 			for _, fo := range fos {
 				bucket := fo.Bucket
 				prefix := fo.Prefix
 				system := fo.System
-				pool.Add(func() { system.Delete(bucket, prefix) })
+				pool.Add(func() {
+					if e := system.Delete(bucket, prefix); e != nil {
+						common.Exit()
+					}
+				})
 			}
 		}
 		return true
@@ -36,9 +44,12 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		logger.Debug(module, "cleaned up dst on non-existing src with -d flag")
 		return
 	}
+	println("downsync", "afterDeleteDst")
 	deleteTempFiles(dst.Prefix, isRec)
+	println("downsync", "afterDeleteTempFiles")
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
+	println("downsync", "afterListRelatively")
 	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
 	if len(copyList)+len(deleteList) == 0 {
 		logger.Info(module, "No diff detected")
@@ -47,14 +58,21 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
 		println(dst.Prefix, fo.Attributes.RelativePath)
-		fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars})
+
+		if e := fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars}); e != nil {
+			common.Exit()
+		}
 	}
 	if isDel {
 		for _, fo := range deleteList {
 			system := fo.System
 			bucket := fo.Bucket
 			prefix := fo.Prefix
-			pool.Add(func() { system.Delete(bucket, prefix) })
+			pool.Add(func() {
+				if e := system.Delete(bucket, prefix); e != nil {
+					common.Exit()
+				}
+			})
 		}
 	}
 }
@@ -75,13 +93,21 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	for _, fo := range copyList {
 		from := fo.Prefix
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
-		pool.Add(func() { dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars}) })
+		pool.Add(func() {
+			if e := dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars}); e != nil {
+				common.Exit()
+			}
+		})
 	}
 	if isDel {
 		for _, fo := range deleteList {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 			system := fo.System
-			pool.Add(func() { system.Delete(dst.Bucket, dstPath) })
+			pool.Add(func() {
+				if e := system.Delete(dst.Bucket, dstPath); e != nil {
+					common.Exit()
+				}
+			})
 		}
 	}
 }
@@ -110,13 +136,21 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		system := fo.System
 		bucket := fo.Bucket
 		prefix := fo.Prefix
-		pool.Add(func() { system.Copy(bucket, prefix, dst.Bucket, dstPath) })
+		pool.Add(func() {
+			if e := system.Copy(bucket, prefix, dst.Bucket, dstPath); e != nil {
+				common.Exit()
+			}
+		})
 	}
 	if isDel {
 		for _, fo := range deleteList {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 			system := fo.System
-			pool.Add(func() { system.Delete(dst.Bucket, dstPath) })
+			pool.Add(func() {
+				if e := system.Delete(dst.Bucket, dstPath); e != nil {
+					common.Exit()
+				}
+			})
 		}
 	}
 }
@@ -139,13 +173,21 @@ func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		system := fo.System
 		bucket := fo.Bucket
 		prefix := fo.Prefix
-		pool.Add(func() { system.Copy(bucket, prefix, dst.Bucket, dstPath) })
+		pool.Add(func() {
+			if e := system.Copy(bucket, prefix, dst.Bucket, dstPath); e != nil {
+				common.Exit()
+			}
+		})
 	}
 	if isDel {
 		for _, fo := range deleteList {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 			system := fo.System
-			pool.Add(func() { system.Delete(dst.Bucket, dstPath) })
+			pool.Add(func() {
+				if e := system.Delete(dst.Bucket, dstPath); e != nil {
+					common.Exit()
+				}
+			})
 		}
 	}
 }
@@ -208,7 +250,11 @@ var rsyncCmd = &cobra.Command{
 }
 
 func listRelatively(base *system.FileObject, isRec bool) map[string]*system.FileObject {
-	fos := base.System.List(base.Bucket, base.Prefix, isRec)
+	var err error
+	var fos []*system.FileObject
+	if fos, err = base.System.List(base.Bucket, base.Prefix, isRec); err != nil {
+		common.Exit()
+	}
 	r := map[string]*system.FileObject{}
 	for _, fo := range fos {
 		fo.Attributes.RelativePath = common.GetRelativePath(base.Prefix, fo.Prefix)
@@ -249,9 +295,10 @@ func diffs(srcFiles, dstFiles map[string]*system.FileObject, forceChecksum bool)
 }
 
 func deleteTempFiles(dir string, isRec bool) {
-	objs := linux.ListTempFiles(dir, isRec)
 	l := system.Lookup("")
-	for _, obj := range objs {
-		l.Delete("", obj)
+	for _, obj := range linux.ListTempFiles(dir, isRec) {
+		if e := l.Delete("", obj); e != nil {
+			common.Exit()
+		}
 	}
 }
