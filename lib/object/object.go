@@ -1,6 +1,7 @@
 package object
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/s3"
 	"github.com/nextbillion-ai/gsg/system"
+	"golang.org/x/time/rate"
 )
 
 var urlRe = regexp.MustCompile(`(s3|gs|S3|GS)://([^/]+)(/.*)?`)
@@ -20,6 +22,41 @@ var s3NotFoundRe = regexp.MustCompile(`.*StatusCode: 404.*`)
 
 var ErrObjectNotFound = fmt.Errorf("Object Not Found")
 var ErrObjectURLInvalid = fmt.Errorf("Object URL Not supported")
+
+type rateLimiterCache struct {
+	sync.RWMutex
+	cache map[string]*rate.Limiter
+}
+
+func newRateLimiterCache() *rateLimiterCache {
+	return &rateLimiterCache{cache: map[string]*rate.Limiter{}}
+}
+
+func (r *rateLimiterCache) Get(url string) *rate.Limiter {
+	defer r.RUnlock()
+	r.RLock()
+	return r.cache[url]
+}
+
+func (r *rateLimiterCache) Set(url string, l *rate.Limiter) {
+	defer r.Unlock()
+	r.Lock()
+	r.cache[url] = l
+}
+
+func (r *rateLimiterCache) GetOrNew(url string) *rate.Limiter {
+
+	var l = r.Get(url)
+	if l != nil {
+		return l
+	}
+	l = rate.NewLimiter(1, 1)
+	r.Set(url, l)
+	return l
+
+}
+
+var _rlCache = newRateLimiterCache()
 
 type systemCache struct {
 	sync.RWMutex
@@ -118,6 +155,7 @@ type Object struct {
 	scheme  string
 	bucket  string
 	prefix  string
+	url     string
 }
 
 func New(url string) (*Object, error) {
@@ -135,6 +173,7 @@ func New(url string) (*Object, error) {
 		scheme:  scheme,
 		bucket:  bucket,
 		prefix:  prefix,
+		url:     url,
 	}, nil
 }
 
@@ -151,6 +190,7 @@ func (o *Object) Reset(url string) error {
 	o.bucket = bucket
 	o.prefix = prefix
 	o.scheme = scheme
+	o.url = url
 	o._system = sys
 	return nil
 }
@@ -177,6 +217,9 @@ func (o *Object) Read(to io.Writer) error {
 
 func (o *Object) Write(from io.Reader) error {
 	var err error
+	if err = _rlCache.GetOrNew(o.url).Wait(context.Background()); err != nil {
+		return err
+	}
 	switch o.scheme {
 	case "s3":
 		return o._system.(*s3.S3).PutObject(o.bucket, o.prefix, from)
