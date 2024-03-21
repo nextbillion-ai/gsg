@@ -5,6 +5,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/gcs"
@@ -19,6 +20,70 @@ var s3NotFoundRe = regexp.MustCompile(`.*StatusCode: 404.*`)
 
 var ErrObjectNotFound = fmt.Errorf("Object Not Found")
 var ErrObjectURLInvalid = fmt.Errorf("Object URL Not supported")
+
+type systemCache struct {
+	sync.RWMutex
+	cache map[string]system.ISystem
+}
+
+func (s *systemCache) Get(scheme, bucket string) system.ISystem {
+	defer s.RUnlock()
+	s.RLock()
+	switch scheme {
+	case "gs":
+		return s.cache["gs"]
+	case "s3":
+		return s.cache["s3://"+bucket]
+	default:
+		return nil
+	}
+}
+
+func (s *systemCache) Set(scheme, bucket string, sys system.ISystem) {
+	defer s.Unlock()
+	s.Lock()
+	switch scheme {
+	case "gs":
+		s.cache["gs"] = sys
+	case "s3":
+		s.cache["s3://"+bucket] = sys
+	default:
+	}
+}
+
+func (s *systemCache) GetOrNew(scheme, bucket string) (system.ISystem, error) {
+	var sys system.ISystem
+	switch scheme {
+	case "gs":
+		sys = s.Get(scheme, bucket)
+		if sys != nil {
+			return sys, nil
+		}
+		sys = &gcs.GCS{}
+	case "s3":
+		sys = s.Get(scheme, bucket)
+		if sys != nil {
+			return sys, nil
+		}
+		sys = &s3.S3{}
+	default:
+		return nil, ErrObjectURLInvalid
+	}
+
+	if err := sys.Init(bucket); err != nil {
+		return nil, err
+	}
+	s.Set(scheme, bucket, sys)
+	return sys, nil
+}
+
+func newSystemCache() *systemCache {
+	return &systemCache{
+		cache: map[string]system.ISystem{},
+	}
+}
+
+var _syscache = newSystemCache()
 
 func parseError(err error) error {
 	s := err.Error()
@@ -36,7 +101,7 @@ type ObjectResult struct {
 	ModTime time.Time
 }
 
-func parseUrl(url string) (system, bucket, prefix string, err error) {
+func parseUrl(url string) (scheme, bucket, prefix string, err error) {
 	match := urlRe.FindStringSubmatch(url)
 	if len(match) != 4 {
 		err = fmt.Errorf("invalid object url: %s", url)
@@ -50,63 +115,50 @@ func parseUrl(url string) (system, bucket, prefix string, err error) {
 
 type Object struct {
 	_system system.ISystem
-	system  string
+	scheme  string
 	bucket  string
 	prefix  string
 }
 
 func New(url string) (*Object, error) {
 	var err error
-	var system, bucket, prefix string
-	if system, bucket, prefix, err = parseUrl(url); err != nil {
+	var scheme, bucket, prefix string
+	if scheme, bucket, prefix, err = parseUrl(url); err != nil {
 		return nil, err
 	}
-	obj := &Object{
-		system: system,
-		bucket: bucket,
-		prefix: prefix,
-	}
-	switch system {
-	case "s3":
-		obj._system = &s3.S3{}
-	case "gs":
-		obj._system = &gcs.GCS{}
-	default:
-		return nil, ErrObjectURLInvalid
-	}
-	if err = obj._system.Init(bucket); err != nil {
+	var sys system.ISystem
+	if sys, err = _syscache.GetOrNew(scheme, bucket); err != nil {
 		return nil, err
 	}
-	return obj, nil
+	return &Object{
+		_system: sys,
+		scheme:  scheme,
+		bucket:  bucket,
+		prefix:  prefix,
+	}, nil
 }
 
 func (o *Object) Reset(url string) error {
 	var err error
-	var system, bucket, prefix string
-	if system, bucket, prefix, err = parseUrl(url); err != nil {
+	var scheme, bucket, prefix string
+	if scheme, bucket, prefix, err = parseUrl(url); err != nil {
+		return err
+	}
+	var sys system.ISystem
+	if sys, err = _syscache.GetOrNew(scheme, bucket); err != nil {
 		return err
 	}
 	o.bucket = bucket
 	o.prefix = prefix
-	if o.system == system {
-		if system == "s3" && o.bucket != bucket {
-			if err = o._system.Init(o.bucket); err != nil {
-				return err
-			}
-		}
-	} else {
-		o.system = system
-		if err = o._system.Init(o.bucket); err != nil {
-			return err
-		}
-	}
+	o.scheme = scheme
+	o._system = sys
 	return nil
 }
 
 func (o *Object) Read(to io.Writer) error {
 	var err error
 	var rc io.ReadCloser
-	switch o.system {
+	switch o.scheme {
 	case "s3":
 		if rc, err = o._system.(*s3.S3).GetObjectReader(o.bucket, o.prefix); err != nil {
 			return parseError(err)
@@ -125,7 +177,7 @@ func (o *Object) Read(to io.Writer) error {
 
 func (o *Object) Write(from io.Reader) error {
 	var err error
-	switch o.system {
+	switch o.scheme {
 	case "s3":
 		return o._system.(*s3.S3).PutObject(o.bucket, o.prefix, from)
 	case "gs":
@@ -143,7 +195,7 @@ func (o *Object) Write(from io.Reader) error {
 }
 
 func (o *Object) Delete() error {
-	switch o.system {
+	switch o.scheme {
 	case "s3":
 		return o._system.(*s3.S3).DeleteObject(o.bucket, o.prefix)
 	case "gs":
