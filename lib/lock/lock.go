@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nextbillion-ai/gsg/gcs"
+	"github.com/nextbillion-ai/gsg/logger"
 )
 
 var g = &gcs.GCS{}
@@ -31,6 +32,7 @@ func (d *Distributed) Lock(ctx context.Context, ttl time.Duration) error {
 		case <-ticker.C:
 			var err error
 			if d.generation, err = g.DoAttemptLock(d.bucket, d.prefix, ttl); err == nil {
+				logger.Debug("lock", "locked with gen: %d", d.generation)
 				return nil
 			}
 		case <-ctx.Done():

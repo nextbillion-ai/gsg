@@ -431,7 +431,7 @@ func (g *GCS) AttemptUnLock(bucket, object string) error {
 
 // DoAttemptLock returns generation and potential error
 func (g *GCS) DoAttemptLock(bucket, object string, ttl time.Duration) (int64, error) {
-	var err error
+	var err, err1 error
 	if err = g.Init(); err != nil {
 		return 0, err
 	}
@@ -439,30 +439,34 @@ func (g *GCS) DoAttemptLock(bucket, object string, ttl time.Duration) (int64, er
 	o := g.client.Bucket(bucket).Object(object)
 	wc := o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
 	_, _ = wc.Write([]byte("1"))
-	e0 := wc.Close()
-	attrs, e1 := o.Attrs(context.Background())
-	if e1 != nil {
-		return 0, e1
+	err = wc.Close()
+	var attrs *storage.ObjectAttrs
+	if attrs, err1 = o.Attrs(context.Background()); err1 != nil {
+		return 0, err1
 	}
-	if e0 != nil {
-		//logger.Debug("DoAttemptLock expire: %+v, current: %+v, ttl:%+v", attrs.Updated, time.Now(), ttl)
-		if attrs.Updated.Add(ttl).Before(time.Now()) {
-			//logger.Debug("DoAttemptLock expired. delete and try lock again")
-			_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
-			//try acquire lock again
-			wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
-			_, _ = wc.Write([]byte("1"))
-			if e2 := wc.Close(); e2 != nil {
-				return 0, e2
-			}
-		} else {
-			//lock acquire failure, quit with error
-			return 0, e0
+	if err == nil {
+		return attrs.Generation, nil
+	}
+	//logger.Debug("DoAttemptLock expire: %+v, current: %+v, ttl:%+v", attrs.Updated, time.Now(), ttl)
+	if attrs.Updated.Add(ttl).Before(time.Now()) {
+		//logger.Debug("DoAttemptLock expired. delete and try lock again")
+		_ = o.If(storage.Conditions{GenerationMatch: attrs.Generation}).Delete(context.Background())
+		//try acquire lock again
+		wc = o.If(storage.Conditions{DoesNotExist: true}).NewWriter(context.Background())
+		_, _ = wc.Write([]byte("1"))
+		if err = wc.Close(); err != nil {
+			return 0, err
 		}
+		if attrs, err1 = o.Attrs(context.Background()); err1 != nil {
+			return 0, err1
+		}
+		return attrs.Generation, nil
+	} else {
+		//lock acquire failure, quit with error
+		return 0, err
 	}
 	//upon sucessful write, store generation in /tmp
 	//logger.Debug("DoAttemptLock lock acquired. updating ttl")
-	return attrs.Generation, nil
 }
 
 // AttemptLock attempts to write a remote lock file
