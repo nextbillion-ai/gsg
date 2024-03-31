@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/logger"
 )
@@ -22,6 +23,21 @@ func New(bucket, prefix string) *Distributed {
 		bucket: bucket,
 		prefix: prefix,
 	}
+}
+
+func NewWithUrl(url string) (*Distributed, error) {
+	var scheme, bucket, prefix string
+	var err error
+	if scheme, bucket, prefix, err = common.ParseObjectUrl(url); err != nil {
+		return nil, err
+	}
+	if scheme != "gs" {
+		return nil, fmt.Errorf("only gcs locks are supported")
+	}
+	return &Distributed{
+		bucket: bucket,
+		prefix: prefix,
+	}, nil
 }
 
 func (d *Distributed) Lock(ctx context.Context, ttl time.Duration) error {

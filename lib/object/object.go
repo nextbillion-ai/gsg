@@ -5,17 +5,15 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/s3"
 	"github.com/nextbillion-ai/gsg/system"
 	"golang.org/x/time/rate"
 )
-
-var urlRe = regexp.MustCompile(`(s3|gs|S3|GS)://([^/]+)(/.*)?`)
 
 var gcsNotFoundRe = regexp.MustCompile(`.*storage: object doesn't exist.*`)
 var s3NotFoundRe = regexp.MustCompile(`.*StatusCode: 404.*`)
@@ -138,18 +136,6 @@ type ObjectResult struct {
 	ModTime time.Time
 }
 
-func parseUrl(url string) (scheme, bucket, prefix string, err error) {
-	match := urlRe.FindStringSubmatch(url)
-	if len(match) != 4 {
-		err = fmt.Errorf("invalid object url: %s", url)
-		return
-	}
-	if len(match[3]) > 0 {
-		match[3] = match[3][1:]
-	}
-	return strings.ToLower(match[1]), match[2], match[3], nil
-}
-
 type Object struct {
 	_system system.ISystem
 	scheme  string
@@ -161,7 +147,7 @@ type Object struct {
 func New(url string) (*Object, error) {
 	var err error
 	var scheme, bucket, prefix string
-	if scheme, bucket, prefix, err = parseUrl(url); err != nil {
+	if scheme, bucket, prefix, err = common.ParseObjectUrl(url); err != nil {
 		return nil, err
 	}
 	var sys system.ISystem
@@ -180,7 +166,7 @@ func New(url string) (*Object, error) {
 func (o *Object) Reset(url string) error {
 	var err error
 	var scheme, bucket, prefix string
-	if scheme, bucket, prefix, err = parseUrl(url); err != nil {
+	if scheme, bucket, prefix, err = common.ParseObjectUrl(url); err != nil {
 		return err
 	}
 	var sys system.ISystem
