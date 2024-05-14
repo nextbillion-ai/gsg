@@ -108,6 +108,14 @@ func GenTempFileName(parts ...string) string {
 
 }
 
+// RemoveCRC32CCache ...
+func RemoveCRC32CCache(path string) {
+	cacheFileName := GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
+	if err := os.Remove(cacheFileName); err != nil {
+		logger.Warn(module, "Failed to remove crc32c cache: %s", err)
+	}
+}
+
 func readOrComputeCRC32c(path string) uint32 {
 	result := uint32(0)
 	cacheFileName := GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")

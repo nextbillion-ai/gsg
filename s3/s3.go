@@ -512,6 +512,7 @@ func (s *S3) Download(
 		logger.Info(module, "download object failed when rename file with %s", err)
 		return err
 	}
+	common.RemoveCRC32CCache(dstFile)
 	common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
 	return nil
 }

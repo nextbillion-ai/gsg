@@ -394,6 +394,7 @@ func (g *GCS) Download(
 		logger.Info(module, "download object failed when rename file with %s", err)
 		return err
 	}
+	common.RemoveCRC32CCache(dstFile)
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
 	if err = g.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
 		return err
