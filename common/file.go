@@ -132,7 +132,17 @@ func readOrComputeCRC32c(path string) uint32 {
 	result = h32.Sum32()
 	crcBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(crcBytes, result)
-	cf, _ := os.OpenFile(cacheFileName, os.O_WRONLY, 0766)
+
+	if _, err := os.Stat(cacheFileName); os.IsNotExist(err) {
+		_, err := os.Create(cacheFileName)
+		if err != nil {
+			panic(err)
+		}
+	}
+	cf, errOpen := os.OpenFile(cacheFileName, os.O_WRONLY, 0766)
+	if errOpen != nil {
+		logger.Debug(module, "open crc32c cachefile failed with %s", errOpen)
+	}
 	defer func() {
 		_ = cf.Close()
 	}()
