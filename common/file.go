@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,10 +132,17 @@ func readOrComputeCRC32c(path string) uint32 {
 	result = h32.Sum32()
 	crcBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(crcBytes, result)
-	err = os.WriteFile(cacheFileName, crcBytes, fs.ModePerm)
-	if err != nil {
+	cf, _ := os.OpenFile(cacheFileName, os.O_WRONLY, 0766)
+	defer func() {
+		_ = cf.Close()
+	}()
+	if _, err = cf.Write(crcBytes); err != nil {
 		logger.Debug(module, "write crc32c cachefile failed with %s", err)
-	} else {
+	}
+	if err = cf.Sync(); err != nil {
+		logger.Debug(module, "write crc32c cachefile sync failed with %s", err)
+	}
+	if err == nil {
 		logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
 	}
 	return result

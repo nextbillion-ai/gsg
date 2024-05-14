@@ -383,6 +383,10 @@ func (g *GCS) Download(
 					logger.Info(module, "download object failed when write to offet with %s", err)
 					common.Exit()
 				}
+				if err = fl.Sync(); err != nil {
+					logger.Info(module, "download object failed when syncing to disk %s", err)
+					common.Exit()
+				}
 			},
 		)
 	}

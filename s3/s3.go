@@ -501,6 +501,10 @@ func (s *S3) Download(
 					logger.Info(module, "download object failed when write to offet with %s", we)
 					common.Exit()
 				}
+				if err := fl.Sync(); err != nil {
+					logger.Info(module, "download object failed when syncing to disk %s", err)
+					common.Exit()
+				}
 			},
 		)
 	}
