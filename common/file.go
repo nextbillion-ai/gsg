@@ -133,13 +133,7 @@ func readOrComputeCRC32c(path string) uint32 {
 	crcBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(crcBytes, result)
 
-	if _, err := os.Stat(cacheFileName); os.IsNotExist(err) {
-		_, err := os.Create(cacheFileName)
-		if err != nil {
-			panic(err)
-		}
-	}
-	cf, errOpen := os.OpenFile(cacheFileName, os.O_WRONLY, 0766)
+	cf, errOpen := os.OpenFile(cacheFileName, os.O_WRONLY|os.O_CREATE, 0766)
 	if errOpen != nil {
 		logger.Debug(module, "open crc32c cachefile failed with %s", errOpen)
 	}
