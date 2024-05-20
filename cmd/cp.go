@@ -76,10 +76,11 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 			}
 			for _, obj := range objs {
 				dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
+				srcPath := obj.Prefix
 				wg.Add(1)
 				pool.Add(func() {
 					defer wg.Done()
-					if err = src.System.Download(src.Bucket, obj.Prefix, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+					if err = src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool}); err != nil {
 						common.Exit()
 					}
 				})
