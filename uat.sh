@@ -25,6 +25,64 @@ same() {
     fi
 }
 
+assertValue() {
+    if [[ "$3" == "remote" ]]
+    then
+        case $mode in
+        gs)
+            if gsutil ls $remote_base/$1 &>/dev/null
+            then
+                content="$(gsutil cat $remote_base/$1 2>/dev/null)"
+                if [[ "$content" == "$2" ]]
+                then
+                    echo OK: $1 exists with correct content remotely.
+                else
+                    echo FATAL: required file $1 does not have correct content remotely.
+                    exit 1
+                fi
+            else
+                echo FATAL: required file $1 does not exists remotely.
+                exit 1
+            fi
+            ;;
+        s3)
+            if aws s3 cp $remote_base/$1 .temp &>/dev/null 
+            then
+                content="$(cat .temp)"
+                if [[ "$content" == "$2" ]]
+                then
+                    echo OK: $1 exists with correct content remotely.
+                else
+                    echo FATAL: required file $1 does not have correct content remotely.
+                    exit 1
+                fi
+            else
+                echo FATAL: required file $1 does not exists remotely.
+                exit 1
+            fi
+            ;;
+        *)
+            exit 1
+            ;;
+        esac
+    else
+        if ls $1 &>/dev/null 
+        then
+            content=$(cat $1)
+            if [[ "$content" == "$2" ]]
+            then
+                echo OK: $1 exists with correct content locally.
+            else
+                echo FATAL: required file $1 does not have correct content locally.
+                exit 1
+            fi
+        else
+            echo FATAL: required file $1 does not exists locally.
+            exit 1
+        fi
+    fi
+}
+
 assert() {
     if [[ "$2" == "remote" ]]
     then
@@ -144,7 +202,12 @@ remote_copy() {
 }
 
 prepare_file() {
-    echo "$testid" > $1
+    value=$testid
+    if [[ "$2" != "" ]]
+    then
+        value=$2
+    fi
+    echo "$value" > $1
 }
 
 do_test() {
@@ -171,13 +234,13 @@ do_test() {
 
     start "test upload a folder"
     mkdir -p $ftu/a/b/c
-    prepare_file $ftu/a/1.txt
-    prepare_file $ftu/a/2.txt
-    prepare_file $ftu/a/b/c/3.txt
+    prepare_file $ftu/a/1.txt 1_txt
+    prepare_file $ftu/a/2.txt 2_txt
+    prepare_file $ftu/a/b/c/3.txt 3_txt
     ../gsg cp -r $ftu $remote_base/$ftu
-    assert $ftu/a/1.txt remote
-    assert $ftu/a/2.txt remote
-    assert $ftu/a/b/c/3.txt remote
+    assertValue $ftu/a/1.txt 1_txt remote
+    assertValue $ftu/a/2.txt 2_txt remote
+    assertValue $ftu/a/b/c/3.txt 3_txt remote
     finish
 
     start "test download"
@@ -193,15 +256,15 @@ do_test() {
     ftd="folder_to_download"
     start "test download a folder"
     mkdir -p $ftd/a/b/c
-    prepare_file $ftd/a/1.txt
-    prepare_file $ftd/a/2.txt
-    prepare_file $ftd/a/b/c/3.txt
+    prepare_file $ftd/a/1.txt 1_txt
+    prepare_file $ftd/a/2.txt 2_txt
+    prepare_file $ftd/a/b/c/3.txt 3_txt
     $(remote_copy true) $ftd $remote_base/$ftd
     rm -rf $ftd
     ../gsg cp -r $remote_base/$ftd $ftd
-    assert $ftd/a/1.txt
-    assert $ftd/a/2.txt
-    assert $ftd/a/b/c/3.txt
+    assertValue $ftd/a/1.txt 1_txt
+    assertValue $ftd/a/2.txt 2_txt
+    assertValue $ftd/a/b/c/3.txt 3_txt
     finish
 
     ftm="folder_to_move"
