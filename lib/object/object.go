@@ -256,3 +256,21 @@ func (o *Object) List(recursive bool) ([]*ObjectResult, error) {
 	}
 	return results, nil
 }
+
+func (o *Object) SubPaths() ([]string, error) {
+	var err error
+	var results []string
+	var fs []*system.FileObject
+	if fs, err = o._system.List(o.bucket, o.prefix, false); err != nil {
+		return nil, parseError(err)
+	}
+	if len(fs) == 0 {
+		return nil, ErrObjectNotFound
+	}
+	for _, f := range fs {
+		if f.FileType() == system.FileType_Directory {
+			results = append(results, fmt.Sprintf("%s://%s/%s", f.System.Scheme(), f.Bucket, f.Prefix))
+		}
+	}
+	return results, nil
+}
