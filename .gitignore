@@ -9,6 +9,7 @@ vendor
 gsg
 uat_temp
 uat
+_icw_
 
 # Test binary, built with `go test -c`
 *.test

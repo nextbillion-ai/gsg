@@ -2,9 +2,12 @@ package cmd
 
 import (
 	"bufio"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,10 +107,107 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 	}
 }
 
-func cloudCopy(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
-	if src.System != dst.System {
-		logger.Info(module, "inter cloud copy not supported. [%s] => [%s]", src.Bucket, dst.Bucket)
+func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.WaitGroup) {
+	var interChange *system.FileObject
+	prepareWorkDir := func() {
+		var err error
+		workDir := fmt.Sprintf("_icw_/%x", md5.Sum([]byte(fmt.Sprintf("%s-%d", dst.Bucket+dst.Prefix, time.Now().UnixNano()))))
+		if err = os.MkdirAll(workDir, 0755); err != nil {
+			logger.Error("inter-cloud", "failed to create work dir: %s", workDir)
+			common.Exit()
+		}
+		interChange = system.ParseFileObject(workDir)
+		if interChange.FileType() != system.FileType_Directory {
+			logger.Error("inter-cloud", "failed to parse work dir: %s to directory", workDir)
+			common.Exit()
+		}
+	}
+	removeWorkDir := func() {
+		var err error
+		if !strings.Contains(interChange.Prefix, "_icw_/") {
+			logger.Error("inter-cloud", "invalid work dir: %s to cleanup", interChange.Prefix)
+			common.Exit()
+		}
+		if err = exec.Command("rm", "-rf", interChange.Prefix).Run(); err != nil {
+			logger.Error("inter-cloud", "failed to cleanup work dir %s : %s", interChange.Prefix, err)
+			common.Exit()
+		}
+	}
+	var err error
+	switch src.FileType() {
+	case system.FileType_Directory:
+		if isRec {
+			prepareWorkDir()
+			var objs []*system.FileObject
+			if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
+				common.Exit()
+			}
+			for _, obj := range objs {
+				interPath := common.GetDstPath(src.Prefix, obj.Prefix, interChange.Prefix)
+				dstPath := common.GetDstPath(linux.GetRealPath(interChange.Prefix), obj.Prefix, dst.Prefix)
+				srcPath := obj.Prefix
+				wg.Add(1)
+				pool.Add(func() {
+					var err error
+					defer wg.Done()
+					if err = src.System.Download(src.Bucket, srcPath, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+						common.Exit()
+					}
+					interFile := system.ParseFileObject(interPath)
+					if interFile.FileType() != system.FileType_Object {
+						logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
+						common.Exit()
+					}
+					if err = dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+						logger.Error("inter-cloud", "failed to upload intermediate file: %s to %s", interPath, dstPath)
+						common.Exit()
+					}
+					if err := os.Remove(interPath); err != nil {
+						logger.Error("inter-cloud", "failed to remove intermediate file: %s", interPath)
+						common.Exit()
+					}
+				})
+			}
+			removeWorkDir()
+		} else {
+			logger.Info(module, "Omitting bucket[%s] prefix[%s]. (Did you mean to do cp -r?)", src.Bucket, src.Prefix)
+			common.Exit()
+		}
+	case system.FileType_Object:
+		prepareWorkDir()
+		dstPrefix := dst.Prefix
+		_, name := common.ParseFile(src.Prefix)
+		if dst.FileType() == system.FileType_Directory {
+			dstPrefix = common.JoinPath(dst.Prefix, name)
+		}
+		interPath := common.JoinPath(interChange.Prefix, name)
+		if err = src.System.Download(src.Bucket, src.Prefix, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+			common.Exit()
+		}
+		interFile := system.ParseFileObject(interPath)
+		if interFile.FileType() != system.FileType_Object {
+			logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
+			common.Exit()
+		}
+		if err = dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+			logger.Error("inter-cloud", "failed to upload intermediate file: %s to %s", interPath, dstPrefix)
+			common.Exit()
+		}
+		if err := os.Remove(interPath); err != nil {
+			logger.Error("inter-cloud", "failed to remove intermediate file: %s", interPath)
+			common.Exit()
+		}
+		removeWorkDir()
+	case system.FileType_Invalid:
+		logger.Info(module, "Invalid bucket[%s] with prefix[%s]", src.Bucket, src.Prefix)
 		common.Exit()
+	}
+}
+
+func cloudCopy(src, dst *system.FileObject, forceCheckum, isRec bool, wg *sync.WaitGroup) {
+	if src.System != dst.System {
+		interCloudCopy(src, dst, forceCheckum, isRec, wg)
+		return
 	}
 	var err error
 	switch src.FileType() {
