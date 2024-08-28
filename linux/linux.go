@@ -27,8 +27,8 @@ type FileAttrs struct {
 	RelativePath string
 	Name         string
 	Size         int64
-	CRC32C       uint32
 	ModTime      time.Time
+	CalcCRC32C   func() uint32
 }
 
 // GetRealPath gets real path of a directory
@@ -53,9 +53,9 @@ func (l *Linux) toAttrs(attrs *FileAttrs) *system.Attrs {
 		return nil
 	}
 	return &system.Attrs{
-		Size:    attrs.Size,
-		CRC32:   attrs.CRC32C,
-		ModTime: attrs.ModTime,
+		Size:       attrs.Size,
+		ModTime:    attrs.ModTime,
+		CalcCRC32C: attrs.CalcCRC32C,
 	}
 }
 
@@ -85,7 +85,7 @@ func (l *Linux) attrs(_, prefix string) *FileAttrs {
 		RelativePath: prefix,
 		Name:         name,
 		Size:         common.GetFileSize(prefix),
-		CRC32C:       common.GetFileCRC32C(prefix),
+		CalcCRC32C:   func() uint32 { return common.GetFileCRC32C(prefix) },
 		ModTime:      common.GetFileModificationTime(prefix),
 	}
 	return res
@@ -112,7 +112,6 @@ func (l *Linux) batchAttrs(bucket, prefix string, isRec bool) ([]*FileAttrs, err
 			RelativePath: common.GetRelativePath(dir, obj.Prefix),
 			Name:         name,
 			Size:         common.GetFileSize(obj.Prefix),
-			CRC32C:       0, // low performance so only set default value, populate when necessary
 			ModTime:      common.GetFileModificationTime(obj.Prefix),
 		})
 	}
