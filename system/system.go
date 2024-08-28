@@ -38,6 +38,7 @@ type Attrs struct {
 	CRC32        uint32
 	ModTime      time.Time
 	RelativePath string
+	CalcCRC32C   func() uint32
 }
 
 func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
@@ -49,6 +50,12 @@ func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
 	r = r && a.Size == b.Size
 	if !forceChecksum && !a.ModTime.Equal(time.Time{}) && !b.ModTime.Equal(time.Time{}) {
 		r = r && a.ModTime.Equal(b.ModTime)
+	}
+	if a.CalcCRC32C != nil {
+		a.CRC32 = a.CalcCRC32C()
+	}
+	if b.CalcCRC32C != nil {
+		b.CRC32 = b.CalcCRC32C()
 	}
 	r = r && a.CRC32 == b.CRC32
 	return r
