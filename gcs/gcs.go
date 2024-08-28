@@ -145,7 +145,9 @@ func (g *GCS) batchAttrs(bucket, prefix string, recursive bool) ([]*storage.Obje
 			Projection: storage.ProjectionNoACL,
 		},
 	)
+	count := int64(0)
 	for {
+		count++
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
@@ -153,6 +155,10 @@ func (g *GCS) batchAttrs(bucket, prefix string, recursive bool) ([]*storage.Obje
 		if err != nil {
 			logger.Info(module, "get objects attributes failed with %s", err)
 			return nil, err
+		}
+
+		if count%100000 == 0 {
+			logger.Info(module, "batchAttrs for bucket[%s] prefix[%s] current count[%d]", bucket, prefix, count)
 		}
 		if len(attrs.Name) > 0 && common.IsSubPath(attrs.Name, prefix) {
 			res = append(res, attrs)

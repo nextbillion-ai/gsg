@@ -150,8 +150,12 @@ func (l *Linux) List(bucket, prefix string, isRec bool) ([]*system.FileObject, e
 	}
 	res := strings.Split(string(stdout), "\n")
 	objs := []*system.FileObject{}
-	for _, v := range res {
+	for i, v := range res {
+		if i%100000 == 0 && i != 0 {
+			logger.Info(module, "ListObjects %d/%d", i, len(res))
+		}
 		v = strings.Trim(v, " \t\n")
+
 		if len(v) > 0 && !common.IsTempFile(v) {
 			objs = append(objs, l.toFileObject(v))
 		}
