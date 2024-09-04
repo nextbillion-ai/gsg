@@ -48,7 +48,7 @@ var duCmd = &cobra.Command{
 				size = common.FromByteSize(size)
 			}
 			if !isSum || index == len(objs)-1 {
-				logger.Info("", "%-10s %s%s%s", size, scheme, bucket, obj.Name)
+				logger.Output(fmt.Sprintf("%-10s %s%s%s\n", size, scheme, bucket, obj.Name))
 			}
 		}
 	},

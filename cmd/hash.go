@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
@@ -29,7 +31,7 @@ var hashCmd = &cobra.Command{
 			common.Exit()
 			return
 		}
-		logger.Info("", "%-20s%d", "Hash (CRC32C):", attrs.CRC32)
-		logger.Info("", "%-20s%s", "ModTime:", attrs.ModTime.UTC().String())
+		logger.Output(fmt.Sprintf("%-20s%d\n", "Hash (CRC32C):", attrs.CRC32))
+		logger.Output(fmt.Sprintf("%-20s%s\n", "ModTime:", attrs.ModTime.UTC().String()))
 	},
 }
