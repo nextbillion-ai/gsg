@@ -56,7 +56,7 @@ func (t *DUTree) ToDiskUsages() []DiskUsage {
 }
 
 func NewDUTree(name string, size int64, folder bool) *DUTree {
-	if folder {
+	if folder && len(name) > 0 {
 		if name[len(name)-1] != '/' {
 			name += "/"
 		}
@@ -70,7 +70,7 @@ func NewDUTree(name string, size int64, folder bool) *DUTree {
 
 func GetAllParents(path, base string) []string {
 	res := []string{}
-	if base[len(base)-1] == '/' {
+	if base == "" || base[len(base)-1] != '/' {
 		base = base + "/"
 	}
 	for {
