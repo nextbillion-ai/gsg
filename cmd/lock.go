@@ -6,6 +6,7 @@ import (
 
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
+	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
 
@@ -34,17 +35,27 @@ var lockCmd = &cobra.Command{
 			ttlInSec = 24 * 3600
 		}
 		fo := system.ParseFileObject(dst)
-		if fo.System.Scheme() != "gs" {
-			logger.Info(module, "only gcs locks are supported")
-			common.Exit()
-		}
 		if fo.FileType() == system.FileType_Directory {
 			logger.Info(module, "lock destination is a directory")
 			common.Exit()
 		}
-		gcs := fo.System.(*gcs.GCS)
-		if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
-			common.Exit()
+
+		if fo.System.Scheme() == "gs" {
+			gcs := fo.System.(*gcs.GCS)
+			if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
+				common.Exit()
+			}
+			common.Finish()
 		}
+
+		if fo.System.Scheme() == "" {
+			lnx := fo.System.(*linux.Linux)
+			if e := lnx.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
+				common.Exit()
+			}
+			common.Finish()
+		}
+
+		logger.Info(module, "lock not suported in scheme %s", fo.System.Scheme())
 	},
 }
