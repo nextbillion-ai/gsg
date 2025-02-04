@@ -3,6 +3,7 @@ package cmd
 import (
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
+	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
 
@@ -21,17 +22,28 @@ var unlockCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		dst := args[0]
 		fo := system.ParseFileObject(dst)
-		if fo.System.Scheme() != "gs" {
-			logger.Info(module, "only gcs locks are supported")
-			common.Exit()
-		}
 		if fo.FileType() != system.FileType_Object {
 			logger.Info(module, "lock destination is not an object")
 			common.Exit()
 		}
-		gcs := fo.System.(*gcs.GCS)
-		if e := gcs.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
-			common.Exit()
+
+		if fo.System.Scheme() == "gs" {
+			gcs := fo.System.(*gcs.GCS)
+			if e := gcs.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
+				common.Exit()
+			}
+			common.Finish()
 		}
+
+		if fo.System.Scheme() == "" {
+			lnx := fo.System.(*linux.Linux)
+			if e := lnx.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
+				common.Exit()
+			}
+
+			common.Finish()
+		}
+
+		logger.Info(module, "lock not suported in scheme %s", fo.System.Scheme())
 	},
 }
