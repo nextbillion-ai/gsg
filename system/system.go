@@ -127,14 +127,30 @@ func (fo *FileObject) FileType() int {
 		return fo.fileType
 	}
 	fo.fileType = FileType_Invalid
-	if fo.System != nil {
-		if ok, err := fo.System.IsDirectory(fo.Bucket, fo.Prefix); err == nil && ok {
-			fo.fileType = FileType_Directory
-		} else if ok, err := fo.System.IsObject(fo.Bucket, fo.Prefix); err == nil && ok {
-			fo.fileType = FileType_Object
-			fo.Attributes, _ = fo.System.Attributes(fo.Bucket, fo.Prefix)
-		}
+	if fo.System == nil {
+		return fo.fileType
 	}
+
+	// Check if it's a directory
+	ok, err := fo.System.IsDirectory(fo.Bucket, fo.Prefix)
+	if err != nil {
+		common.Exit()
+	}
+	if ok {
+		fo.fileType = FileType_Directory
+		return fo.fileType
+	}
+
+	// Check if it's an object
+	ok, err = fo.System.IsObject(fo.Bucket, fo.Prefix)
+	if err != nil {
+		common.Exit()
+	}
+	if ok {
+		fo.fileType = FileType_Object
+		fo.Attributes, _ = fo.System.Attributes(fo.Bucket, fo.Prefix)
+	}
+
 	return fo.fileType
 }
 
