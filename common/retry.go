@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"time"
 )
 
@@ -23,6 +24,10 @@ func DefaultRetryConfig() RetryConfig {
 // DoWithRetry executes a function with retry logic
 // If all retries fail, it returns the last error encountered
 func DoWithRetry(operation func() error, config RetryConfig) error {
+	if operation == nil {
+		return errors.New("operation cannot be nil")
+	}
+
 	var lastErr error
 
 	for attempt := 1; attempt <= config.MaxAttempts; attempt++ {
