@@ -657,3 +657,106 @@ func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) error 
 	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 	return nil
 }
+
+// DoAttemptUnlock takes ETag as input and returns potential error
+func (s *S3) DoAttemptUnlock(bucket, object string, etag string) error {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return err
+	}
+	// delete fails means other client has acquired lock or ETag changed
+	logger.Debug(module, "DoAttemptUnlock: unlock with ETag:%s", etag)
+	_, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(object),
+	})
+	return err
+}
+
+// AttemptUnLock attempts to release a remote lock file
+func (s *S3) AttemptUnLock(bucket, object string) error {
+	cacheFileName := common.GenTempFileName(bucket, "/", object)
+	etagBytes, e := os.ReadFile(cacheFileName)
+	if e != nil {
+		logger.Debug(module, "failed to read lock cache: %+v", cacheFileName)
+		return nil
+	}
+	etag := string(etagBytes)
+	if e := s.DoAttemptUnlock(bucket, object, etag); e != nil {
+		logger.Debug(module, "unlock error: %+v", e)
+		return e
+	}
+	return nil
+}
+
+// DoAttemptLock returns ETag and potential error
+func (s *S3) DoAttemptLock(bucket, object string, ttl time.Duration) (string, error) {
+	var err error
+	if err = s.Init(bucket); err != nil {
+		return "", err
+	}
+
+	// First, check if lock object already exists
+	_, err = s.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(object),
+	})
+
+	if err == nil {
+		// Lock object exists, check if it's expired
+		attrs, err1 := s.S3Attrs(bucket, object)
+		if err1 != nil {
+			return "", err1
+		}
+
+		if attrs != nil && attrs.S3Attrs.LastModified != nil {
+			// Check if lock is expired based on TTL
+			if attrs.S3Attrs.LastModified.Add(ttl).Before(time.Now()) {
+				logger.Debug(module, "DoAttemptLock expired. delete and try lock again")
+				// Try to delete the expired lock
+				_, _ = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(object),
+				})
+			} else {
+				// Lock is still valid, return error
+				return "", fmt.Errorf("lock already exists and not expired")
+			}
+		}
+	}
+
+	// Try to create the lock object
+	putOutput, err := s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(object),
+		Body:   strings.NewReader("1"),
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	// Successfully acquired lock, return ETag
+	if putOutput.ETag != nil {
+		return *putOutput.ETag, nil
+	}
+	return "", fmt.Errorf("failed to get ETag from put operation")
+}
+
+// AttemptLock attempts to write a remote lock file
+func (s *S3) AttemptLock(bucket, object string, ttl time.Duration) error {
+	etag, e := s.DoAttemptLock(bucket, object, ttl)
+	if e != nil {
+		logger.Info(module, "attempt lock failed: %s", e)
+		return e
+	}
+
+	// Upon successful write, store ETag in /tmp
+	logger.Debug(module, "AttemptLock: storing ETag: %+v", etag)
+	cacheFileName := common.GenTempFileName(bucket, "/", object)
+	if e1 := os.WriteFile(cacheFileName, []byte(etag), os.ModePerm); e1 != nil {
+		logger.Info(module, "AttemptLock: cache lock ETag failed: %s", e1)
+		return e1
+	}
+	return nil
+}
