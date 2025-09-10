@@ -8,6 +8,7 @@ import (
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/s3"
 	"github.com/nextbillion-ai/gsg/system"
 
 	"github.com/spf13/cobra"
@@ -42,6 +43,14 @@ var lockCmd = &cobra.Command{
 
 		if fo.System.Scheme() == "gs" {
 			gcs := fo.System.(*gcs.GCS)
+			if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
+				common.Exit()
+			}
+			common.Finish()
+		}
+
+		if fo.System.Scheme() == "s3" {
+			gcs := fo.System.(*s3.S3)
 			if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
 				common.Exit()
 			}
