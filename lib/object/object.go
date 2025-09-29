@@ -208,6 +208,7 @@ func (o *Object) Write(from io.Reader) error {
 	}
 	switch o.scheme {
 	case "s3":
+		fmt.Println("s3", o.bucket, o.prefix)
 		return o._system.(*s3.S3).PutObject(o.bucket, o.prefix, from)
 	case "gs":
 		var w io.WriteCloser

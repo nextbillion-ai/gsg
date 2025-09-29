@@ -55,8 +55,12 @@ func (s *S3) toAttrs(attrs *S3Attributes) *system.Attrs {
 	if attrs.S3Attrs.Checksum != nil && attrs.S3Attrs.Checksum.ChecksumCRC32C != nil {
 		crc32c, _ = strconv.ParseUint(*attrs.S3Attrs.Checksum.ChecksumCRC32C, 10, 32)
 	}
+	var size int64 = 0
+	if attrs.S3Attrs.ObjectSize != nil {
+		size = *attrs.S3Attrs.ObjectSize
+	}
 	return &system.Attrs{
-		Size:    attrs.S3Attrs.ObjectSize,
+		Size:    size,
 		CRC32:   uint32(crc32c),
 		ModTime: getR2ModificationTime(attrs),
 	}
@@ -269,8 +273,12 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsag
 	if obj, err = s.S3Attrs(bucket, prefix); err != nil {
 		return nil, err
 	}
+	var size int64 = 0
+	if obj.S3Attrs.ObjectSize != nil {
+		size = *obj.S3Attrs.ObjectSize
+	}
 	if obj != nil {
-		return []system.DiskUsage{{Size: obj.S3Attrs.ObjectSize, Name: obj.Prefix}}, nil
+		return []system.DiskUsage{{Size: size, Name: obj.Prefix}}, nil
 	}
 	// is directory
 	root := system.NewDUTree(prefix, 0, true)
@@ -279,7 +287,11 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsag
 		return nil, err
 	}
 	for _, obj := range objs {
-		du := system.NewDUTree(obj.Prefix, obj.S3Attrs.ObjectSize, false)
+		var size int64 = 0
+		if obj.S3Attrs.ObjectSize != nil {
+			size = *obj.S3Attrs.ObjectSize
+		}
+		du := system.NewDUTree(obj.Prefix, size, false)
 		dirs := system.GetAllParents(du.Name, prefix)
 		runningRoot := root
 		for _, dir := range dirs[1:] {
@@ -360,13 +372,16 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 	var err error
 	if err = s.Init(bucket); err != nil {
+		fmt.Println("s3", bucket, prefix, from)
 		return err
 	}
+	fmt.Println("finish init")
 	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
 		Body:   from,
 	}); err != nil {
+		fmt.Println("s3", bucket, prefix, from, err)
 		return err
 	}
 	return nil
@@ -440,8 +455,12 @@ func (s *S3) Download(
 		logger.Debug(module, log)
 		return fmt.Errorf(log)
 	}
+	var size int64 = 0
+	if attrs.S3Attrs.ObjectSize != nil {
+		size = *attrs.S3Attrs.ObjectSize
+	}
 	chunkSize := int64(googleapi.DefaultUploadChunkSize)
-	chunkNumber := int(math.Ceil(float64(attrs.S3Attrs.ObjectSize) / float64(chunkSize)))
+	chunkNumber := int(math.Ceil(float64(size) / float64(chunkSize)))
 	if chunkNumber <= 0 {
 		chunkNumber = 1
 	}
@@ -456,7 +475,7 @@ func (s *S3) Download(
 		startByte := int64(i) * chunkSize
 		length := chunkSize
 		if i == chunkNumber-1 {
-			length = attrs.S3Attrs.ObjectSize - startByte
+			length = size - startByte
 		}
 
 		wg.Add(1)
@@ -466,12 +485,12 @@ func (s *S3) Download(
 
 				// create folder and temp file if not exist
 				once.Do(func() {
-					pb = ctx.Bars.New(attrs.S3Attrs.ObjectSize, fmt.Sprintf("Downloading [%s]:", prefix))
+					pb = ctx.Bars.New(size, fmt.Sprintf("Downloading [%s]:", prefix))
 					folder, _ := common.ParseFile(dstFile)
 					if !common.IsPathExist(folder) {
 						common.CreateFolder(folder)
 					}
-					common.CreateFile(dstFileTemp, attrs.S3Attrs.ObjectSize)
+					common.CreateFile(dstFileTemp, size)
 				})
 				gi := s3.GetObjectInput{
 					Bucket: aws.String(bucket),
