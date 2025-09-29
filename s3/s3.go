@@ -372,16 +372,13 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 	var err error
 	if err = s.Init(bucket); err != nil {
-		fmt.Println("s3", bucket, prefix, from)
 		return err
 	}
-	fmt.Println("finish init")
 	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
 		Body:   from,
 	}); err != nil {
-		fmt.Println("s3", bucket, prefix, from, err)
 		return err
 	}
 	return nil
