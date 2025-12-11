@@ -456,7 +456,10 @@ func (s *S3) Download(
 	if attrs.S3Attrs.ObjectSize != nil {
 		size = *attrs.S3Attrs.ObjectSize
 	}
-	chunkSize := int64(googleapi.DefaultUploadChunkSize)
+	chunkSize := ctx.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = int64(googleapi.DefaultUploadChunkSize)
+	}
 	chunkNumber := int(math.Ceil(float64(size) / float64(chunkSize)))
 	if chunkNumber <= 0 {
 		chunkNumber = 1

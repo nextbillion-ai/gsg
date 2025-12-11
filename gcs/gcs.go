@@ -328,7 +328,10 @@ func (g *GCS) Download(
 	}
 
 	// get chunck size and chunk number
-	chunkSize := int64(googleapi.DefaultUploadChunkSize)
+	chunkSize := ctx.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = int64(googleapi.DefaultUploadChunkSize)
+	}
 	chunkNumber := int(math.Ceil(float64(attrs.Size) / float64(chunkSize)))
 	if chunkNumber <= 0 {
 		chunkNumber = 1

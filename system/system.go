@@ -62,8 +62,9 @@ func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
 }
 
 type RunContext struct {
-	Bars *bar.Container
-	Pool *worker.Pool
+	Bars      *bar.Container
+	Pool      *worker.Pool
+	ChunkSize int64
 }
 
 type DiskUsage struct {
