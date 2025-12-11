@@ -26,6 +26,7 @@ var (
 	mockFail          bool
 	multiThread       int
 	chunkSize         int64
+	directIO          bool
 	bars              *bar.Container
 	pool              *worker.Pool
 )
@@ -45,6 +46,10 @@ func init() {
 	rootCmd.PersistentFlags().Int64Var(
 		&chunkSize, "chunk-size", -1,
 		"set download chunk size in bytes (default 16MB, 0 to disable chunking)",
+	)
+	rootCmd.PersistentFlags().BoolVar(
+		&directIO, "direct-io", false,
+		"use O_DIRECT to bypass page cache (reduces memory pressure)",
 	)
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
@@ -99,6 +104,9 @@ func initFlags() {
 		}
 		if v == "--mock-fail" {
 			mockFail = true
+		}
+		if v == "--direct-io" {
+			directIO = true
 		}
 	}
 }

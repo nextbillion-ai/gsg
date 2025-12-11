@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/bar"
@@ -515,24 +516,48 @@ func (s *S3) Download(
 				}
 
 				// create write with offset and length of file
-				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				var fl *os.File
+				if ctx.DirectIO {
+					// O_DIRECT bypasses page cache, reduces memory pressure
+					// Note: Only supported on Linux
+					fd, e := syscall.Open(dstFileTemp, syscall.O_WRONLY|0x4000 /* O_DIRECT */, 0766)
+					if e != nil {
+						logger.Debug(module, "O_DIRECT not supported or failed: %s, using buffered I/O", e)
+						fl, _ = os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+						ctx.DirectIO = false // fallback
+					} else {
+						fl = os.NewFile(uintptr(fd), dstFileTemp)
+					}
+				} else {
+					fl, _ = os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				}
 				_, se := fl.Seek(startByte, 0)
 				if se != nil {
 					logger.Info(module, "download object failed when seek for offset with %s", se)
 					common.Exit()
 				}
+				defer func() { _ = fl.Close() }()
 
-				// use buffered writer to reduce system calls
-				bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
-				defer func() {
-					_ = bufWriter.Flush()
-					_ = fl.Close()
-				}()
-
-				// write data with offset and length to file
-				if _, we := io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
-					logger.Info(module, "download object failed when write to offet with %s", we)
-					common.Exit()
+				if ctx.DirectIO {
+					// Direct I/O: no buffering, write directly to disk
+					logger.Debug(module, "Using Direct I/O for chunk at offset %d", startByte)
+					if _, we := io.Copy(io.MultiWriter(fl, pb), oo.Body); we != nil {
+						logger.Info(module, "download object failed when write with direct io: %s", we)
+						common.Exit()
+					}
+				} else {
+					// Buffered I/O: use memory buffer to reduce system calls
+					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
+					defer func() { _ = bufWriter.Flush() }()
+					
+					if _, we := io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
+						logger.Info(module, "download object failed when write to offet with %s", we)
+						common.Exit()
+					}
+					if err := bufWriter.Flush(); err != nil {
+						logger.Info(module, "download object failed when flush buffer with %s", err)
+						common.Exit()
+					}
 				}
 			},
 		)
