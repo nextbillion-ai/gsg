@@ -25,6 +25,7 @@ var (
 	enableMultiThread bool
 	mockFail          bool
 	multiThread       int
+	chunkSize         int64
 	bars              *bar.Container
 	pool              *worker.Pool
 )
@@ -40,6 +41,10 @@ func init() {
 	rootCmd.PersistentFlags().IntVarP(
 		&multiThread, "c", "c", 64,
 		"set concurrency of execution workers, limit from 1 to 1000",
+	)
+	rootCmd.PersistentFlags().Int64Var(
+		&chunkSize, "chunk-size", -1,
+		"set download chunk size in bytes (default 16MB, 0 to disable chunking)",
 	)
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,

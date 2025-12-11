@@ -456,11 +456,21 @@ func (s *S3) Download(
 	if attrs.S3Attrs.ObjectSize != nil {
 		size = *attrs.S3Attrs.ObjectSize
 	}
-	chunkSize := int64(googleapi.DefaultUploadChunkSize)
+	chunkSize := ctx.ChunkSize
+	if chunkSize < 0 {
+		chunkSize = int64(googleapi.DefaultUploadChunkSize)
+	} else if chunkSize == 0 {
+		// chunk size 0 means no chunking, download as single chunk
+		chunkSize = size
+		if chunkSize <= 0 {
+			chunkSize = 1
+		}
+	}
 	chunkNumber := int(math.Ceil(float64(size) / float64(chunkSize)))
 	if chunkNumber <= 0 {
 		chunkNumber = 1
 	}
+	logger.Debug(module, "Downloading [%s] with %d chunk(s), chunk size: %d bytes, total size: %d bytes", prefix, chunkNumber, chunkSize, size)
 
 	var pb *bar.ProgressBar
 	var wg sync.WaitGroup
