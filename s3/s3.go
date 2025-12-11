@@ -523,7 +523,7 @@ func (s *S3) Download(
 				}
 
 				// use buffered writer to reduce system calls
-				bufWriter := bufio.NewWriterSize(fl, 16*1024*1024)
+				bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 				defer func() {
 					_ = bufWriter.Flush()
 					_ = fl.Close()
