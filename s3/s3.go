@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -520,15 +521,17 @@ func (s *S3) Download(
 					logger.Info(module, "download object failed when seek for offset with %s", se)
 					common.Exit()
 				}
-				defer func() { _ = fl.Close() }()
+
+				// use buffered writer to reduce system calls
+				bufWriter := bufio.NewWriterSize(fl, 16*1024*1024) // 16MB buffer
+				defer func() {
+					_ = bufWriter.Flush() // flush before closing file
+					_ = fl.Close()
+				}()
 
 				// write data with offset and length to file
-				if _, we := io.Copy(io.MultiWriter(fl, pb), oo.Body); we != nil {
+				if _, we := io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
 					logger.Info(module, "download object failed when write to offet with %s", we)
-					common.Exit()
-				}
-				if err := fl.Sync(); err != nil {
-					logger.Info(module, "download object failed when syncing to disk %s", err)
 					common.Exit()
 				}
 			},
@@ -537,6 +540,13 @@ func (s *S3) Download(
 
 	// move back the temp file
 	wg.Wait()
+
+	// sync temp file to disk before rename
+	if tmpFile, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766); err == nil {
+		_ = tmpFile.Sync()
+		_ = tmpFile.Close()
+	}
+
 	err = os.Rename(dstFileTemp, dstFile)
 	if err != nil {
 		logger.Info(module, "download object failed when rename file with %s", err)

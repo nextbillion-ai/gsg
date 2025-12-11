@@ -1,6 +1,7 @@
 package gcs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -392,15 +393,17 @@ func (g *GCS) Download(
 					logger.Info(module, "download object failed when seek for offset with %s", err)
 					common.Exit()
 				}
-				defer func() { _ = fl.Close() }()
+
+				// use buffered writer to reduce system calls
+				bufWriter := bufio.NewWriterSize(fl, 16*1024*1024) // 16MB buffer
+				defer func() {
+					_ = bufWriter.Flush() // flush before closing file
+					_ = fl.Close()
+				}()
 
 				// write data with offset and length to file
-				if _, err = io.Copy(io.MultiWriter(fl, pb), rc); err != nil {
+				if _, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
 					logger.Info(module, "download object failed when write to offet with %s", err)
-					common.Exit()
-				}
-				if err = fl.Sync(); err != nil {
-					logger.Info(module, "download object failed when syncing to disk %s", err)
 					common.Exit()
 				}
 			},
@@ -409,6 +412,13 @@ func (g *GCS) Download(
 
 	// move back the temp file
 	wg.Wait()
+
+	// sync temp file to disk before rename
+	if tmpFile, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766); err == nil {
+		_ = tmpFile.Sync()
+		_ = tmpFile.Close()
+	}
+
 	err = os.Rename(dstFileTemp, dstFile)
 	if err != nil {
 		logger.Info(module, "download object failed when rename file with %s", err)
