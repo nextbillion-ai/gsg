@@ -132,8 +132,6 @@ func readOrComputeCRC32c(path string) uint32 {
 	crc32q := crc32.MakeTable(crc32.Castagnoli)
 	h32 := crc32.New(crc32q)
 
-	// Use 10MB buffer and drop cache after reading to avoid polluting page cache
-	// This prevents impacting other applications that depend on cache (e.g., OSRM)
 	const bufSize = 10 * 1024 * 1024 // 10MB
 	buf := make([]byte, bufSize)
 	totalRead := int64(0)
@@ -146,11 +144,9 @@ func readOrComputeCRC32c(path string) uint32 {
 				break
 			}
 
-			// Tell kernel to drop this chunk from cache immediately
 			fadviseDontNeed(file, totalRead, int64(n))
 			totalRead += int64(n)
 
-			// Small yield to other I/O operations
 			time.Sleep(time.Millisecond * 5) // 5ms pause every 10MB
 		}
 		if readErr == io.EOF {
