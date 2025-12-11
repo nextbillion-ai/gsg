@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package common
@@ -5,14 +6,36 @@ package common
 import (
 	"os"
 	"syscall"
+	"unsafe"
 )
+
+const (
+	// POSIX fadvise constants
+	_POSIX_FADV_SEQUENTIAL = 2
+	_POSIX_FADV_DONTNEED   = 4
+)
+
+// fadvise is a wrapper for posix_fadvise system call
+func fadvise(fd int, offset int64, length int64, advice int) error {
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_FADVISE64,
+		uintptr(fd),
+		uintptr(offset),
+		uintptr(length),
+		uintptr(advice),
+		0, 0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
 
 // fadviseSequential hints the kernel for sequential access
 func fadviseSequential(file *os.File) {
 	fd := int(file.Fd())
 	if fd >= 0 {
-		// POSIX_FADV_SEQUENTIAL: optimize for sequential read
-		_ = syscall.Fadvise(fd, 0, 0, syscall.FADV_SEQUENTIAL)
+		_ = fadvise(fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
 	}
 }
 
@@ -20,8 +43,8 @@ func fadviseSequential(file *os.File) {
 func fadviseDontNeed(file *os.File, offset, length int64) {
 	fd := int(file.Fd())
 	if fd >= 0 {
-		// POSIX_FADV_DONTNEED: don't keep in cache
-		_ = syscall.Fadvise(fd, offset, length, syscall.FADV_DONTNEED)
+		_ = fadvise(fd, offset, length, _POSIX_FADV_DONTNEED)
 	}
 }
 
+var _ = unsafe.Sizeof(0) // for unused import check
