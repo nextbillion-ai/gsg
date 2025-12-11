@@ -43,8 +43,8 @@ func init() {
 		"set concurrency of execution workers, limit from 1 to 1000",
 	)
 	rootCmd.PersistentFlags().Int64Var(
-		&chunkSize, "chunk-size", 8*1024*1024,
-		"set download chunk size in bytes (default 8MB, 0 to disable chunking)",
+		&chunkSize, "chunk-size", -1,
+		"set download chunk size in bytes (default 16MB, 0 to disable chunking)",
 	)
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
