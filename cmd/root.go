@@ -128,9 +128,14 @@ func Execute() error {
 	pool.Run()
 
 	logger.Debug(
-		module, "enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d",
-		enableMultiThread, mockFail, multiThread, selectedMultiThread, screenCols, screenLines,
+		module, "enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d, gentleIO=%t, chunkSize=%d",
+		enableMultiThread, mockFail, multiThread, selectedMultiThread, screenCols, screenLines, gentleIO, chunkSize,
 	)
+
+	// Warn if using gentle-io with non-aligned chunk size
+	if gentleIO && chunkSize > 0 && chunkSize%512 != 0 {
+		logger.Info(module, "Warning: --chunk-size %d is not aligned to 512 bytes, O_DIRECT may fail and fallback to buffered I/O", chunkSize)
+	}
 
 	if mockFail {
 		common.Exit()

@@ -389,14 +389,16 @@ func (g *GCS) Download(
 
 				// create write with offset and length of file
 				var fl *os.File
-				if ctx.GentleIO {
+				useDirectIO := ctx.GentleIO
+
+				if useDirectIO {
 					// O_DIRECT bypasses page cache, reduces memory pressure
 					// Note: Only supported on Linux
 					fd, e := syscall.Open(dstFileTemp, syscall.O_WRONLY|0x4000 /* O_DIRECT */, 0766)
 					if e != nil {
 						logger.Debug(module, "O_DIRECT not supported or failed: %s, using buffered I/O", e)
 						fl, _ = os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
-						ctx.GentleIO = false // fallback
+						useDirectIO = false // fallback to buffered I/O
 					} else {
 						fl = os.NewFile(uintptr(fd), dstFileTemp)
 					}
@@ -410,7 +412,7 @@ func (g *GCS) Download(
 				}
 				defer func() { _ = fl.Close() }()
 
-				if ctx.GentleIO {
+				if useDirectIO {
 					// Direct I/O: no buffering, write directly to disk
 					logger.Debug(module, "Using Direct I/O for chunk at offset %d", startByte)
 					if _, err = io.Copy(io.MultiWriter(fl, pb), rc); err != nil {
@@ -420,8 +422,7 @@ func (g *GCS) Download(
 				} else {
 					// Buffered I/O: use memory buffer to reduce system calls
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
-					defer func() { _ = bufWriter.Flush() }()
-					
+
 					if _, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
 						logger.Info(module, "download object failed when write to offet with %s", err)
 						common.Exit()
