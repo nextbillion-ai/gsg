@@ -26,7 +26,7 @@ var (
 	mockFail          bool
 	multiThread       int
 	chunkSize         int64
-	directIO          bool
+	gentleIO          bool
 	bars              *bar.Container
 	pool              *worker.Pool
 )
@@ -48,8 +48,8 @@ func init() {
 		"set download chunk size in bytes (default 16MB, 0 to disable chunking)",
 	)
 	rootCmd.PersistentFlags().BoolVar(
-		&directIO, "direct-io", false,
-		"use O_DIRECT to bypass page cache (reduces memory pressure)",
+		&gentleIO, "gentle-io", false,
+		"enable gentle I/O mode to reduce impact on other applications (uses O_DIRECT, fadvise, throttling)",
 	)
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
@@ -105,8 +105,9 @@ func initFlags() {
 		if v == "--mock-fail" {
 			mockFail = true
 		}
-		if v == "--direct-io" {
-			directIO = true
+		if v == "--gentle-io" {
+			gentleIO = true
+			common.GentleIO = true
 		}
 	}
 }

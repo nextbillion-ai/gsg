@@ -389,14 +389,14 @@ func (g *GCS) Download(
 
 				// create write with offset and length of file
 				var fl *os.File
-				if ctx.DirectIO {
+				if ctx.GentleIO {
 					// O_DIRECT bypasses page cache, reduces memory pressure
 					// Note: Only supported on Linux
 					fd, e := syscall.Open(dstFileTemp, syscall.O_WRONLY|0x4000 /* O_DIRECT */, 0766)
 					if e != nil {
 						logger.Debug(module, "O_DIRECT not supported or failed: %s, using buffered I/O", e)
 						fl, _ = os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
-						ctx.DirectIO = false // fallback
+						ctx.GentleIO = false // fallback
 					} else {
 						fl = os.NewFile(uintptr(fd), dstFileTemp)
 					}
@@ -410,7 +410,7 @@ func (g *GCS) Download(
 				}
 				defer func() { _ = fl.Close() }()
 
-				if ctx.DirectIO {
+				if ctx.GentleIO {
 					// Direct I/O: no buffering, write directly to disk
 					logger.Debug(module, "Using Direct I/O for chunk at offset %d", startByte)
 					if _, err = io.Copy(io.MultiWriter(fl, pb), rc); err != nil {
