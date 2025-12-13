@@ -522,34 +522,60 @@ func (s *S3) Download(
 					common.Exit()
 				}
 
-				// Use buffered writer to reduce system calls
-				bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
+				defer func() { _ = fl.Close() }()
 
-				// If gentle I/O mode, advise kernel not to keep written data in cache
-				// This reduces page cache pollution and protects other applications (e.g., OSRM)
+				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
-					logger.Debug(module, "Using gentle I/O mode with fadvise for chunk at offset %d", startByte)
+					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
 					common.FadviseWriteSequential(fl)
-					defer func() {
-						// After writing, tell kernel to drop this data from cache
-						common.FadviseWriteDontNeed(fl, startByte, length)
-					}()
-				}
 
-				defer func() {
-					_ = bufWriter.Flush()
-					_ = fl.Close()
-				}()
+					// Use throttled copy: write in small chunks with delays
+					buf := make([]byte, 1*1024*1024) // 1MB buffer
+					totalWritten := int64(0)
 
-				// write data with offset and length to file
-				if _, we := io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
-					logger.Info(module, "download object failed when write to offet with %s", we)
-					common.Exit()
-				}
+					for {
+						n, readErr := oo.Body.Read(buf)
+						if n > 0 {
+							if _, writeErr := fl.Write(buf[:n]); writeErr != nil {
+								logger.Info(module, "download object failed when write: %s", writeErr)
+								common.Exit()
+							}
+							if _, writeErr := pb.Write(buf[:n]); writeErr != nil {
+								// Progress bar write error, non-fatal
+							}
+							totalWritten += int64(n)
 
-				if err := bufWriter.Flush(); err != nil {
-					logger.Info(module, "download object failed when flush buffer with %s", err)
-					common.Exit()
+							// Every 10MB, pause and drop cache
+							if totalWritten%(10*1024*1024) == 0 {
+								common.FadviseWriteDontNeed(fl, startByte, totalWritten)
+								time.Sleep(time.Millisecond * 20) // 20ms pause every 10MB
+							}
+						}
+						if readErr == io.EOF {
+							break
+						}
+						if readErr != nil {
+							logger.Info(module, "download object failed when read: %s", readErr)
+							common.Exit()
+						}
+					}
+
+					// Final fadvise to drop remaining data
+					common.FadviseWriteDontNeed(fl, startByte, totalWritten)
+				} else {
+					// Fast mode: use buffered writer
+					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
+					defer func() { _ = bufWriter.Flush() }()
+
+					if _, we := io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
+						logger.Info(module, "download object failed when write to offet with %s", we)
+						common.Exit()
+					}
+
+					if err := bufWriter.Flush(); err != nil {
+						logger.Info(module, "download object failed when flush buffer with %s", err)
+						common.Exit()
+					}
 				}
 			},
 		)
