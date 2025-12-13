@@ -47,4 +47,20 @@ func fadviseDontNeed(file *os.File, offset, length int64) {
 	}
 }
 
+// FadviseWriteSequential hints kernel for sequential write pattern
+func FadviseWriteSequential(file *os.File) {
+	fd := int(file.Fd())
+	if fd >= 0 {
+		_ = fadvise(fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
+	}
+}
+
+// FadviseWriteDontNeed tells kernel to write back and drop cache for written data
+func FadviseWriteDontNeed(file *os.File, offset, length int64) {
+	fd := int(file.Fd())
+	if fd >= 0 {
+		_ = fadvise(fd, offset, length, _POSIX_FADV_DONTNEED)
+	}
+}
+
 var _ = unsafe.Sizeof(0) // for unused import check
