@@ -70,10 +70,10 @@ var upgradeCmd = &cobra.Command{
 			return
 		}
 
-		// upgrade local version
-		if err = g.Download(upgradeBucket, srcPath, srcPath, true, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize}); err != nil {
-			common.Exit()
-		}
+	// upgrade local version
+	if err = g.Download(upgradeBucket, srcPath, srcPath, true, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+		common.Exit()
+	}
 		common.Chmod(dstPath, 0766)
 	},
 }

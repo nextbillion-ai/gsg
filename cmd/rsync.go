@@ -55,7 +55,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
 		if e := common.DoWithRetrySimple(func() error {
-			return fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars, ChunkSize: chunkSize})
+			return fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
 		}); e != nil {
 			common.Exit()
 		}

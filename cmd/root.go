@@ -26,6 +26,7 @@ var (
 	mockFail          bool
 	multiThread       int
 	chunkSize         int64
+	gentleIO          bool
 	bars              *bar.Container
 	pool              *worker.Pool
 )
@@ -45,6 +46,10 @@ func init() {
 	rootCmd.PersistentFlags().Int64Var(
 		&chunkSize, "chunk-size", -1,
 		"set download chunk size in bytes (default 16MB, 0 to disable chunking)",
+	)
+	rootCmd.PersistentFlags().BoolVar(
+		&gentleIO, "gentle-io", false,
+		"enable gentle I/O mode to reduce impact on other applications (uses O_DIRECT, fadvise, throttling)",
 	)
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
@@ -100,6 +105,10 @@ func initFlags() {
 		if v == "--mock-fail" {
 			mockFail = true
 		}
+		if v == "--gentle-io" {
+			gentleIO = true
+			common.GentleIO = true
+		}
 	}
 }
 
@@ -119,9 +128,14 @@ func Execute() error {
 	pool.Run()
 
 	logger.Debug(
-		module, "enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d",
-		enableMultiThread, mockFail, multiThread, selectedMultiThread, screenCols, screenLines,
+		module, "enableMultiThread=%t, mockFail=%t, multiThread=%d, getMultiThread=%d, screenCols=%d, screenLines=%d, gentleIO=%t, chunkSize=%d",
+		enableMultiThread, mockFail, multiThread, selectedMultiThread, screenCols, screenLines, gentleIO, chunkSize,
 	)
+
+	// Warn if using gentle-io with non-aligned chunk size
+	if gentleIO && chunkSize > 0 && chunkSize%512 != 0 {
+		logger.Info(module, "Warning: --chunk-size %d is not aligned to 512 bytes, O_DIRECT may fail and fallback to buffered I/O", chunkSize)
+	}
 
 	if mockFail {
 		common.Exit()

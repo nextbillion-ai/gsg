@@ -65,6 +65,7 @@ type RunContext struct {
 	Bars      *bar.Container
 	Pool      *worker.Pool
 	ChunkSize int64
+	GentleIO  bool
 }
 
 type DiskUsage struct {

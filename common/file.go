@@ -19,6 +19,12 @@ const (
 	tempFileSuffix = "_.gstmp"
 )
 
+var (
+	// GentleIO controls whether to use gentle I/O for CRC calculation
+	// When true, uses fadviseDontNeed and throttling to reduce cache pollution
+	GentleIO = false
+)
+
 // GetFileModificationTime gets mtime of a file
 func GetFileModificationTime(path string) time.Time {
 	file, err := os.Stat(path)
@@ -117,19 +123,59 @@ func readOrComputeCRC32c(path string) uint32 {
 		logger.Debug(module, "loaded crc32c [%s] from catch: %d", cacheFileName, result)
 		return result
 	}
+
+	logger.Debug(module, "Computing CRC32C for [%s], size: %d bytes, gentle mode: %t", path, GetFileSize(path), GentleIO)
 	file, err := os.Open(path)
 	if err != nil {
 		logger.Debug(module, "failed with %s", err)
 		return 0
 	}
 	defer func() { _ = file.Close() }()
+
 	crc32q := crc32.MakeTable(crc32.Castagnoli)
 	h32 := crc32.New(crc32q)
-	_, err = io.Copy(h32, file)
-	if err != nil {
-		logger.Debug(module, "failed with %s", err)
+
+	if GentleIO {
+		// Gentle mode: use fadvise and throttling to reduce impact on other processes
+		fadviseSequential(file)
+
+		const bufSize = 10 * 1024 * 1024 // 10MB
+		buf := make([]byte, bufSize)
+		totalRead := int64(0)
+
+		for {
+			n, readErr := file.Read(buf)
+			if n > 0 {
+				if _, writeErr := h32.Write(buf[:n]); writeErr != nil {
+					logger.Debug(module, "failed to write to hash: %s", writeErr)
+					break
+				}
+
+				// Tell kernel to drop this chunk from cache
+				fadviseDontNeed(file, totalRead, int64(n))
+				totalRead += int64(n)
+
+				// Yield to other I/O operations
+				time.Sleep(time.Millisecond * 5)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				logger.Debug(module, "failed with %s", readErr)
+				break
+			}
+		}
+	} else {
+		// Fast mode: standard io.Copy without throttling
+		_, err = io.Copy(h32, file)
+		if err != nil {
+			logger.Debug(module, "failed with %s", err)
+		}
 	}
+
 	result = h32.Sum32()
+	logger.Debug(module, "Computed CRC32C for [%s]: %d", path, result)
 	crcBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(crcBytes, result)
 
