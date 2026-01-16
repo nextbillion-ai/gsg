@@ -104,6 +104,9 @@ func (p *ProgressBar) Write(bs []byte) (n int, err error) {
 
 // draw simple sentences, suitable for non-tty interface
 func (p *ProgressBar) drawSimple() {
+	if p == nil {
+		return
+	}
 	p.onceStart.Do(func() {
 		fmt.Printf("%s In progress\n", p.Prepend)
 	})
