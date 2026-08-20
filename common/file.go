@@ -17,6 +17,8 @@ import (
 
 const (
 	tempFileSuffix = "_.gstmp"
+	// crc32cCacheSize is the exact byte length of a crc32c cache file.
+	crc32cCacheSize = 4
 )
 
 var (
@@ -117,11 +119,9 @@ func readOrComputeCRC32c(path string) uint32 {
 	result := uint32(0)
 	cacheFileName := GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
 
-	b, e := os.ReadFile(cacheFileName)
-	if e == nil {
-		result = binary.LittleEndian.Uint32(b)
-		logger.Debug(module, "loaded crc32c [%s] from catch: %d", cacheFileName, result)
-		return result
+	if cached, ok := readCRC32cCache(cacheFileName); ok {
+		logger.Debug(module, "loaded crc32c [%s] from catch: %d", cacheFileName, cached)
+		return cached
 	}
 
 	logger.Debug(module, "Computing CRC32C for [%s], size: %d bytes, gentle mode: %t", path, GetFileSize(path), GentleIO)
@@ -135,6 +135,8 @@ func readOrComputeCRC32c(path string) uint32 {
 	crc32q := crc32.MakeTable(crc32.Castagnoli)
 	h32 := crc32.New(crc32q)
 
+	// A sum over a partially read file is wrong; it must never be cached.
+	complete := true
 	if GentleIO {
 		// Gentle mode: use fadvise and throttling to reduce impact on other processes
 		fadviseSequential(file)
@@ -148,6 +150,7 @@ func readOrComputeCRC32c(path string) uint32 {
 			if n > 0 {
 				if _, writeErr := h32.Write(buf[:n]); writeErr != nil {
 					logger.Debug(module, "failed to write to hash: %s", writeErr)
+					complete = false
 					break
 				}
 
@@ -163,6 +166,7 @@ func readOrComputeCRC32c(path string) uint32 {
 			}
 			if readErr != nil {
 				logger.Debug(module, "failed with %s", readErr)
+				complete = false
 				break
 			}
 		}
@@ -171,31 +175,103 @@ func readOrComputeCRC32c(path string) uint32 {
 		_, err = io.Copy(h32, file)
 		if err != nil {
 			logger.Debug(module, "failed with %s", err)
+			complete = false
 		}
 	}
 
 	result = h32.Sum32()
 	logger.Debug(module, "Computed CRC32C for [%s]: %d", path, result)
-	crcBytes := make([]byte, 4)
+	if !complete {
+		// Return the sum anyway -- callers treat a CRC mismatch as a failed
+		// transfer, which is the safe direction -- but caching it would make a
+		// transient read error permanent for this path and mtime.
+		logger.Debug(module, "not caching crc32c for [%s]: file was not read in full", path)
+		return result
+	}
+	writeCRC32cCache(cacheFileName, result)
+	return result
+}
+
+// readCRC32cCache returns the cached crc32c for cacheFileName, reporting false
+// when there is no usable cache. Anything that is not exactly crc32cCacheSize
+// bytes of regular file was left behind by a run that died mid-write, so it is
+// removed rather than decoded -- reading it as a uint32 used to panic with
+// "index out of range [3] with length 0". The size is checked before any bytes
+// are read, so a stray huge file under the cache name cannot be slurped into
+// memory.
+func readCRC32cCache(cacheFileName string) (uint32, bool) {
+	cf, err := os.Open(cacheFileName)
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = cf.Close() }()
+
+	fi, err := cf.Stat()
+	if err != nil {
+		logger.Debug(module, "stat crc32c cachefile [%s] failed with %s", cacheFileName, err)
+		return 0, false
+	}
+	if fi.Mode().IsRegular() && fi.Size() == crc32cCacheSize {
+		b := make([]byte, crc32cCacheSize)
+		if _, err = io.ReadFull(cf, b); err == nil {
+			return binary.LittleEndian.Uint32(b), true
+		}
+		logger.Debug(module, "read crc32c cachefile [%s] failed with %s", cacheFileName, err)
+	}
+
+	logger.Debug(module, "discarding unusable crc32c cachefile [%s] of %d byte(s)", cacheFileName, fi.Size())
+	if err = os.Remove(cacheFileName); err != nil {
+		logger.Debug(module, "failed to remove unusable crc32c cachefile with %s", err)
+	}
+	return 0, false
+}
+
+// writeCRC32cCache persists a crc32c value to the cache file atomically.
+// The bytes go to a temp file that is renamed into place, so neither a
+// concurrent reader nor a later run can observe a half-written cache file --
+// opening the cache path directly published a zero-length file before the
+// value landed, and anything that killed the process in between (a failing
+// object calling common.Exit, a signal) left that empty file behind for every
+// subsequent run to trip over.
+func writeCRC32cCache(cacheFileName string, result uint32) {
+	crcBytes := make([]byte, crc32cCacheSize)
 	binary.LittleEndian.PutUint32(crcBytes, result)
 
-	cf, errOpen := os.OpenFile(cacheFileName, os.O_WRONLY|os.O_CREATE, 0766)
-	if errOpen != nil {
-		logger.Debug(module, "open crc32c cachefile failed with %s", errOpen)
+	cf, err := os.CreateTemp(filepath.Dir(cacheFileName), filepath.Base(cacheFileName)+".tmp")
+	if err != nil {
+		logger.Debug(module, "open crc32c cachefile failed with %s", err)
+		return
 	}
+	tempName := cf.Name()
 	defer func() {
 		_ = cf.Close()
+		// A no-op once the rename below succeeded.
+		_ = os.Remove(tempName)
 	}()
+
+	// CreateTemp uses 0600. Keep the cache readable by other users sharing /tmp,
+	// as it has always been, but not writable by them -- the old 0766 was
+	// filtered by umask to 0744, so setting 0766 outright would widen it.
+	if err = cf.Chmod(0644); err != nil {
+		logger.Debug(module, "chmod crc32c cachefile failed with %s", err)
+	}
 	if _, err = cf.Write(crcBytes); err != nil {
 		logger.Debug(module, "write crc32c cachefile failed with %s", err)
+		return
 	}
 	if err = cf.Sync(); err != nil {
 		logger.Debug(module, "write crc32c cachefile sync failed with %s", err)
+		return
 	}
-	if err == nil {
-		logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
+	if err = cf.Close(); err != nil {
+		logger.Debug(module, "close crc32c cachefile failed with %s", err)
+		return
 	}
-	return result
+	if err = os.Rename(tempName, cacheFileName); err != nil {
+		logger.Debug(module, "rename crc32c cachefile failed with %s", err)
+		return
+	}
+	logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
 }
 
 // GetFileCRC32C gets the crc32c of a file
