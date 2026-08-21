@@ -202,6 +202,11 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]st
 	return subPaths, nil
 }
 
+// maxAttrsInFlight caps concurrent GetObjectAttributes calls while listing.
+// It matches the default of the -c flag; batchAttrs has no access to the
+// worker pool, so it cannot follow that flag directly.
+const maxAttrsInFlight = 64
+
 func (s *S3) batchAttrs(bucket, prefix string, recursive bool) ([]*S3Attributes, error) {
 	var err error
 	var subPaths []string
@@ -210,25 +215,23 @@ func (s *S3) batchAttrs(bucket, prefix string, recursive bool) ([]*S3Attributes,
 	}
 	res := make([]*S3Attributes, len(subPaths))
 	errs := make([]error, len(subPaths))
-	var wg sync.WaitGroup
-	for index, subPath := range subPaths {
+	// One goroutine per object also meant one in-flight GetObjectAttributes
+	// call per object, so a prefix holding a million keys started a million of
+	// each at once. Bound both.
+	common.ParallelDo(len(subPaths), maxAttrsInFlight, func(index int) {
+		subPath := subPaths[index]
 		if strings.HasSuffix(subPath, "/") {
 			res[index] = &S3Attributes{
 				S3Attrs: &s3.GetObjectAttributesOutput{},
 				Bucket:  bucket,
 				Prefix:  subPath,
 			}
-			continue
+			return
 		}
-		wg.Add(1)
-		go func(index int, subPath string) {
-			defer wg.Done()
-			s3a, e := s.S3Attrs(bucket, subPath)
-			res[index] = s3a
-			errs[index] = e
-		}(index, subPath)
-	}
-	wg.Wait()
+		s3a, e := s.S3Attrs(bucket, subPath)
+		res[index] = s3a
+		errs[index] = e
+	})
 	for _, e := range errs {
 		if e != nil {
 			return nil, e
