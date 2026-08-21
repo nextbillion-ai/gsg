@@ -1,5 +1,5 @@
 set -e
-testid=`date +%s`
+testid="$(date +%s)-$$"
 remote_base_template="://gsg-uat/$testid"
 start() {
     echo ">>>>>>>> $1"
@@ -30,9 +30,9 @@ assertValue() {
     then
         case $mode in
         gs)
-            if gsutil ls $remote_base/$1 &>/dev/null
+            if gsutil ls "$remote_base/$1" &>/dev/null
             then
-                content="$(gsutil cat $remote_base/$1 2>/dev/null)"
+                content="$(gsutil cat "$remote_base/$1" 2>/dev/null)"
                 if [[ "$content" == "$2" ]]
                 then
                     echo OK: $1 exists with correct content remotely.
@@ -46,7 +46,7 @@ assertValue() {
             fi
             ;;
         s3)
-            if aws s3 cp $remote_base/$1 .temp &>/dev/null 
+            if aws s3 cp "$remote_base/$1" .temp &>/dev/null
             then
                 content="$(cat .temp)"
                 if [[ "$content" == "$2" ]]
@@ -66,9 +66,9 @@ assertValue() {
             ;;
         esac
     else
-        if ls $1 &>/dev/null 
+        if ls "$1" &>/dev/null
         then
-            content=$(cat $1)
+            content=$(cat "$1")
             if [[ "$content" == "$2" ]]
             then
                 echo OK: $1 exists with correct content locally.
@@ -88,9 +88,9 @@ assert() {
     then
         case $mode in
         gs)
-            if gsutil ls $remote_base/$1 &>/dev/null
+            if gsutil ls "$remote_base/$1" &>/dev/null
             then
-                content="$(gsutil cat $remote_base/$1 2>/dev/null)"
+                content="$(gsutil cat "$remote_base/$1" 2>/dev/null)"
                 if [[ "$content" == "$testid" ]]
                 then
                     echo OK: $1 exists with correct content remotely.
@@ -104,7 +104,7 @@ assert() {
             fi
             ;;
         s3)
-            if aws s3 cp $remote_base/$1 .temp &>/dev/null 
+            if aws s3 cp "$remote_base/$1" .temp &>/dev/null
             then
                 content="$(cat .temp)"
                 if [[ "$content" == "$testid" ]]
@@ -124,9 +124,9 @@ assert() {
             ;;
         esac
     else
-        if ls $1 &>/dev/null 
+        if ls "$1" &>/dev/null
         then
-            content=$(cat $1)
+            content=$(cat "$1")
             if [[ "$content" == "$testid" ]]
             then
                 echo OK: $1 exists with correct content locally.
@@ -146,7 +146,7 @@ assert_not() {
     then
         case $mode in
         gs)
-            if gsutil ls $remote_base/$1 &>/dev/null
+            if gsutil ls "$remote_base/$1" &>/dev/null
             then
                 echo FATAL: required file $1 does exists remotely.
                 exit 1
@@ -155,7 +155,7 @@ assert_not() {
             fi
             ;;
         s3)
-            if aws s3 cp $remote_base/$1 .temp &>/dev/null 
+            if aws s3 cp "$remote_base/$1" .temp &>/dev/null
             then
                 echo FATAL: required file $1 does exists remotely.
                 exit 1
@@ -168,7 +168,7 @@ assert_not() {
             ;;
         esac
     else
-        if ls $1 &>/dev/null 
+        if ls "$1" &>/dev/null
         then
             echo FATAL: required file $1 does exists locally.
             exit 1
@@ -207,12 +207,95 @@ prepare_file() {
     then
         value=$2
     fi
-    echo "$value" > $1
+    echo "$value" > "$1"
+}
+
+# assertEq compares a value against an expectation and reports which check failed.
+assertEq() {
+    local what="$1" got="$2" want="$3"
+    if [[ "$got" == "$want" ]]
+    then
+        echo "OK: $what"
+    else
+        echo "FATAL: $what"
+        echo "      want: [$want]"
+        echo "      got:  [$got]"
+        exit 1
+    fi
+}
+
+# assertOk runs a command and requires it to succeed. Several of the bugs these
+# cases cover were panics, so a non-zero exit is the failure being checked for.
+assertOk() {
+    local what="$1"; shift
+    if "$@" >/dev/null 2>&1
+    then
+        echo "OK: $what"
+    else
+        echo "FATAL: $what -- command exited $? : $*"
+        exit 1
+    fi
+}
+
+# assertNoCrash runs a command that is allowed to fail, and requires only that
+# it did not crash. Some cases below cover panics where a clean error is a
+# perfectly good outcome, and plain "cmd || true" would hide the panic exactly
+# as well as it hides the error.
+assertNoCrash() {
+    local what="$1"; shift
+    local out
+    out="$("$@" 2>&1)" || true
+    if echo "$out" | grep -qE "panic:|index out of range|slice bounds out of range|\[RECOVERED\]"
+    then
+        echo "FATAL: $what -- crashed"
+        echo "$out" | grep -E "panic:|index out of range|slice bounds out of range|\[RECOVERED\]" | head -3 | sed 's/^/      /'
+        exit 1
+    fi
+    echo "OK: $what"
+}
+
+# snapshotTmp / poisonNewTmp reproduce the state a killed run leaves behind.
+# gsg caches crc32c values and lock generations in /tmp under md5 names and
+# used to decode them without checking their length. The exact names depend on
+# a file's mtime formatted by Go, which the shell cannot reproduce, so the new
+# ones are found by diffing /tmp -- but only files that are both named like an
+# md5 and exactly the size of the cache being targeted are touched. That keeps
+# an unrelated process's temp file safe, and stops a stray file from standing
+# in for the cache we meant to corrupt and giving a false pass.
+snapshotTmp() {
+    ls /tmp > .tmp_before 2>/dev/null || true
+}
+
+# poisonNewTmp <expected-size-in-bytes>
+poisonNewTmp() {
+    local want="$1" n=0 f
+    ls /tmp > .tmp_after 2>/dev/null || true
+    for f in $(comm -13 .tmp_before .tmp_after 2>/dev/null | grep -E '^[0-9a-f]{32}$')
+    do
+        if [[ -f "/tmp/$f" && "$(wc -c < "/tmp/$f" | tr -d ' ')" == "$want" ]]
+        then
+            : > "/tmp/$f"
+            n=$((n+1))
+        fi
+    done
+    echo "$n"
 }
 
 do_test() {
     mode=$1
     remote_base="$1$remote_base_template"
+
+        # A failing assertion exits immediately, which skips the cleanup below and
+    # is usually what you want -- the remote state is what you need to look at.
+    # Say where it is, since the prefix is timestamped.
+    trap 'code=$?; if [[ $code -ne 0 ]]; then
+        echo
+        echo "test data left behind for inspection at: $remote_base"
+        case $mode in
+        gs) echo "remove it with: gsutil -m rm -r $remote_base" ;;
+        s3) echo "remove it with: aws s3 rm $remote_base --recursive" ;;
+        esac
+    fi' EXIT
 
     start "prepare test ground for mode: $mode"
     rm -rf uat_temp || true
@@ -321,29 +404,233 @@ do_test() {
     finish
 
 
+    # ---------------------------------------------------------------------
+    # Regression cases.
+    #
+    # Everything above exercises cp, mv and rsync. du, ls, cat, rm and the -v
+    # checksum path had no coverage at all, which is where a set of crashes
+    # went unnoticed. Each case below fails on the commit that introduced it.
+    # ---------------------------------------------------------------------
+
+    start "regression: du over a prefix with files directly under it"
+    # DiskUsage walked the parent chain with dirs[1:], and GetAllParents
+    # returns an empty slice for an object sitting directly under the prefix,
+    # so this panicked with "slice bounds out of range [1:0]". Only trees whose
+    # every object was nested survived, which made it look intermittent.
+    fdu="folder_to_du"
+    mkdir -p $fdu/sub/deep
+    printf '0123456789'   > $fdu/direct.txt       # 10 bytes, directly under the prefix
+    printf '01234'        > $fdu/sub/mid.txt      # 5
+    printf '0123456789ab' > $fdu/sub/deep/low.txt # 12
+    ../gsg cp -r $fdu $remote_base/$fdu
+    assertOk "du -s exits cleanly" ../gsg du -s $remote_base/$fdu
+    assertOk "du exits cleanly"    ../gsg du    $remote_base/$fdu
+    assertEq "du -s totals every object" \
+        "$(../gsg du -s $remote_base/$fdu 2>/dev/null | awk '{print $1}')" "27"
+    # dirs[1:] also dropped the shallowest directory between prefix and object,
+    # so a whole level went missing from the listing even when it did not panic.
+    assertEq "du reports the sub/ level"      "$(../gsg du $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/$")" "1"
+    assertEq "du reports the sub/deep/ level" "$(../gsg du $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/deep/$")" "1"
+    assertEq "du subtotal for sub/" \
+        "$(../gsg du $remote_base/$fdu 2>/dev/null | grep "/$fdu/sub/$" | awk '{print $1}')" "17"
+    finish
+
+    start "regression: du -s on a single object and on a bucket prefix"
+    assertOk "du -s of one object" ../gsg du -s $remote_base/$fdu/direct.txt
+    assertEq "du -s of one object reports its size" \
+        "$(../gsg du -s $remote_base/$fdu/direct.txt 2>/dev/null | awk '{print $1}')" "10"
+    finish
+
+    start "regression: ls -r returns exactly the objects that exist"
+    assertEq "ls -r lists all three" \
+        "$(../gsg ls -r $remote_base/$fdu 2>/dev/null | sed "s#.*/$fdu/##" | sort | tr '\n' ' ')" \
+        "direct.txt sub/deep/low.txt sub/mid.txt "
+    assertEq "ls -l reports the byte size" \
+        "$(../gsg ls -l $remote_base/$fdu/direct.txt 2>/dev/null | awk '{print $1}')" "10"
+    finish
+
+    start "regression: cat returns exact content"
+    assertEq "cat direct.txt" "$(../gsg cat $remote_base/$fdu/direct.txt 2>/dev/null)" "0123456789"
+    finish
+
+    start "regression: a truncated crc32c cache must not crash the next run"
+    # The cache write was not atomic: the file was created, then the four bytes
+    # were written. A run killed in between left an empty file in /tmp for good,
+    # and every later run decoded it as a uint32 and panicked with
+    # "index out of range [3] with length 0".
+    #
+    # gs only. S3.Download never verifies the downloaded file: it takes
+    # forceChecksum but uses it solely to set ChecksumMode on the GetObject
+    # request, and S3.MustEqualCRC32C is defined and never called from
+    # anywhere. So -v computes no checksum on the s3 path and writes no cache
+    # for this case to corrupt. Enable this for s3 once that is fixed.
+    if [[ "$mode" != "gs" ]]
+    then
+        echo "SKIP: s3 downloads do not verify checksums, so -v writes no crc32c cache"
+        finish
+    else
+    fcrc="folder_crc"
+    mkdir -p $fcrc
+    prepare_file $fcrc/one.txt crc_one
+    prepare_file $fcrc/two.txt crc_two
+    ../gsg cp -r $fcrc $remote_base/$fcrc
+    rm -rf ${fcrc}_down && mkdir -p ${fcrc}_down
+    snapshotTmp
+    ../gsg cp -r -v $remote_base/$fcrc ${fcrc}_down
+    poisoned=$(poisonNewTmp 4)   # a crc32c cache is exactly 4 bytes
+    if [[ "$poisoned" == "0" ]]
+    then
+        echo "FATAL: expected the -v download to leave crc32c cache files in /tmp, found none"
+        exit 1
+    fi
+    echo "OK: emptied $poisoned crc32c cache file(s) to mimic a run killed mid-write"
+    assertOk "cp -v survives a truncated crc32c cache" \
+        ../gsg cp -r -v $remote_base/$fcrc ${fcrc}_down
+    assertValue ${fcrc}_down/one.txt crc_one
+    snapshotTmp
+    ../gsg rsync -r -v $remote_base/$fcrc ${fcrc}_down
+    poisonNewTmp 4 >/dev/null
+    assertOk "rsync -v survives a truncated crc32c cache" \
+        ../gsg rsync -r -v $remote_base/$fcrc ${fcrc}_down
+    finish
+    fi
+
+    start "regression: a truncated lock cache must not crash unlock"
+    # Same shape as the crc32c cache: the generation was decoded from /tmp with
+    # no length check, so a short file panicked with "index out of range".
+    #
+    # gs only. The s3 backend caches the lock's ETag as a variable length
+    # string and never decodes a fixed width value from it, so it has no such
+    # panic and nothing of a known size for poisonNewTmp to target.
+    if [[ "$mode" != "gs" ]]
+    then
+        echo "SKIP: s3 caches an etag string, so it has no fixed width decode to corrupt"
+        finish
+    else
+    snapshotTmp
+    ../gsg lock $remote_base/lockfile 3600
+    poisoned=$(poisonNewTmp 8)   # a gs lock generation is 8 bytes
+    if [[ "$poisoned" == "0" ]]
+    then
+        echo "FATAL: expected lock to leave an 8 byte generation cache in /tmp, found none"
+        exit 1
+    fi
+    echo "OK: emptied $poisoned lock cache file(s)"
+    # Unlock cannot succeed without the generation, so a clean failure is a
+    # fine outcome here -- but it must not panic. "|| true" would hide the
+    # panic just as well as the error, so the output is inspected instead.
+    assertNoCrash "unlock does not crash on a truncated lock cache" \
+        ../gsg unlock $remote_base/lockfile
+    assertOk "gsg still runs afterwards" ../gsg ls -r $remote_base/$fdu
+    ../gsg rm $remote_base/lockfile >/dev/null 2>&1 || true
+    finish
+    fi
+
+    start "lock and unlock round trip"
+    # After the case above the cache file holds a valid generation again, so a
+    # normal round trip must still work. Runs second because that case needs
+    # the lock cache to be newly created in order to find and corrupt it, and
+    # gs leaves the file behind after a successful unlock.
+    assertOk "lock succeeds"   ../gsg lock $remote_base/lockfile 3600
+    assertOk "unlock succeeds" ../gsg unlock $remote_base/lockfile
+    assert_not lockfile remote
+    finish
+
+    start "regression: filenames with spaces and non-ascii characters"
+    fodd="folder_odd"
+    mkdir -p $fodd
+    prepare_file "$fodd/with spaces.txt" spaced
+    prepare_file "$fodd/café-日.txt" accented
+    ../gsg cp -r $fodd $remote_base/$fodd
+    # Checked with gsutil/aws rather than gsg ls, so a path bug shared by both
+    # sides of gsg cannot make this pass.
+    assertValue "$fodd/with spaces.txt" spaced remote
+    assertValue "$fodd/café-日.txt" accented remote
+    rm -rf ${fodd}_down && mkdir -p ${fodd}_down
+    ../gsg cp -r $remote_base/$fodd ${fodd}_down
+    assertOk "odd names round-trip identically" diff -r $fodd ${fodd}_down
+    finish
+
+    start "regression: rm removes exactly what it is asked to"
+    before=$(../gsg ls -r $remote_base/$fdu 2>/dev/null | wc -l | tr -d ' ')
+    ../gsg rm $remote_base/$fdu/direct.txt
+    assertEq "rm removed one object" \
+        "$(../gsg ls -r $remote_base/$fdu 2>/dev/null | wc -l | tr -d ' ')" "$((before-1))"
+    assert_not $fdu/direct.txt remote
+    assertValue $fdu/sub/mid.txt 01234 remote
+    assertValue $fdu/sub/deep/low.txt 0123456789ab remote
+    finish
+
     start "leaving $testbase"
     popd
     finish
 
     start "cleanup test ground"
+    # The /tmp snapshots live inside uat_temp, so this covers them.
     rm -rf uat_temp || true
+    # Only this run's own prefix. This used to delete every object in the
+    # bucket, which is fine on a scratch bucket and destructive anywhere else.
+    cleaned=true
     case $mode in
     gs)
-        gsutil ls  gs://gsg-uat | xargs -I {} gsutil -m rm -r {} || true
+        gsutil -m rm -r "$remote_base" || cleaned=false
         ;;
     s3)
-        aws s3 rm s3://gsg-uat --recursive || true
+        aws s3 rm "$remote_base" --recursive || cleaned=false
         ;;
     esac
-    
+    # Non-fatal, but never silent: reporting success while leaving objects in
+    # the bucket is how a scratch bucket quietly fills up.
+    if [[ "$cleaned" != "true" ]]
+    then
+        echo "WARNING: could not remove $remote_base -- objects are still there"
+    fi
+
     finish
 
+    trap - EXIT
     finish "everything OK with $mode !"
 }
+
+usage() {
+    echo "usage: $0 [gs|s3|all]    (default: all)"
+    echo
+    echo "  gs   requires gsutil and GOOGLE_APPLICATION_CREDENTIALS"
+    echo "  s3   requires the aws cli and its credentials"
+    echo
+    echo "Objects are written under <scheme>://gsg-uat/<timestamp> and that"
+    echo "prefix is removed at the end."
+    exit 1
+}
+
+requireTool() {
+    if ! command -v "$1" >/dev/null 2>&1
+    then
+        echo "FATAL: $1 is required for mode $2 but is not installed"
+        exit 1
+    fi
+}
+
+target="${1:-all}"
+case "$target" in
+gs|s3|all) ;;
+*) usage ;;
+esac
 
 start "building gsg binary"
 go build
 finish
 
-do_test gs
-do_test s3
+# Verification deliberately goes through gsutil and the aws cli rather than
+# through gsg, so that gsg cannot be the thing that validates its own output.
+if [[ "$target" == "gs" || "$target" == "all" ]]
+then
+    requireTool gsutil gs
+    do_test gs
+fi
+
+if [[ "$target" == "s3" || "$target" == "all" ]]
+then
+    requireTool aws s3
+    do_test s3
+fi
