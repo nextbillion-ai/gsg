@@ -29,6 +29,10 @@ import (
 
 const (
 	module = "S3"
+	// lockCachePerm keeps the cache private. os.ModePerm made it world
+	// readable and writable, and cross-user unlock cannot work anyway: the
+	// ETag is specific to whoever acquired the lock.
+	lockCachePerm = 0600
 )
 
 type S3 struct {
@@ -833,7 +837,7 @@ func (s *S3) AttemptLock(bucket, object string, ttl time.Duration) error {
 	// Upon successful write, store ETag in /tmp
 	logger.Debug(module, "AttemptLock: storing ETag: %+v", etag)
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
-	if e1 := os.WriteFile(cacheFileName, []byte(etag), os.ModePerm); e1 != nil {
+	if e1 := common.WriteFileAtomic(cacheFileName, []byte(etag), lockCachePerm); e1 != nil {
 		logger.Info(module, "AttemptLock: cache lock ETag failed: %s", e1)
 		return e1
 	}

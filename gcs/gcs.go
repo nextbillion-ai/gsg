@@ -27,6 +27,12 @@ import (
 const (
 	googleApplicationCredentialsEnv = "GOOGLE_APPLICATION_CREDENTIALS"
 	module                          = "GCS"
+	// lockCacheSize is the byte length of a cached lock generation.
+	lockCacheSize = 8
+	// lockCachePerm keeps the cache private. os.ModePerm made it world
+	// readable and writable, and cross-user unlock cannot work anyway: the
+	// generation is specific to whoever acquired the lock.
+	lockCachePerm = 0600
 )
 
 // ConfigPath gets gcp config path from env
@@ -494,6 +500,18 @@ func (g *GCS) AttemptUnLock(bucket, object string) error {
 		logger.Debug(module, "failed to read lock cache: %+v", cacheFileName)
 		return nil
 	}
+	if len(generationBytes) < lockCacheSize {
+		// Left short by a run that died mid-write; decoding it panicked with
+		// "index out of range". It names no generation, so the remote lock
+		// cannot be released and will stand until its TTL expires. Say so
+		// rather than reporting a successful unlock.
+		//
+		// The file is left in place: another process may have just renamed a
+		// valid cache over this path, and removing it would discard that. The
+		// next successful lock replaces it atomically anyway.
+		logger.Info(module, "invalid lock cache [%s] of %d byte(s)", cacheFileName, len(generationBytes))
+		return fmt.Errorf("invalid lock cache [%s]: cannot release the lock on gs://%s/%s", cacheFileName, bucket, object)
+	}
 	generation := binary.LittleEndian.Uint64(generationBytes)
 	if e := g.DoAttemptUnlock(bucket, object, int64(generation)); e != nil {
 		logger.Debug(module, "unlock error: %+v", e)
@@ -553,9 +571,9 @@ func (g *GCS) AttemptLock(bucket, object string, ttl time.Duration) error {
 	//upon sucessful write, store generation in /tmp
 	logger.Debug(module, "AttemptLock: storing generation: %+v", generation)
 	cacheFileName := common.GenTempFileName(bucket, "/", object)
-	generationBytes := make([]byte, 8)
+	generationBytes := make([]byte, lockCacheSize)
 	binary.LittleEndian.PutUint64(generationBytes, uint64(generation))
-	if e1 := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); e1 != nil {
+	if e1 := common.WriteFileAtomic(cacheFileName, generationBytes, lockCachePerm); e1 != nil {
 		logger.Info(module, "AttemptLock: cache lock generation failed: %s", e1)
 		return e1
 	}

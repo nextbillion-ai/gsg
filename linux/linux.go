@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"os/exec"
@@ -20,6 +21,10 @@ import (
 
 const (
 	module = "LINUX"
+	// lockCachePerm keeps the cache private. os.ModePerm made it world
+	// readable and writable, and cross-user unlock cannot work anyway: the
+	// generation is specific to whoever acquired the lock.
+	lockCachePerm = 0600
 )
 
 var (
@@ -305,7 +310,7 @@ func (l *Linux) AttemptLock(bucket, object string, ttl time.Duration) error {
 	generationBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(generationBytes, uint64(generation))
 
-	if err := os.WriteFile(cacheFileName, generationBytes, os.ModePerm); err != nil {
+	if err := common.WriteFileAtomic(cacheFileName, generationBytes, lockCachePerm); err != nil {
 		logger.Info(module, "AttemptLock: cache lock generation failed: %s", err)
 		return err
 	}
@@ -421,9 +426,12 @@ func (l *Linux) AttemptUnLock(bucket, object string) error {
 	}
 
 	if len(generationBytes) < 8 {
-		// If for some reason your cache file is corrupted, you might handle it here
-		logger.Debug(module, "AttemptUnLock: lock cache file is invalid (less than 8 bytes)")
-		return nil
+		// Left short by a run that died mid-write. It names no generation, so
+		// the lock cannot be released; report that rather than a success. The
+		// file stays put -- another process may have just renamed a valid
+		// cache over this path, and the next lock replaces it atomically.
+		logger.Info(module, "AttemptUnLock: invalid lock cache [%s] of %d byte(s)", cacheFileName, len(generationBytes))
+		return fmt.Errorf("invalid lock cache [%s]: cannot release the lock on %s", cacheFileName, object)
 	}
 
 	generation := int64(binary.LittleEndian.Uint64(generationBytes))
