@@ -195,10 +195,17 @@ func readOrComputeCRC32c(path string) uint32 {
 // readCRC32cCache returns the cached crc32c for cacheFileName, reporting false
 // when there is no usable cache. Anything that is not exactly crc32cCacheSize
 // bytes of regular file was left behind by a run that died mid-write, so it is
-// removed rather than decoded -- reading it as a uint32 used to panic with
+// ignored rather than decoded -- reading it as a uint32 used to panic with
 // "index out of range [3] with length 0". The size is checked before any bytes
 // are read, so a stray huge file under the cache name cannot be slurped into
 // memory.
+//
+// An unusable file is left where it is. Deleting from the read path would race:
+// another process may have renamed a good cache in between the read above and
+// the delete, and we would throw that away. A bad regular file is replaced by
+// the next complete computation anyway, since writeCRC32cCache renames over
+// this path. A path that rename cannot replace -- a directory, say -- does
+// survive, at the cost of recomputing this file's crc32c every time.
 func readCRC32cCache(cacheFileName string) (uint32, bool) {
 	cf, err := os.Open(cacheFileName)
 	if err != nil {
@@ -219,10 +226,7 @@ func readCRC32cCache(cacheFileName string) (uint32, bool) {
 		logger.Debug(module, "read crc32c cachefile [%s] failed with %s", cacheFileName, err)
 	}
 
-	logger.Debug(module, "discarding unusable crc32c cachefile [%s] of %d byte(s)", cacheFileName, fi.Size())
-	if err = os.Remove(cacheFileName); err != nil {
-		logger.Debug(module, "failed to remove unusable crc32c cachefile with %s", err)
-	}
+	logger.Debug(module, "ignoring unusable crc32c cachefile [%s] of %d byte(s)", cacheFileName, fi.Size())
 	return 0, false
 }
 
