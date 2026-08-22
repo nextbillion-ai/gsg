@@ -18,7 +18,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 1 | PR #41 | yes -- cp exits 0 having stored nothing | fix |
 | 2 | PR #45 | yes -- 1000 of 1005 subdirectories listed | fix |
 | 3 | PR #46 | yes -- a 301 is reported as "not an object" | fix, with 14 |
-| 4 | open | yes -- `cp -v` from s3 logs 0 checksum checks | fix, or drop the flag for s3 |
+| 4 | PR #47 | yes -- `cp -v` from s3 logs 0 checksum checks | fix |
 | 5 | PR #44 | yes -- unlock deleted another holder's lock | fix |
 | 6 | open | yes, but needs a newline in a filename | low |
 | 7 | open | no -- one goroutine per process | low, testing annoyance only |
@@ -32,6 +32,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
 | 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
 | 17 | open | yes -- keys with # or non-ascii silently fail to copy | fix, small |
+| 18 | open | yes -- two checksum-less objects compare equal | fix with 4's other half |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -599,3 +600,29 @@ Found while reviewing the region fix; independent of it.
 the separators alone -- `url.PathEscape` on the key would also escape its
 slashes, so it cannot be applied to the whole thing at once. Worth checking the
 same call's `Key` and the equivalent in `PutObject` while there.
+
+## 18. Attrs cannot say "there is no checksum"
+
+`system.Attrs.CRC32` is a bare `uint32`, so an object that carries no checksum
+is indistinguishable from one whose checksum happens to be zero. `Attrs.Same`
+compares the number unconditionally:
+
+```go
+r = r && a.CRC32 == b.CRC32
+```
+
+Two S3 objects that both lack a checksum therefore compare equal and are treated
+as identical on size and mtime alone, even under `-v`. Before #47 every S3
+object read back as 0, so this was universal; after it, it applies to objects
+written by something that stored no CRC32C, or a multipart object whose
+checksum is of-parts.
+
+The reverse costs work rather than correctness: an S3 object with no checksum
+against a local file always compares unequal, so it is copied again on every
+run.
+
+**Fix:** carry presence alongside the value -- a `*uint32`, or a bool beside it
+-- and have `Same` skip the comparison when either side has nothing to offer,
+rather than comparing zeroes. This is the same shape as the other half of item
+4, where `GetFileCRC32C` has no way to say it could not compute one, so the two
+are worth doing together.
