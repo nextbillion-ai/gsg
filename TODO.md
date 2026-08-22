@@ -16,8 +16,8 @@ several are not worth fixing. The evidence is recorded under each one.
 | # | Status | Reproduced? | Verdict |
 |---|--------|-------------|---------|
 | 1 | PR #41 | yes -- cp exits 0 having stored nothing | fix |
-| 2 | open | yes -- 1000 of 1005 subdirectories listed | **fix**, silent data loss |
-| 3 | open | yes -- a 301 is reported as "not an object" | **fix**, compounds 14 |
+| 2 | PR #45 | yes -- 1000 of 1005 subdirectories listed | fix |
+| 3 | PR #46 | yes -- a 301 is reported as "not an object" | fix, with 14 |
 | 4 | open | yes -- `cp -v` from s3 logs 0 checksum checks | fix, or drop the flag for s3 |
 | 5 | PR #44 | yes -- unlock deleted another holder's lock | fix |
 | 6 | open | yes, but needs a newline in a filename | low |
@@ -28,9 +28,10 @@ several are not worth fixing. The evidence is recorded under each one.
 | 11 | open | yes, but needs a marker carrying bytes | low |
 | 12 | PR #42 | yes -- 8 data races under -m | fix |
 | 13 | PR #43 | n/a -- duplication, one copy with a flaw | fix |
-| 14 | open | yes -- 301 MovedPermanently across regions | **fix**, 7 regions on this account |
+| 14 | PR #46 | yes -- 301 MovedPermanently across regions | fix, with 3 |
 | 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
 | 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
+| 17 | open | yes -- keys with # or non-ascii silently fail to copy | fix, small |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -567,3 +568,34 @@ low rather than as a defect anyone is likely to hit.
 changes every receipt path, so receipts written by an older gsg become
 unreadable and their locks wait out the TTL -- the same rollout consideration as
 item 15's legacy-receipt handling.
+
+## 17. A cross-bucket copy silently drops keys with awkward characters
+
+`S3.Copy` builds the source reference by concatenation:
+
+```go
+CopySource: aws.String(fmt.Sprintf("%v/%v", srcBucket, srcPrefix)),
+```
+
+AWS requires that value URL-encoded. Unencoded, a key carrying a character
+that means something in a URL is misread, and the copy does not happen.
+
+**Reproduced** against real S3, copying each key from one prefix to another:
+
+```
+"plain.txt"        landed: yes
+"with space.txt"   landed: yes
+"hash#tag.txt"     landed: NO
+"café.txt"         landed: NO
+```
+
+No error surfaces at the gsg level, so the object simply is not there
+afterwards. `Copy` is what `cp` and `rsync` use between two cloud paths, so a
+tree containing such a name syncs incompletely.
+
+Found while reviewing the region fix; independent of it.
+
+**Fix:** encode the source reference, escaping each path segment and leaving
+the separators alone -- `url.PathEscape` on the key would also escape its
+slashes, so it cannot be applied to the whole thing at once. Worth checking the
+same call's `Key` and the equivalent in `PutObject` while there.
