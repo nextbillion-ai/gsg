@@ -866,8 +866,9 @@ usage() {
     echo
     echo "GSG_UAT_RACE=1 builds gsg with the race detector and aborts on any"
     echo "data race. The bulk operations below run with -m, so this genuinely"
-    echo "exercises the worker pool. Expect it to fail today: gcs.Init and"
-    echo "s3.Init race on their lazy client, which is TODO.md item 12."
+    echo "exercises the worker pool. It passes as of the fix for TODO.md item"
+    echo "12, and roughly doubles the runtime, so it is worth turning on when"
+    echo "touching anything concurrent."
     exit 1
 }
 
@@ -887,9 +888,8 @@ esac
 
 start "building gsg binary"
 # GSG_UAT_RACE=1 builds with the race detector and makes any data race abort
-# the run. Off by default because it is 2-10x slower, and because gsg currently
-# has known races that would stop the suite before it tests anything -- see the
-# note in usage().
+# the run. Off by default only because it roughly doubles the runtime; it does
+# pass. See the note in usage().
 buildFlags=""
 if [[ "${GSG_UAT_RACE:-}" == "1" ]]
 then

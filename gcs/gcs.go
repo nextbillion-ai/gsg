@@ -41,6 +41,11 @@ func ConfigPath() string {
 }
 
 type GCS struct {
+	// mu guards the lazy client. One GCS is registered for the whole process
+	// and every worker goroutine calls Init, so the check-then-set this
+	// replaces raced: two goroutines could both find a nil client and both
+	// build one, leaving one leaked.
+	mu     sync.Mutex
 	client *storage.Client
 }
 
@@ -79,6 +84,8 @@ func (g *GCS) toFileObject(attrs *storage.ObjectAttrs, bucket string) *system.Fi
 
 // storageClient gets or creates a gcp storage client
 func (g *GCS) Init(_ ...string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.client != nil {
 		return nil
 	}
