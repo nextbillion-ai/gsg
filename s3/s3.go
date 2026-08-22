@@ -763,16 +763,44 @@ func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) error 
 }
 
 // DoAttemptUnlock takes ETag as input and returns potential error
+// validLockETag reports whether etag is shaped like the quoted entity-tag S3
+// returns from PutObject, which is what AttemptLock stores verbatim. Anything
+// else -- empty, "*", a bare hash, something carrying CR or LF -- is refused
+// rather than normalised, because the only thing this value is used for is
+// proving the lock belongs to the caller.
+func validLockETag(etag string) bool {
+	if len(etag) < 3 || etag[0] != '"' || etag[len(etag)-1] != '"' {
+		return false
+	}
+	return !strings.ContainsAny(etag, "*\r\n")
+}
+
 func (s *S3) DoAttemptUnlock(bucket, object string, etag string) error {
 	var err error
 	if err = s.Init(bucket); err != nil {
 		return err
 	}
+	// A receipt that is not a well formed entity-tag proves nothing, so there is
+	// no safe delete to make. Empty is the common case -- a receipt missing, or
+	// truncated by a run that died mid-write, which the other backends already
+	// treat as an error. "*" is the dangerous one: If-Match: * matches any
+	// object, so a receipt corrupted to that would delete whoever holds the
+	// lock, which is the very thing this condition exists to prevent.
+	if !validLockETag(etag) {
+		logger.Info(module, "DoAttemptUnlock: unusable ETag %q for s3://%s/%s", etag, bucket, object)
+		return fmt.Errorf("cannot release the lock on s3://%s/%s: %q is not an ETag that proves it is ours", bucket, object, etag)
+	}
 	// delete fails means other client has acquired lock or ETag changed
 	logger.Debug(module, "DoAttemptUnlock: unlock with ETag:%s", etag)
+	// If-Match is what makes that comment true. Without it the delete removed
+	// whichever lock happened to be present -- including one another process
+	// had just acquired, seconds after this caller's own lock expired. The gcs
+	// backend has always conditioned its delete on the generation it stored;
+	// this is the same guarantee.
 	_, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(object),
+		Bucket:  aws.String(bucket),
+		Key:     aws.String(object),
+		IfMatch: aws.String(etag),
 	})
 	return err
 }

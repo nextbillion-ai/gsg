@@ -661,6 +661,41 @@ do_test() {
     finish
     fi
 
+    start "regression: unlock must not release a lock someone else now holds"
+    # A takes the lock and caches its receipt. A's lock then goes away and B
+    # takes a new one at the same path -- a different generation on gs, a
+    # different ETag on s3. A's unlock has to refuse: its receipt names the old
+    # object, not B's.
+    #
+    # gs conditioned its delete on the stored generation from the start. s3
+    # took an etag argument, logged it, and deleted unconditionally, so A's
+    # unlock removed B's lock and reported success. Both backends are checked
+    # here so the two cannot drift again.
+    aunl="unlock_other.lock"
+    ../gsg lock $remote_base/$aunl 3600            # A locks, receipt cached locally
+    case $mode in
+    gs)
+        gsutil rm "$remote_base/$aunl" >/dev/null 2>&1
+        echo "B" | gsutil cp - "$remote_base/$aunl" >/dev/null 2>&1
+        ;;
+    s3)
+        aws s3api delete-object --bucket gsg-uat --key "$testid/$aunl" >/dev/null 2>&1
+        printf 'B' | aws s3 cp - "$remote_base/$aunl" >/dev/null 2>&1
+        ;;
+    esac
+    if ../gsg unlock $remote_base/$aunl >/dev/null 2>&1
+    then
+        echo "FATAL: unlock reported success on a lock held by someone else"
+        exit 1
+    fi
+    echo "OK: unlock refuses a lock it does not hold"
+    assertValue $aunl B remote
+    case $mode in
+    gs) gsutil rm "$remote_base/$aunl" >/dev/null 2>&1 ;;
+    s3) aws s3api delete-object --bucket gsg-uat --key "$testid/$aunl" >/dev/null 2>&1 ;;
+    esac
+    finish
+
     start "lock and unlock round trip"
     # After the case above the cache file holds a valid generation again, so a
     # normal round trip must still work. Runs second because that case needs
