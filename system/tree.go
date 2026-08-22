@@ -68,6 +68,36 @@ func NewDUTree(name string, size int64, folder bool) *DUTree {
 	}
 }
 
+// Add inserts an object into the tree under base, creating the intermediate
+// directories between base and the object on the way down.
+//
+// An object that sits directly under base has no intermediate directories, so
+// GetAllParents returns an empty slice for it. Callers used to skip the first
+// entry with dirs[1:], which panicked on exactly that case -- and, for deeper
+// objects, silently dropped the topmost directory level from the tree.
+func (t *DUTree) Add(name string, size int64, base string) {
+	if len(name) == 0 {
+		return
+	}
+	node := t
+	for _, dir := range GetAllParents(name, base) {
+		child, exists := node.Children[dir]
+		if !exists {
+			child = NewDUTree(dir, 0, true)
+			node.Children[dir] = child
+		}
+		node = child
+	}
+	if name[len(name)-1] == '/' {
+		// A directory marker or common prefix. GetAllParents ends with the
+		// directory itself, so the walk above already landed on its node --
+		// adding a leaf here too would emit the same name twice.
+		node.Size += size
+		return
+	}
+	node.Children[name] = NewDUTree(name, size, false)
+}
+
 func GetAllParents(path, base string) []string {
 	res := []string{}
 	if base == "" || base[len(base)-1] != '/' {

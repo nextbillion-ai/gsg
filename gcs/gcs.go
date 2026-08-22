@@ -216,24 +216,11 @@ func (g *GCS) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsa
 		return nil, err
 	}
 	for _, obj := range objs {
-		var du *system.DUTree
-		if len(obj.Name) > 0 {
-			du = system.NewDUTree(obj.Name, obj.Size, false)
-		} else if len(obj.Prefix) > 0 {
-			du = system.NewDUTree(obj.Prefix, obj.Size, false)
+		name := obj.Name
+		if len(name) == 0 {
+			name = obj.Prefix
 		}
-		dirs := system.GetAllParents(du.Name, prefix)
-		runningRoot := root
-		for _, dir := range dirs[1:] {
-			var pu *system.DUTree
-			var exists bool
-			if pu, exists = runningRoot.Children[dir]; !exists {
-				pu = system.NewDUTree(dir, 0, true)
-				runningRoot.Children[dir] = pu
-			}
-			runningRoot = pu
-		}
-		runningRoot.Children[du.Name] = du
+		root.Add(name, obj.Size, prefix)
 	}
 
 	return root.ToDiskUsages(), nil
