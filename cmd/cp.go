@@ -83,7 +83,13 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 				wg.Add(1)
 				pool.Add(func() {
 					defer wg.Done()
-					if err = src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+					// A local error, as every sibling here already uses. This
+					// assigned the function-scoped err instead, so all the
+					// download goroutines shared one variable: the statement
+					// writes err and then reads it back for the comparison, and
+					// another goroutine overwriting it in between let a
+					// goroutine miss its own failure and report nothing.
+					if e := src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
 						common.Exit()
 					}
 				})
