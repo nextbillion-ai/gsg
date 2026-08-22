@@ -245,10 +245,14 @@ assertNoCrash() {
     local what="$1"; shift
     local out
     out="$("$@" 2>&1)" || true
-    if echo "$out" | grep -qE "panic:|index out of range|slice bounds out of range|\[RECOVERED\]"
+    # DATA RACE belongs here too: under GSG_UAT_RACE the detector prints that
+    # and exits non-zero, and the "|| true" above would otherwise let a race
+    # pass as a clean failure.
+    local bad="panic:|index out of range|slice bounds out of range|\[RECOVERED\]|WARNING: DATA RACE"
+    if echo "$out" | grep -qE "$bad"
     then
         echo "FATAL: $what -- crashed"
-        echo "$out" | grep -E "panic:|index out of range|slice bounds out of range|\[RECOVERED\]" | head -3 | sed 's/^/      /'
+        echo "$out" | grep -E "$bad" | head -3 | sed 's/^/      /'
         exit 1
     fi
     echo "OK: $what"
@@ -320,7 +324,7 @@ do_test() {
     prepare_file $ftu/a/1.txt 1_txt
     prepare_file $ftu/a/2.txt 2_txt
     prepare_file $ftu/a/b/c/3.txt 3_txt
-    ../gsg cp -r $ftu $remote_base/$ftu
+    ../gsg -m cp -r $ftu $remote_base/$ftu
     assertValue $ftu/a/1.txt 1_txt remote
     assertValue $ftu/a/2.txt 2_txt remote
     assertValue $ftu/a/b/c/3.txt 3_txt remote
@@ -344,7 +348,7 @@ do_test() {
     prepare_file $ftd/a/b/c/3.txt 3_txt
     $(remote_copy true) $ftd $remote_base/$ftd
     rm -rf $ftd
-    ../gsg cp -r $remote_base/$ftd $ftd
+    ../gsg -m cp -r $remote_base/$ftd $ftd
     assertValue $ftd/a/1.txt 1_txt
     assertValue $ftd/a/2.txt 2_txt
     assertValue $ftd/a/b/c/3.txt 3_txt
@@ -358,7 +362,7 @@ do_test() {
     prepare_file $ftm/a/b/c/3.txt
     $(remote_copy true) $ftm $remote_base/$ftm
     rm -rf $ftm
-    ../gsg mv -r $remote_base/$ftm $ftm
+    ../gsg -m mv -r $remote_base/$ftm $ftm
     assert $ftm/a/1.txt
     assert $ftm/a/2.txt
     assert $ftm/a/b/c/3.txt
@@ -376,12 +380,12 @@ do_test() {
     prepare_file $ftr/a/1.txt
     prepare_file $ftr/a/2.txt
     prepare_file $ftr/a/b/c/3.txt
-    ../gsg rsync -r $ftr $remote_base/$ftr
+    ../gsg -m rsync -r $ftr $remote_base/$ftr
     assert $ftr/a/1.txt remote
     assert $ftr/a/2.txt remote
     assert $ftr/a/b/c/3.txt remote
     echo "whocares" > $ftr/a/1.txt
-    ../gsg rsync -r $ftr $remote_base/$ftr
+    ../gsg -m rsync -r $ftr $remote_base/$ftr
     $(remote_copy) $remote_base/$ftr/a/1.txt $ftr/a/1_remote.txt
     same $ftr/a/1.txt $ftr/a/1_remote.txt
     finish
@@ -390,14 +394,14 @@ do_test() {
     prepare_file $ftr/a/1.txt
     $(remote_copy) $ftr/a/1.txt $remote_base/$ftr/a/1.txt
     rm -rf $ftr
-    ../gsg rsync -r $remote_base/$ftr $ftr
+    ../gsg -m rsync -r $remote_base/$ftr $ftr
     assert $ftr/a/1.txt
     assert $ftr/a/2.txt
     assert $ftr/a/b/c/3.txt
     finish
 
     start "test rsync with -d and non-existing src"
-    ../gsg rsync -d whocares $remote_base/$ftr
+    ../gsg -m rsync -d whocares $remote_base/$ftr
     assert_not $ftr/a/1.txt remote
     assert_not $ftr/a/2.txt remote
     assert_not $ftr/a/b/c/3.txt remote
@@ -423,7 +427,7 @@ do_test() {
     fnest="folder_nested_only"
     mkdir -p $fnest/x/y
     printf '01234567' > $fnest/x/y/only.txt   # 8 bytes, nothing at the top level
-    ../gsg cp -r $fnest $remote_base/$fnest
+    ../gsg -m cp -r $fnest $remote_base/$fnest
     assertOk "du exits cleanly with no direct child" ../gsg du $remote_base/$fnest
     assertEq "du reports the x/ level"   "$(../gsg du $remote_base/$fnest 2>/dev/null | grep -c "/$fnest/x/$")" "1"
     assertEq "du reports the x/y/ level" "$(../gsg du $remote_base/$fnest 2>/dev/null | grep -c "/$fnest/x/y/$")" "1"
@@ -441,7 +445,7 @@ do_test() {
     printf '0123456789'   > $fdu/direct.txt       # 10 bytes, directly under the prefix
     printf '01234'        > $fdu/sub/mid.txt      # 5
     printf '0123456789ab' > $fdu/sub/deep/low.txt # 12
-    ../gsg cp -r $fdu $remote_base/$fdu
+    ../gsg -m cp -r $fdu $remote_base/$fdu
     assertOk "du -s exits cleanly" ../gsg du -s $remote_base/$fdu
     assertOk "du exits cleanly"    ../gsg du    $remote_base/$fdu
     assertEq "du -s totals every object" \
@@ -557,10 +561,10 @@ do_test() {
     mkdir -p $fcrc
     prepare_file $fcrc/one.txt crc_one
     prepare_file $fcrc/two.txt crc_two
-    ../gsg cp -r $fcrc $remote_base/$fcrc
+    ../gsg -m cp -r $fcrc $remote_base/$fcrc
     rm -rf ${fcrc}_down && mkdir -p ${fcrc}_down
     snapshotTmp
-    ../gsg cp -r -v $remote_base/$fcrc ${fcrc}_down
+    ../gsg -m cp -r -v $remote_base/$fcrc ${fcrc}_down
     poisoned=$(poisonNewTmp 4)   # a crc32c cache is exactly 4 bytes
     if [[ "$poisoned" == "0" ]]
     then
@@ -569,13 +573,13 @@ do_test() {
     fi
     echo "OK: emptied $poisoned crc32c cache file(s) to mimic a run killed mid-write"
     assertOk "cp -v survives a truncated crc32c cache" \
-        ../gsg cp -r -v $remote_base/$fcrc ${fcrc}_down
+        ../gsg -m cp -r -v $remote_base/$fcrc ${fcrc}_down
     assertValue ${fcrc}_down/one.txt crc_one
     snapshotTmp
-    ../gsg rsync -r -v $remote_base/$fcrc ${fcrc}_down
+    ../gsg -m rsync -r -v $remote_base/$fcrc ${fcrc}_down
     poisonNewTmp 4 >/dev/null
     assertOk "rsync -v survives a truncated crc32c cache" \
-        ../gsg rsync -r -v $remote_base/$fcrc ${fcrc}_down
+        ../gsg -m rsync -r -v $remote_base/$fcrc ${fcrc}_down
     finish
     fi
 
@@ -625,13 +629,13 @@ do_test() {
     mkdir -p $fodd
     prepare_file "$fodd/with spaces.txt" spaced
     prepare_file "$fodd/café-日.txt" accented
-    ../gsg cp -r $fodd $remote_base/$fodd
+    ../gsg -m cp -r $fodd $remote_base/$fodd
     # Checked with gsutil/aws rather than gsg ls, so a path bug shared by both
     # sides of gsg cannot make this pass.
     assertValue "$fodd/with spaces.txt" spaced remote
     assertValue "$fodd/café-日.txt" accented remote
     rm -rf ${fodd}_down && mkdir -p ${fodd}_down
-    ../gsg cp -r $remote_base/$fodd ${fodd}_down
+    ../gsg -m cp -r $remote_base/$fodd ${fodd}_down
     assertOk "odd names round-trip identically" diff -r $fodd ${fodd}_down
     finish
 
@@ -643,6 +647,20 @@ do_test() {
     assert_not $fdu/direct.txt remote
     assertValue $fdu/sub/mid.txt 01234 remote
     assertValue $fdu/sub/deep/low.txt 0123456789ab remote
+    finish
+
+    start "rm -r removes a whole tree"
+    # cmd/rm.go schedules recursive deletes through the worker pool, and
+    # nothing here exercised that at all.
+    frm="folder_to_rm"
+    mkdir -p $frm/a/b
+    prepare_file $frm/a/1.txt
+    prepare_file $frm/a/b/2.txt
+    ../gsg -m cp -r $frm $remote_base/$frm
+    assert $frm/a/1.txt remote
+    ../gsg -m rm -r $remote_base/$frm
+    assert_not $frm/a/1.txt remote
+    assert_not $frm/a/b/2.txt remote
     finish
 
     start "leaving $testbase"
@@ -684,6 +702,12 @@ usage() {
     echo
     echo "Objects are written under <scheme>://gsg-uat/<timestamp> and that"
     echo "prefix is removed at the end."
+    echo
+    echo "GSG_UAT_RACE=1 builds gsg with the race detector and aborts on any"
+    echo "data race. The bulk operations below run with -m, so this genuinely"
+    echo "exercises the worker pool. Expect it to fail today: gcs.Init and"
+    echo "s3.Init race on their lazy client, and the progress bars race until"
+    echo "#36 lands. Both are recorded in TODO.md."
     exit 1
 }
 
@@ -702,7 +726,18 @@ gs|s3|all) ;;
 esac
 
 start "building gsg binary"
-go build
+# GSG_UAT_RACE=1 builds with the race detector and makes any data race abort
+# the run. Off by default because it is 2-10x slower, and because gsg currently
+# has known races that would stop the suite before it tests anything -- see the
+# note in usage().
+buildFlags=""
+if [[ "${GSG_UAT_RACE:-}" == "1" ]]
+then
+    buildFlags="-race"
+    export GORACE="halt_on_error=1"
+    echo "race detector ON: any data race aborts the run"
+fi
+go build $buildFlags
 finish
 
 # Verification deliberately goes through gsutil and the aws cli rather than
