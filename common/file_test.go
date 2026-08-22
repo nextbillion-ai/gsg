@@ -171,9 +171,9 @@ func TestCRC32cCacheIsNotWorldWritable(t *testing.T) {
 
 	fi, err := os.Stat(cachePath)
 	assert.NoError(t, err)
-	mode := fi.Mode().Perm()
-	assert.Equal(t, os.FileMode(0), mode&0022, "cache must not be group/world writable, got %o", mode)
-	assert.NotEqual(t, os.FileMode(0), mode&0044, "cache must stay readable by other users, got %o", mode)
+	// The exact mode, not just "not writable and readable somehow": readable by
+	// others sharing /tmp, writable by nobody else.
+	assert.Equal(t, os.FileMode(crc32cCachePerm), fi.Mode().Perm())
 }
 
 // Anything at the cache path that is not a 4-byte regular file is discarded

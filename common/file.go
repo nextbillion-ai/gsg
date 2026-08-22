@@ -19,6 +19,8 @@ const (
 	tempFileSuffix = "_.gstmp"
 	// crc32cCacheSize is the exact byte length of a crc32c cache file.
 	crc32cCacheSize = 4
+	// crc32cCachePerm keeps the cache readable by other users sharing /tmp.
+	crc32cCachePerm = 0644
 )
 
 var (
@@ -230,49 +232,18 @@ func readCRC32cCache(cacheFileName string) (uint32, bool) {
 	return 0, false
 }
 
-// writeCRC32cCache persists a crc32c value to the cache file atomically.
-// The bytes go to a temp file that is renamed into place, so neither a
-// concurrent reader nor a later run can observe a half-written cache file --
-// opening the cache path directly published a zero-length file before the
-// value landed, and anything that killed the process in between (a failing
-// object calling common.Exit, a signal) left that empty file behind for every
-// subsequent run to trip over.
+// writeCRC32cCache persists a crc32c value to the cache file atomically, so
+// that neither a concurrent reader nor a later run can observe it half written.
+//
+// 0644 rather than the 0600 the lock caches use: a checksum cached by one user
+// staying readable by another sharing /tmp saves real work, and there is
+// nothing sensitive in it.
 func writeCRC32cCache(cacheFileName string, result uint32) {
 	crcBytes := make([]byte, crc32cCacheSize)
 	binary.LittleEndian.PutUint32(crcBytes, result)
 
-	cf, err := os.CreateTemp(filepath.Dir(cacheFileName), filepath.Base(cacheFileName)+".tmp")
-	if err != nil {
-		logger.Debug(module, "open crc32c cachefile failed with %s", err)
-		return
-	}
-	tempName := cf.Name()
-	defer func() {
-		_ = cf.Close()
-		// A no-op once the rename below succeeded.
-		_ = os.Remove(tempName)
-	}()
-
-	// CreateTemp uses 0600. Keep the cache readable by other users sharing /tmp,
-	// as it has always been, but not writable by them -- the old 0766 was
-	// filtered by umask to 0744, so setting 0766 outright would widen it.
-	if err = cf.Chmod(0644); err != nil {
-		logger.Debug(module, "chmod crc32c cachefile failed with %s", err)
-	}
-	if _, err = cf.Write(crcBytes); err != nil {
-		logger.Debug(module, "write crc32c cachefile failed with %s", err)
-		return
-	}
-	if err = cf.Sync(); err != nil {
-		logger.Debug(module, "write crc32c cachefile sync failed with %s", err)
-		return
-	}
-	if err = cf.Close(); err != nil {
-		logger.Debug(module, "close crc32c cachefile failed with %s", err)
-		return
-	}
-	if err = os.Rename(tempName, cacheFileName); err != nil {
-		logger.Debug(module, "rename crc32c cachefile failed with %s", err)
+	if err := WriteFileAtomic(cacheFileName, crcBytes, crc32cCachePerm); err != nil {
+		logger.Debug(module, "write crc32c cachefile [%s] failed with %s", cacheFileName, err)
 		return
 	}
 	logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
