@@ -587,16 +587,28 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
 
 	// upload file
+	//
+	// The writer gets a cancellable context so a failed read can abort the
+	// upload. Closing it instead would finalize whatever had been written,
+	// publishing a truncated object under a name that now looks complete.
+	uploadCtx, abort := context.WithCancel(context.Background())
+	defer abort()
 	o := g.client.Bucket(bucket).Object(object)
-	wc := o.NewWriter(context.Background())
+	wc := o.NewWriter(uploadCtx)
 	wc.Metadata = map[string]string{
 		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
 	}
 	if _, err = io.Copy(io.MultiWriter(wc, pb), f); err != nil {
 		logger.Info(module, "upload object failed when copy file with %s", err)
+		abort()
 		return err
 	}
-	defer func() { _ = wc.Close() }()
+	// Close finalizes the upload and returns the server's commit errors, which
+	// io.Copy above cannot see: it only fills the writer's buffer.
+	if err = wc.Close(); err != nil {
+		logger.Info(module, "upload object failed when finalizing with %s", err)
+		return err
+	}
 	return nil
 }
 
