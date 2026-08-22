@@ -206,6 +206,11 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]st
 	return subPaths, nil
 }
 
+// maxAttrsInFlight caps concurrent GetObjectAttributes calls while listing.
+// It matches the default of the -c flag; batchAttrs has no access to the
+// worker pool, so it cannot follow that flag directly.
+const maxAttrsInFlight = 64
+
 func (s *S3) batchAttrs(bucket, prefix string, recursive bool) ([]*S3Attributes, error) {
 	var err error
 	var subPaths []string
@@ -214,7 +219,14 @@ func (s *S3) batchAttrs(bucket, prefix string, recursive bool) ([]*S3Attributes,
 	}
 	res := make([]*S3Attributes, len(subPaths))
 	errs := make([]error, len(subPaths))
-	var wg sync.WaitGroup
+
+	// A sub-path ending in "/" is a common prefix rather than an object, so it
+	// needs no request and is filled in right here, exactly as before. Only the
+	// entries that actually cost a round trip go through the fan-out below.
+	// Sized for the common case, where most sub-paths are objects rather than
+	// common prefixes: this is the million-key path, and growing by doubling
+	// would copy it repeatedly.
+	fetch := make([]int, 0, len(subPaths))
 	for index, subPath := range subPaths {
 		if strings.HasSuffix(subPath, "/") {
 			res[index] = &S3Attributes{
@@ -224,15 +236,18 @@ func (s *S3) batchAttrs(bucket, prefix string, recursive bool) ([]*S3Attributes,
 			}
 			continue
 		}
-		wg.Add(1)
-		go func(index int, subPath string) {
-			defer wg.Done()
-			s3a, e := s.S3Attrs(bucket, subPath)
-			res[index] = s3a
-			errs[index] = e
-		}(index, subPath)
+		fetch = append(fetch, index)
 	}
-	wg.Wait()
+
+	// One goroutine per object also meant one in-flight GetObjectAttributes
+	// call per object, so a prefix holding a million keys started a million of
+	// each at once. Bound both.
+	common.ParallelDo(len(fetch), maxAttrsInFlight, func(i int) {
+		index := fetch[i]
+		s3a, e := s.S3Attrs(bucket, subPaths[index])
+		res[index] = s3a
+		errs[index] = e
+	})
 	for _, e := range errs {
 		if e != nil {
 			return nil, e
