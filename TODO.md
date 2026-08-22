@@ -258,3 +258,40 @@ Unreachable today: `cmd/du.go` is the only caller and always passes
 **Fix:** either have `DiskUsage` reject `recursive=false`, or descend per prefix
 to get real subtotals, which defeats the point of the delimiter. Rejecting it is
 probably right.
+
+## 11. S3 ignores the size of an object whose key ends in "/"
+
+`batchAttrs` short-circuits every sub-path ending in `/`:
+
+```go
+if strings.HasSuffix(subPath, "/") {
+    res[index] = &S3Attributes{
+        S3Attrs: &s3.GetObjectAttributesOutput{},   // empty: no ObjectSize
+        Bucket:  bucket,
+        Prefix:  subPath,
+    }
+    continue
+}
+```
+
+so the size is never fetched and reads back as 0. That is right for a common
+prefix, which has no size and is not an object at all. It is wrong for a real
+object whose key happens to end in `/` -- the directory markers that console
+UIs and Hadoop write. Their bytes are silently missing from `du`.
+
+Measured: a 7 byte marker added to a prefix already holding 27 bytes leaves
+`du -s` reporting 27.
+
+The short-circuit exists because `listObjectsAndSubPaths` flattens two different
+things into one `[]string`: real keys from `Contents`, and synthetic entries from
+`CommonPrefixes`. Once flattened, a trailing `/` is the only thing left to tell
+them apart, and it cannot. Note that in a recursive listing there are no common
+prefixes at all, so every trailing-slash entry there is a real object and the
+short-circuit is always wrong.
+
+Rare in practice, since markers are almost always zero length. Pre-existing, and
+`uat.sh` pins the current behaviour so that changing it is deliberate.
+
+**Fix:** keep the two kinds apart instead of flattening them -- which is the same
+change item 9 needs, since it also wants `Size` and `LastModified` carried
+through from the listing rather than refetched.
