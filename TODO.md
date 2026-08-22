@@ -29,7 +29,8 @@ several are not worth fixing. The evidence is recorded under each one.
 | 12 | PR #42 | yes -- 8 data races under -m | fix |
 | 13 | PR #43 | n/a -- duplication, one copy with a flaw | fix |
 | 14 | open | yes -- 301 MovedPermanently across regions | **fix**, 7 regions on this account |
-| 15 | open | yes -- 8 of 8 processes acquire the same lock | **fix first**, S3 locking does not work |
+| 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
+| 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -541,3 +542,28 @@ gs: 1 of 8, 1 of 8, 1 of 8
 Not "two contenders can both come away holding it" -- essentially all of them
 do. S3 locking provides no mutual exclusion worth the name. Anything relying on
 it for exclusion has none. This is the first thing to fix.
+
+## 16. A lock receipt is shared between the two schemes
+
+`common.GenTempFileName(bucket, "/", object)` hashes the bucket and the object
+and nothing else, so a lock on `gs://b/x.lock` and one on `s3://b/x.lock` write
+to the same file in /tmp:
+
+```
+gs://gsg-uat/same.lock -> /tmp/d3abc4d6c4e06f8533531ed2a44ae948
+s3://gsg-uat/same.lock -> /tmp/d3abc4d6c4e06f8533531ed2a44ae948
+```
+
+Taking the second lock overwrites the first's receipt, and the first can then no
+longer be released -- it will be refused, since the receipt now holds the other
+backend's identifier, and the lock stands until its TTL.
+
+**Reproduced** while testing item 15, by racing locks on both schemes at the
+same bucket and key. It needs a bucket of the same name to exist on both
+providers and the same key used for a lock on each, which is why it is filed
+low rather than as a defect anyone is likely to hit.
+
+**Fix:** include the scheme in the name passed to `GenTempFileName`. Note that
+changes every receipt path, so receipts written by an older gsg become
+unreadable and their locks wait out the TTL -- the same rollout consideration as
+item 15's legacy-receipt handling.
