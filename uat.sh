@@ -833,8 +833,7 @@ usage() {
     echo "GSG_UAT_RACE=1 builds gsg with the race detector and aborts on any"
     echo "data race. The bulk operations below run with -m, so this genuinely"
     echo "exercises the worker pool. Expect it to fail today: gcs.Init and"
-    echo "s3.Init race on their lazy client, and the progress bars race until"
-    echo "#36 lands. Both are recorded in TODO.md."
+    echo "s3.Init race on their lazy client, which is TODO.md item 12."
     exit 1
 }
 
