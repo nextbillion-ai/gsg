@@ -19,17 +19,26 @@ type Container struct {
 	sync.Mutex
 }
 
-// ProgressBar holds attributes of a bar
+// ProgressBar holds attributes of a bar.
+//
+// A single bar is shared by every goroutine downloading a chunk of one object,
+// and is read concurrently by the container's printer. mu guards exactly the
+// three fields those two both touch: Progress, Speed and CurrentTime.
+// Container, Total, Prepend and StartTime are set before the bar is published
+// and never written again, so they are read without it.
 type ProgressBar struct {
-	Container   *Container
+	Container *Container
+	Total     int64
+	Prepend   string
+	StartTime time.Time
+
+	mu          sync.Mutex
 	Progress    int64
-	Total       int64
 	Speed       float64
-	StartTime   time.Time
 	CurrentTime time.Time
-	Prepend     string
-	onceStart   sync.Once
-	onceEnd     sync.Once
+
+	onceStart sync.Once
+	onceEnd   sync.Once
 }
 
 // New creates a BarContainer
@@ -50,7 +59,17 @@ func (b *Container) GetScreenDimensions() (cols int, lines int) {
 // printer check bars and draw
 func (b *Container) printer() {
 	for {
-		for _, bar := range b.bars {
+		// Copy under the lock New appends with. Ranging over b.bars directly
+		// read the slice header while append was replacing it, which could
+		// pair a stale pointer with the new length and walk off the old array.
+		b.Lock()
+		bars := make([]*ProgressBar, len(b.bars))
+		copy(bars, b.bars)
+		b.Unlock()
+
+		// Draw outside the lock: drawing writes to stdout, and New must not
+		// block behind it.
+		for _, bar := range bars {
 			bar.drawSimple()
 		}
 		time.Sleep(time.Millisecond * time.Duration(b.refreshInMs))
@@ -81,6 +100,9 @@ func (b *Container) New(total int64, prepend string) *ProgressBar {
 
 // IncrBy increate progress by an number
 func (p *ProgressBar) IncrBy(delta int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.CurrentTime = time.Now()
 	p.Progress += delta
 	if p.Progress > p.Total {
@@ -110,30 +132,41 @@ func (p *ProgressBar) drawSimple() {
 	p.onceStart.Do(func() {
 		fmt.Printf("%s In progress\n", p.Prepend)
 	})
-	if p.Progress >= p.Total {
+
+	p.mu.Lock()
+	progress := p.Progress
+	speed := p.Speed
+	elapsed := p.CurrentTime.Sub(p.StartTime)
+	p.mu.Unlock()
+
+	if progress >= p.Total {
 		p.onceEnd.Do(func() {
-			elapsed := fmt.Sprintf("%d", int64(p.CurrentTime.Sub(p.StartTime).Seconds())) + "s"
 			fmt.Printf(
 				"%s Done (%s, %s, %s)\n",
 				p.Prepend,
 				humanizeBytes(float64(p.Total)), // total
-				elapsed,                         // elapsed
-				humanizeBytes(p.Speed)+"/s",     // speed
+				fmt.Sprintf("%d", int64(elapsed.Seconds()))+"s", // elapsed
+				humanizeBytes(speed)+"/s",                       // speed
 			)
 		})
 	}
-	//return
 }
 
 func humanizeBytes(s float64) string {
 	sizes := []string{"B", "kB", "MB", "GB", "TB", "PB", "EB"}
 	base := 1024.0
-	if s < 10 {
+	// Negated so NaN takes this branch too; NaN compares false against
+	// everything, and math.Log(NaN) fed an undefined index to sizes.
+	if !(s >= 10) {
 		return fmt.Sprintf("%2.0f%s", s, sizes[0])
 	}
-	e := math.Floor(math.Log(float64(s)) / math.Log(base))
+	e := math.Floor(math.Log(s) / math.Log(base))
+	// A value at or past 1024^7, or +Inf, indexed past the end of sizes.
+	if last := float64(len(sizes) - 1); e > last {
+		e = last
+	}
 	suffix := sizes[int(e)]
-	val := math.Floor(float64(s)/math.Pow(base, e)*10+0.5) / 10
+	val := math.Floor(s/math.Pow(base, e)*10+0.5) / 10
 	return fmt.Sprintf("%.1f%s", val, suffix)
 }
 

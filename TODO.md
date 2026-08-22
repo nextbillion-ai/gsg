@@ -258,3 +258,75 @@ Unreachable today: `cmd/du.go` is the only caller and always passes
 **Fix:** either have `DiskUsage` reject `recursive=false`, or descend per prefix
 to get real subtotals, which defeats the point of the delimiter. Rejecting it is
 probably right.
+
+## 11. S3 ignores the size of an object whose key ends in "/"
+
+`batchAttrs` short-circuits every sub-path ending in `/`:
+
+```go
+if strings.HasSuffix(subPath, "/") {
+    res[index] = &S3Attributes{
+        S3Attrs: &s3.GetObjectAttributesOutput{},   // empty: no ObjectSize
+        Bucket:  bucket,
+        Prefix:  subPath,
+    }
+    continue
+}
+```
+
+so the size is never fetched and reads back as 0. That is right for a common
+prefix, which has no size and is not an object at all. It is wrong for a real
+object whose key happens to end in `/` -- the directory markers that console
+UIs and Hadoop write. Their bytes are silently missing from `du`.
+
+Measured: a 7 byte marker added to a prefix already holding 27 bytes leaves
+`du -s` reporting 27.
+
+The short-circuit exists because `listObjectsAndSubPaths` flattens two different
+things into one `[]string`: real keys from `Contents`, and synthetic entries from
+`CommonPrefixes`. Once flattened, a trailing `/` is the only thing left to tell
+them apart, and it cannot. Note that in a recursive listing there are no common
+prefixes at all, so every trailing-slash entry there is a real object and the
+short-circuit is always wrong.
+
+Rare in practice, since markers are almost always zero length. Pre-existing, and
+`uat.sh` pins the current behaviour so that changing it is deliberate.
+
+**Fix:** keep the two kinds apart instead of flattening them -- which is the same
+change item 9 needs, since it also wants `Size` and `LastModified` carried
+through from the listing rather than refetched.
+
+## 12. Both cloud backends race on their lazy client
+
+`GCS.Init` and `S3.Init` are check-then-set with no synchronization:
+
+```go
+func (g *GCS) Init(_ ...string) error {
+    if g.client != nil {          // read
+        return nil
+    }
+    ...
+    g.client, err = storage.NewClient(...)   // write
+```
+
+The backends are process-wide singletons -- `cmd/root.go` registers one
+`&gcs.GCS{}` and one `&s3.S3{}` -- and every worker goroutine calls `Init` at
+the top of whatever it is doing. With `-m` they race.
+
+Found by building `main` with `-race` and running `gsg -m cp -r` of 40 files at
+a real bucket: twelve races reported, with `gcs.Init` among them at both the
+read and the write.
+
+The likely outcome is two clients being built and one leaked, since a pointer
+write is not torn on the architectures gsg targets. That is still undefined
+under the Go memory model, and it is the kind of thing that stops being benign
+when a future client type grows more state.
+
+**Fix:** a `sync.Once` per backend. Note `S3.Init` also takes a bucket argument
+and derives the region from it, so its Once has to key on something or the
+first bucket seen wins -- which is arguably already the behaviour, since the
+client is cached after the first call.
+
+**Also:** `uat.sh` gained `GSG_UAT_RACE=1`, which builds with the race detector
+and aborts on any race. It cannot be turned on in earnest until this and item 7
+are fixed.
