@@ -366,3 +366,25 @@ anyway -- so the parameter stays.
 Worth checking at the same time whether the lock-generation encode/decode
 should be shared too: gcs and linux both marshal a uint64 the same way and both
 guard the length on the way back.
+
+## 14. One S3 client for the process, with the region taken from the first bucket
+
+`S3.Init` caches a single client and derives its region from whichever bucket
+happens to call it first:
+
+```go
+region, err = s3manager.GetBucketRegion(ctx, sess, bucket, "ap-southeast-1")
+```
+
+Every later call returns that client regardless of which bucket it was asked
+about, so operating across two regions in one process uses the wrong endpoint
+for one of them. Guarding the lazy init with a mutex made this deterministic
+rather than racy; it did not make it correct.
+
+The region lookup also swallows its own error -- the callback returns `nil` on
+failure rather than propagating -- so a transient lookup failure caches a client
+built with the fallback region instead of failing.
+
+**Fix:** cache clients keyed by region (or by bucket), and treat a failed region
+lookup as a failed `Init`. If one region per process is the intended invariant,
+say so and enforce it rather than leaving it to call order.
