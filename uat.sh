@@ -412,6 +412,25 @@ do_test() {
     # went unnoticed. Each case below fails on the commit that introduced it.
     # ---------------------------------------------------------------------
 
+    start "regression: the dropped directory level, isolated from the panic"
+    # Deliberately before the case below. That one has a file directly under
+    # the prefix, which makes the unfixed code panic before any assertion runs,
+    # so it can only prove the final behaviour -- never that dirs[1:] ALSO
+    # dropped a level. Nothing sits directly under this prefix, so the unfixed
+    # code gets through it without panicking:
+    # GetAllParents returns two entries, dirs[1:] keeps only the deeper one,
+    # and the x/ level silently disappears.
+    fnest="folder_nested_only"
+    mkdir -p $fnest/x/y
+    printf '01234567' > $fnest/x/y/only.txt   # 8 bytes, nothing at the top level
+    ../gsg cp -r $fnest $remote_base/$fnest
+    assertOk "du exits cleanly with no direct child" ../gsg du $remote_base/$fnest
+    assertEq "du reports the x/ level"   "$(../gsg du $remote_base/$fnest 2>/dev/null | grep -c "/$fnest/x/$")" "1"
+    assertEq "du reports the x/y/ level" "$(../gsg du $remote_base/$fnest 2>/dev/null | grep -c "/$fnest/x/y/$")" "1"
+    assertEq "du -s total"               "$(../gsg du -s $remote_base/$fnest 2>/dev/null | awk '{print $1}')" "8"
+    assertEq "x/ subtotal"               "$(../gsg du $remote_base/$fnest 2>/dev/null | grep "/$fnest/x/$" | awk '{print $1}')" "8"
+    finish
+
     start "regression: du over a prefix with files directly under it"
     # DiskUsage walked the parent chain with dirs[1:], and GetAllParents
     # returns an empty slice for an object sitting directly under the prefix,
@@ -433,13 +452,78 @@ do_test() {
     assertEq "du reports the sub/deep/ level" "$(../gsg du $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/deep/$")" "1"
     assertEq "du subtotal for sub/" \
         "$(../gsg du $remote_base/$fdu 2>/dev/null | grep "/$fdu/sub/$" | awk '{print $1}')" "17"
+    assertEq "du subtotal for sub/deep/" \
+        "$(../gsg du $remote_base/$fdu 2>/dev/null | grep "/$fdu/sub/deep/$" | awk '{print $1}')" "12"
+    assertEq "du -s lists exactly one row" \
+        "$(../gsg du -s $remote_base/$fdu 2>/dev/null | wc -l | tr -d ' ')" "1"
+    # The exact set, not just the count -- six rows of the wrong six would pass
+    # a cardinality check.
+    assertEq "du lists exactly these paths" \
+        "$(../gsg du $remote_base/$fdu 2>/dev/null | awk '{print $2}' | sed "s#^.*/$testid/##" | sort | tr '\n' ' ')" \
+        "$fdu/ $fdu/direct.txt $fdu/sub/ $fdu/sub/deep/ $fdu/sub/deep/low.txt $fdu/sub/mid.txt "
     finish
+
+
+    start "regression: du -h and -sh, the flag the original regression was named after"
+    # d5c1e42 "fix: du -sh" is the commit that turned the tree walk into a
+    # panic, and nothing here ever ran the human readable path.
+    assertOk "du -sh exits cleanly" ../gsg du -sh $remote_base/$fdu
+    assertEq "du -sh renders the total" \
+        "$(../gsg du -sh $remote_base/$fdu 2>/dev/null | awk '{print $1, $2}')" "27 B"
+    printf '%2048s' '' > kib.bin
+    ../gsg cp kib.bin $remote_base/$fdu/kib.bin
+    assertEq "du -sh renders KiB" \
+        "$(../gsg du -sh $remote_base/$fdu/kib.bin 2>/dev/null | awk '{print $1, $2}')" "2.00 KiB"
+    assertEq "du -h keeps the per-directory rows" \
+        "$(../gsg du -h $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/$")" "1"
+    ../gsg rm $remote_base/$fdu/kib.bin >/dev/null 2>&1 || true
+    finish
+
+    start "regression: a directory marker object must not be listed twice"
+    # An object whose key ends in "/" -- what console UIs and Hadoop write to
+    # fake a folder. GetAllParents already ends with that directory, so the
+    # tree walk lands on its node; adding a leaf for it as well emitted the
+    # same name twice. Covered by unit tests in system/tree_test.go; this is
+    # the end to end check.
+    #
+    # s3 only: aws s3api can put a key ending in "/", gsutil cannot -- it
+    # appends the local filename instead. The branch being exercised lives in
+    # system/tree.go and is shared by both backends.
+    if [[ "$mode" != "s3" ]]
+    then
+        echo "SKIP: gsutil cannot create an object whose key ends in /"
+        finish
+    else
+    # The marker carries bytes on purpose. Their fate pins a second, separate
+    # behaviour, described below.
+    printf '1234567' > marker.bin   # 7 bytes
+    aws s3api put-object --bucket gsg-uat --key "$testid/$fdu/sub/" --body marker.bin >/dev/null
+    assertEq "du lists sub/ exactly once, not twice" \
+        "$(../gsg du $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/$")" "1"
+    # 27, not 34: batchAttrs short-circuits every key ending in "/" and
+    # synthesizes an empty GetObjectAttributesOutput for it, so the marker's
+    # size is never read and its 7 bytes go uncounted. Right for a common
+    # prefix, which has no size; wrong for a real object that happens to end in
+    # "/". Pre-existing, unchanged by #35, and recorded in TODO.md -- pinned
+    # here so that fixing it is a deliberate act rather than a surprise.
+    assertEq "a marker's bytes are currently NOT counted (known, see TODO.md)" \
+        "$(../gsg du -s $remote_base/$fdu 2>/dev/null | awk '{print $1}')" "27"
+    assertEq "and the sub/ subtotal is unchanged by it" \
+        "$(../gsg du $remote_base/$fdu 2>/dev/null | grep "/$fdu/sub/$" | awk '{print $1}')" "17"
+    aws s3api delete-object --bucket gsg-uat --key "$testid/$fdu/sub/" >/dev/null
+    finish
+    fi
 
     start "regression: du -s on a single object and on a bucket prefix"
     assertOk "du -s of one object" ../gsg du -s $remote_base/$fdu/direct.txt
     assertEq "du -s of one object reports its size" \
         "$(../gsg du -s $remote_base/$fdu/direct.txt 2>/dev/null | awk '{print $1}')" "10"
     finish
+
+    # Not covered here: s3 batchAttrs leaves a nil entry when an object's
+    # attribute lookup fails, and List and DiskUsage must skip those. Making a
+    # lookup fail on demand is not something a live harness can arrange, so
+    # that path is left to the Go tests.
 
     start "regression: ls -r returns exactly the objects that exist"
     assertEq "ls -r lists all three" \
