@@ -770,6 +770,40 @@ do_test() {
     assertOk "odd names round-trip identically" diff -r $fodd ${fodd}_down
     finish
 
+    start "regression: an upload the server rejects must not report success"
+    # GCS finalizes an upload in Close, and that is where the server's answer
+    # arrives -- io.Copy only fills the writer's buffer. Upload deferred that
+    # Close and discarded its error, so any commit-time failure was reported as
+    # a success: a rejected object name, a quota, a permission failure at
+    # finalize, a dropped connection. cp exited 0 having stored nothing, and
+    # rsync's retry never fired because there was no error to retry on.
+    #
+    # gs only. The trigger used here is an object name containing a newline,
+    # which GCS rejects with "Disallowed unicode characters present in object
+    # name"; s3 accepts such keys, and its Upload checks PutObject's error
+    # anyway, so it never had this defect.
+    if [[ "$mode" != "gs" ]]
+    then
+        echo "SKIP: s3 accepts these names and already checks its upload error"
+        finish
+    else
+    frej="folder_rejected"
+    nl2=$'\n'
+    mkdir -p $frej
+    prepare_file $frej/fine.txt accepted
+    printf 'x' > "$frej/we${nl2}ird.txt"
+    if ../gsg -m cp -r $frej $remote_base/$frej >/dev/null 2>&1
+    then
+        echo "FATAL: cp reported success although the server rejected an object"
+        exit 1
+    fi
+    echo "OK: cp fails when the server rejects an object at commit"
+    # The one it could store is still stored, and the rejected one is absent.
+    assertValue $frej/fine.txt accepted remote
+    assert_not "$frej/we${nl2}ird.txt" remote
+    finish
+    fi
+
     start "regression: rm removes exactly what it is asked to"
     before=$(../gsg ls -r $remote_base/$fdu 2>/dev/null | wc -l | tr -d ' ')
     ../gsg rm $remote_base/$fdu/direct.txt
@@ -916,8 +950,9 @@ usage() {
     echo
     echo "GSG_UAT_RACE=1 builds gsg with the race detector and aborts on any"
     echo "data race. The bulk operations below run with -m, so this genuinely"
-    echo "exercises the worker pool. Expect it to fail today: gcs.Init and"
-    echo "s3.Init race on their lazy client, which is TODO.md item 12."
+    echo "exercises the worker pool. It passes as of the fix for TODO.md item"
+    echo "12, and roughly doubles the runtime, so it is worth turning on when"
+    echo "touching anything concurrent."
     exit 1
 }
 
@@ -937,9 +972,8 @@ esac
 
 start "building gsg binary"
 # GSG_UAT_RACE=1 builds with the race detector and makes any data race abort
-# the run. Off by default because it is 2-10x slower, and because gsg currently
-# has known races that would stop the suite before it tests anything -- see the
-# note in usage().
+# the run. Off by default only because it roughly doubles the runtime; it does
+# pass. See the note in usage().
 buildFlags=""
 if [[ "${GSG_UAT_RACE:-}" == "1" ]]
 then

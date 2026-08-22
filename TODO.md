@@ -1,15 +1,39 @@
 # Known issues
 
-Defects found while investigating a set of intermittent crashes in August 2026,
-which are understood but not yet fixed. Each entry says what is wrong, where,
-what it costs, and what a fix would involve.
+Defects found while investigating a set of intermittent crashes in August 2026.
+Each entry says what is wrong, where, what it costs, and what a fix would
+involve.
 
 The crashes themselves were fixed separately: #34 (truncated crc32c cache), #35
 (`du` slice panic), #36 (progress bar races), #37 (local listing), #38
 (truncated lock cache) and #39 (unbounded S3 fan-out). `uat.sh` gained coverage
 for all of them in #40.
 
-Everything below was re-checked against `main` after #34 was merged.
+Every item below was then reproduced, or an attempt was made, against real
+buckets. That changed the picture: some are worse than first written, and
+several are not worth fixing. The evidence is recorded under each one.
+
+| # | Status | Reproduced? | Verdict |
+|---|--------|-------------|---------|
+| 1 | PR #41 | yes -- cp exits 0 having stored nothing | fix |
+| 2 | open | yes -- 1000 of 1005 subdirectories listed | **fix**, silent data loss |
+| 3 | open | yes -- a 301 is reported as "not an object" | **fix**, compounds 14 |
+| 4 | open | yes -- `cp -v` from s3 logs 0 checksum checks | fix, or drop the flag for s3 |
+| 5 | PR #44 | yes -- unlock deleted another holder's lock | fix |
+| 6 | open | yes, but needs a newline in a filename | low |
+| 7 | open | no -- one goroutine per process | low, testing annoyance only |
+| 8 | open | synthetic only -- 511 MB per million objects | low unless such prefixes exist |
+| 9 | open | yes -- 1.8x slower, ~1005 extra calls per 1005 objects | fix eventually |
+| 10 | open | yes, but unreachable from the CLI | low |
+| 11 | open | yes, but needs a marker carrying bytes | low |
+| 12 | PR #42 | yes -- 8 data races under -m | fix |
+| 13 | PR #43 | n/a -- duplication, one copy with a flaw | fix |
+| 14 | open | yes -- 301 MovedPermanently across regions | **fix**, 7 regions on this account |
+| 15 | open | yes -- 8 of 8 processes acquire the same lock | **fix first**, S3 locking does not work |
+
+Suggested order for what remains: 15, then 2, then 14 and 3 together, since
+fixing 3 alone converts silence into errors without making the requests
+correct.
 
 ---
 
@@ -71,6 +95,18 @@ paginator) is what the API expects.
 `IsTruncated`, not on an empty `Contents`. Needs a real bucket with more than a
 page of subdirectories to test against.
 
+**Reproduced.** 1005 subdirectories under one prefix, each holding one object,
+with no object at the top level so the first page carries only common prefixes:
+
+```
+provider reports: 1005 subdirectories
+gsg ls          : 1000        <- exactly MaxKeys
+gsg ls -r       : 1005        <- recursive uses no delimiter, so Contents is never empty
+```
+
+The same fixture on gs lists 1005 of 1005: the GCS iterator paginates for us.
+S3 only.
+
 ## 3. `S3Attrs` reports every failure as "not an object"
 
 `S3Attrs` in `s3/s3.go` returns `(nil, nil)` both when the key genuinely is not
@@ -84,6 +120,19 @@ crashes but still silently under-reports.
 
 **Fix:** distinguish a not-found response from a real error, propagate the
 latter, and keep the nil result only for genuine absence.
+
+**Reproduced, and it hides item 14.** Asking gsg about an object in a bucket
+whose region the cached client does not match:
+
+```
+gsg (IsObject)          -> ok=false err=<nil>
+the same call, unwrapped -> 301 MovedPermanently
+```
+
+So a request that failed outright is reported as "this is not an object". Any
+caller then treats the object as absent. Fixing 14 without fixing this would
+still leave every other failure -- throttling, auth, a network blip -- silently
+reported as absence.
 
 ## 4. `GetFileCRC32C` cannot report an error, so it returns a wrong value
 
@@ -109,6 +158,17 @@ re-copy, or a failed verification. Not always, though:
 `func() (uint32, error)`, and `Attrs.Same` either returns an error or treats a
 checksum failure as not-same. Touches `common`, `linux`, `system`, `gcs` and
 `s3`, and should close the `S3.Download` gap at the same time.
+
+**Reproduced for the S3 half.** Downloading the same object from each backend
+with `cp -v`, counting log lines containing "CRC32C checking":
+
+```
+gs: 2        s3: 0
+```
+
+`-v` on the s3 path verifies nothing at all. The "returns a wrong value" half
+could not be reproduced: forcing a read to fail partway through a regular file
+is not something a test can arrange portably.
 
 ## 5. An S3 unlock deletes whatever lock is there
 
@@ -137,6 +197,12 @@ Directory totals are unaffected, since `du -s` prints only the last line.
 That fixes both the parsing and the portability, but it reports apparent size
 rather than allocated blocks, so the numbers will change.
 
+**Reproduced, low value.** A file named `we<newline>ird.txt` makes `du -aB1`
+emit a record split across two lines, and the entry comes back truncated to the
+part before the newline. The panic this used to cause is fixed (#37); what
+remains is a wrong name in `du` output, and only for filenames containing a
+newline.
+
 ## 7. A progress bar container can never be stopped
 
 `bar.Container.printer` loops forever with no way to stop it, and the container
@@ -152,6 +218,11 @@ cannot reach the lock.
 
 **Fix:** a `Close` or stop channel, plus an injectable writer. Unexporting the
 guarded fields would be a breaking change.
+
+**Not reproduced, and probably not worth fixing.** `bar.New` is called once per
+process, so the immortal goroutine is not a leak in any real run. The cost is
+that the package is awkward to test, which is a reason to change it only if
+someone is working there anyway.
 
 ## 8. Listing holds every key in memory, on both backends
 
@@ -173,6 +244,11 @@ responses; it is the accumulation that is unbounded.
 
 **Fix:** stream pages to the caller instead of accumulating, which changes the
 `ISystem.List` signature.
+
+**Only measured synthetically.** 511 MB for a million `*storage.ObjectAttrs`
+with realistic keys, plus a tree node each. Whether that matters depends on
+whether prefixes of that size actually get listed; nothing here demonstrates
+that they do.
 
 ## 9. S3 fetches attributes it was already given, one call per object
 
@@ -230,6 +306,18 @@ with no checksum algorithm requested, so objects gsg uploaded may carry no
 stored CRC32C at all. If so, `crc32c` is 0 on both sides and the comparison is
 already a no-op, which changes how much of step 3 is even needed.
 
+**Reproduced, modest at this size.** `ls -r` over 1005 objects, three runs each:
+
+```
+gs: 0.50s 0.53s 0.53s
+s3: 1.20s 0.92s 0.91s
+```
+
+About 1.8x, and roughly 1005 extra API calls that return data the listing
+already carried. Real money and latency at a million keys; barely visible at a
+thousand. The stronger argument for fixing it remains the partial-failure
+surface it creates, not the speed.
+
 ## 10. A non-recursive `du` reports zero for every directory
 
 With `recursive=false` the listing uses a delimiter, so subdirectories come back
@@ -258,6 +346,10 @@ Unreachable today: `cmd/du.go` is the only caller and always passes
 **Fix:** either have `DiskUsage` reject `recursive=false`, or descend per prefix
 to get real subtotals, which defeats the point of the delimiter. Rejecting it is
 probably right.
+
+**Reproduced, but unreachable.** `cmd/du.go` is the only caller and always
+passes `recursive=true`, so nothing in the CLI can hit this. It is reachable
+only through `ISystem.DiskUsage` directly.
 
 ## 11. S3 ignores the size of an object whose key ends in "/"
 
@@ -295,6 +387,10 @@ Rare in practice, since markers are almost always zero length. Pre-existing, and
 **Fix:** keep the two kinds apart instead of flattening them -- which is the same
 change item 9 needs, since it also wants `Size` and `LastModified` carried
 through from the listing rather than refetched.
+
+**Reproduced, low value.** A 7 byte marker added to a prefix holding 27 bytes
+leaves `du -s` reporting 27. Directory markers are essentially always zero
+length, so the undercount needs an unusual object to appear at all.
 
 ## 12. Both cloud backends race on their lazy client
 
@@ -388,3 +484,60 @@ built with the fallback region instead of failing.
 **Fix:** cache clients keyed by region (or by bucket), and treat a failed region
 lookup as a failed `Init`. If one region per process is the intended invariant,
 say so and enforce it rather than leaving it to call order.
+
+**Reproduced, and this account is exposed to it.** Buckets here span seven
+regions: ap-southeast-1 (20), us-west-2 (7), us-east-2 (3), eu-central-1 (2),
+ap-south-1 (2), us-west-1, ap-southeast-2, and four in us-east-1.
+
+A HeadObject against a us-west-2 bucket:
+
+```
+client pinned to us-west-2      -> 404 NotFound          (correct: the key is absent)
+client pinned to ap-southeast-1 -> 301 MovedPermanently  (the request fails)
+```
+
+So any single gsg process touching two buckets in different regions -- a
+cross-bucket `cp`, an `rsync` between buckets -- uses the wrong endpoint for
+one of them. Item 3 then turns the 301 into "not an object".
+
+## 15. Acquiring an S3 lock is not mutually exclusive
+
+`S3.DoAttemptLock` decides whether it may take the lock, then takes it, with
+nothing binding the two together:
+
+```go
+_, err = s.client.HeadObject(...)          // is there a lock?
+... if expired ...
+_, _ = s.client.DeleteObject(...)          // unconditional: may delete a NEW holder's lock
+...
+putOutput, err := s.client.PutObject(...)  // unconditional: overwrites whoever got there first
+```
+
+Two contenders can both come through it holding what each believes is the lock.
+The expired-lock cleanup deletes unconditionally, so a lock taken between the
+Head and the Delete is destroyed; and the create overwrites rather than failing
+when the object already exists.
+
+The gcs backend does neither: it creates with `DoesNotExist: true`, and its
+expired-lock cleanup deletes with `GenerationMatch`.
+
+Raised while reviewing the fix for item 5, which conditioned the *release* on
+the caller's ETag. Release is now safe on AWS; acquire is not, so S3 locking is
+still not a correct distributed lock.
+
+**Fix:** `IfNoneMatch: "*"` on the create, treating 412 as "not acquired", and
+`IfMatch` with the observed ETag on the expired-lock delete. Both are the same
+conditional-request feature item 5 uses, so they carry the same question about
+providers that ignore or reject it -- see the note there.
+
+**Reproduced, and worse than described above.** Eight processes racing for the
+same lock, three rounds:
+
+```
+s3: 8 of 8, 6 of 8, 8 of 8 processes believe they hold the lock
+gs: 1 of 8, 1 of 8, 1 of 8
+```
+
+Not "two contenders can both come away holding it" -- essentially all of them
+do. S3 locking provides no mutual exclusion worth the name. Anything relying on
+it for exclusion has none. This is the first thing to fix.

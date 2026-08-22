@@ -41,6 +41,10 @@ const (
 )
 
 type S3 struct {
+	// mu guards the lazy client, for the same reason as in the gcs backend:
+	// one S3 is registered for the whole process and every worker goroutine
+	// calls Init.
+	mu     sync.Mutex
 	client *s3.Client
 }
 
@@ -416,6 +420,8 @@ func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 }
 
 func (s *S3) Init(buckets ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.client != nil {
 		return nil
 	}
