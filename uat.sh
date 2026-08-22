@@ -537,6 +537,39 @@ do_test() {
         "$(../gsg ls -l $remote_base/$fdu/direct.txt 2>/dev/null | awk '{print $1}')" "10"
     finish
 
+    start "regression: a non-recursive listing mixes objects and common prefixes"
+    # Every other listing here is recursive. Without -r the provider is asked
+    # for a delimited listing, which returns real objects alongside synthetic
+    # "common prefix" entries for the subdirectories. The two are handled by
+    # different branches of the s3 backend's batchAttrs -- a common prefix
+    # needs no attribute request -- and nothing exercised that mix.
+    assertEq "ls without -r returns this level plus the subdirectory" \
+        "$(../gsg ls $remote_base/$fdu 2>/dev/null | sed "s#.*/$fdu/##" | sort | tr '\n' ' ')" \
+        "direct.txt sub/ "
+    assertEq "ls -r still returns the leaves, not the subdirectory" \
+        "$(../gsg ls -r $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/\$")" "0"
+    finish
+
+    start "regression: a listing larger than the attribute fan-out limit"
+    # batchAttrs caps concurrent attribute requests at 64. Every other fixture
+    # here is small enough that the cap never engages, so nothing covered the
+    # path where work queues behind it.
+    fmany="folder_many"
+    mkdir -p $fmany
+    i=1
+    while [[ $i -le 70 ]]
+    do
+        printf '%s' "$i" > $fmany/f$i.txt
+        i=$((i + 1))
+    done
+    ../gsg -m cp -r $fmany $remote_base/$fmany
+    assertEq "all 70 objects list back" \
+        "$(../gsg ls -r $remote_base/$fmany 2>/dev/null | wc -l | tr -d ' ')" "70"
+    assertEq "and du -s totals them" \
+        "$(../gsg du -s $remote_base/$fmany 2>/dev/null | awk '{print $1}')" \
+        "$(cat $fmany/* | wc -c | tr -d ' ')"
+    finish
+
     start "regression: cat returns exact content"
     assertEq "cat direct.txt" "$(../gsg cat $remote_base/$fdu/direct.txt 2>/dev/null)" "0123456789"
     finish
