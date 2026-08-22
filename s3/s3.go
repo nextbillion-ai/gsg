@@ -261,9 +261,27 @@ func (s *S3) List(bucket, prefix string, recursive bool) ([]*system.FileObject, 
 		return nil, err
 	}
 	for _, attr := range s3as {
-		fos = append(fos, s.toFileObject(attr))
+		fo := s.toFileObject(attr)
+		if fo == nil {
+			// batchAttrs leaves a nil entry when an object's attribute lookup
+			// failed. Callers dereference what List returns, so drop it here --
+			// but say so, because S3Attrs reports every failure as "not an
+			// object" and a dropped key would otherwise go unnoticed.
+			logger.Info(module, "skipping bucket[%s] prefix[%s]: attributes unavailable", bucket, prefix)
+			continue
+		}
+		fos = append(fos, fo)
 	}
 	return fos, nil
+}
+
+// s3ObjectSize reads an object's size, which is absent on directory markers and
+// on responses that carry no ObjectSize.
+func s3ObjectSize(attrs *S3Attributes) int64 {
+	if attrs == nil || attrs.S3Attrs == nil || attrs.S3Attrs.ObjectSize == nil {
+		return 0
+	}
+	return *attrs.S3Attrs.ObjectSize
 }
 
 // GetDiskUsageObjects gets disk usage of objects under a prefix
@@ -274,12 +292,10 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsag
 	if obj, err = s.S3Attrs(bucket, prefix); err != nil {
 		return nil, err
 	}
-	var size int64 = 0
-	if obj.S3Attrs.ObjectSize != nil {
-		size = *obj.S3Attrs.ObjectSize
-	}
+	// S3Attrs reports "not an object" as (nil, nil), so this must be checked
+	// before anything is read off obj.
 	if obj != nil {
-		return []system.DiskUsage{{Size: size, Name: obj.Prefix}}, nil
+		return []system.DiskUsage{{Size: s3ObjectSize(obj), Name: obj.Prefix}}, nil
 	}
 	// is directory
 	root := system.NewDUTree(prefix, 0, true)
@@ -288,23 +304,13 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsag
 		return nil, err
 	}
 	for _, obj := range objs {
-		var size int64 = 0
-		if obj.S3Attrs.ObjectSize != nil {
-			size = *obj.S3Attrs.ObjectSize
+		if obj == nil {
+			// Same as in List: S3Attrs reports every failure as "not an
+			// object", so an unreadable key would silently undercount the total.
+			logger.Info(module, "skipping an object under bucket[%s] prefix[%s]: attributes unavailable", bucket, prefix)
+			continue
 		}
-		du := system.NewDUTree(obj.Prefix, size, false)
-		dirs := system.GetAllParents(du.Name, prefix)
-		runningRoot := root
-		for _, dir := range dirs[1:] {
-			var pu *system.DUTree
-			var exists bool
-			if pu, exists = runningRoot.Children[dir]; !exists {
-				pu = system.NewDUTree(dir, 0, true)
-				runningRoot.Children[dir] = pu
-			}
-			runningRoot = pu
-		}
-		runningRoot.Children[du.Name] = du
+		root.Add(obj.Prefix, s3ObjectSize(obj), prefix)
 	}
 	return root.ToDiskUsages(), nil
 }
