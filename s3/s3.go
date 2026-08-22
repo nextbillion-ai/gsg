@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -24,12 +23,12 @@ import (
 	"google.golang.org/api/googleapi"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -160,11 +159,16 @@ func isNotFound(err error) bool {
 	if errors.As(err, &nf) {
 		return true
 	}
-	// GetObjectAttributes answers a missing key with a bare 404 rather than a
-	// modelled error, so the status has to be read off the response.
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
-		return re.HTTPStatusCode() == http.StatusNotFound
+	// Deliberately not "any 404". A missing bucket is a 404 too -- measured,
+	// code NoSuchBucket -- and that is a failure to answer, not an absent key.
+	// Matching on the code keeps the two apart where the modelled types do not
+	// reach us.
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
 	}
 	return false
 }

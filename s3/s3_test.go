@@ -3,12 +3,10 @@ package s3
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"testing"
 
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/aws/smithy-go"
 )
 
 func TestValidLockETag(t *testing.T) {
@@ -43,18 +41,14 @@ func TestIsNotFound(t *testing.T) {
 		{"nil", nil, false},
 		{"NoSuchKey", &types.NoSuchKey{}, true},
 		{"NotFound", &types.NotFound{}, true},
-		{"http 404", &awshttp.ResponseError{
-			ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{
-				Response: &http.Response{StatusCode: http.StatusNotFound}}}}, true},
-		{"http 301 region redirect", &awshttp.ResponseError{
-			ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{
-				Response: &http.Response{StatusCode: http.StatusMovedPermanently}}}}, false},
-		{"http 403 denied", &awshttp.ResponseError{
-			ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{
-				Response: &http.Response{StatusCode: http.StatusForbidden}}}}, false},
-		{"http 503 throttled", &awshttp.ResponseError{
-			ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{
-				Response: &http.Response{StatusCode: http.StatusServiceUnavailable}}}}, false},
+		{"code NoSuchKey", &smithy.GenericAPIError{Code: "NoSuchKey"}, true},
+		{"code NotFound", &smithy.GenericAPIError{Code: "NotFound"}, true},
+		// A missing bucket is a 404 as well, so matching on status alone would
+		// report a bucket that is not there as an object that is not there.
+		{"code NoSuchBucket", &smithy.GenericAPIError{Code: "NoSuchBucket"}, false},
+		{"code AccessDenied", &smithy.GenericAPIError{Code: "AccessDenied"}, false},
+		{"code SlowDown", &smithy.GenericAPIError{Code: "SlowDown"}, false},
+		{"code PermanentRedirect", &smithy.GenericAPIError{Code: "PermanentRedirect"}, false},
 		{"a plain error", errors.New("connection reset"), false},
 		{"wrapped NoSuchKey", fmt.Errorf("listing: %w", &types.NoSuchKey{}), true},
 	} {
