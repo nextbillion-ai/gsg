@@ -295,3 +295,38 @@ Rare in practice, since markers are almost always zero length. Pre-existing, and
 **Fix:** keep the two kinds apart instead of flattening them -- which is the same
 change item 9 needs, since it also wants `Size` and `LastModified` carried
 through from the listing rather than refetched.
+
+## 12. Both cloud backends race on their lazy client
+
+`GCS.Init` and `S3.Init` are check-then-set with no synchronization:
+
+```go
+func (g *GCS) Init(_ ...string) error {
+    if g.client != nil {          // read
+        return nil
+    }
+    ...
+    g.client, err = storage.NewClient(...)   // write
+```
+
+The backends are process-wide singletons -- `cmd/root.go` registers one
+`&gcs.GCS{}` and one `&s3.S3{}` -- and every worker goroutine calls `Init` at
+the top of whatever it is doing. With `-m` they race.
+
+Found by building `main` with `-race` and running `gsg -m cp -r` of 40 files at
+a real bucket: twelve races reported, with `gcs.Init` among them at both the
+read and the write.
+
+The likely outcome is two clients being built and one leaked, since a pointer
+write is not torn on the architectures gsg targets. That is still undefined
+under the Go memory model, and it is the kind of thing that stops being benign
+when a future client type grows more state.
+
+**Fix:** a `sync.Once` per backend. Note `S3.Init` also takes a bucket argument
+and derives the region from it, so its Once has to key on something or the
+first bucket seen wins -- which is arguably already the behaviour, since the
+client is cached after the first call.
+
+**Also:** `uat.sh` gained `GSG_UAT_RACE=1`, which builds with the race detector
+and aborts on any race. It cannot be turned on in earnest until this and item 7
+are fixed.
