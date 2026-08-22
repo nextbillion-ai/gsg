@@ -153,13 +153,108 @@ cannot reach the lock.
 **Fix:** a `Close` or stop channel, plus an injectable writer. Unexporting the
 guarded fields would be a breaking change.
 
-## 8. Listing S3 holds every key in memory
+## 8. Listing holds every key in memory, on both backends
 
-`listObjectsAndSubPaths` accumulates all `types.Object` values, then all
-sub-paths, then `batchAttrs` builds equally long `res` and `errs` slices, and
-callers build more on top. #39 bounded the goroutines and in-flight requests but
-not the allocation, so a prefix with a very large number of keys still needs all
-of them resident at once.
+`GCS.batchAttrs` accumulates every `*storage.ObjectAttrs` into one slice, and
+`DiskUsage` then builds a `DUTree` node per object on top of that. On the S3
+side `listObjectsAndSubPaths` accumulates all `types.Object` values, then all
+sub-paths, then `batchAttrs` builds equally long `res` and `errs` slices. #39
+bounded the goroutines and in-flight requests but not the allocation.
+
+Measured: 1M `*storage.ObjectAttrs` with ~40 character keys occupy **511 MB**
+(536 bytes each; the struct alone is 456 bytes before string contents). The tree
+adds another node and map per object on top. A million-object `du` is
+comfortably a gigabyte resident.
+
+Note this is not avoided by the delimiter. `du` always lists recursively
+(`cmd/du.go` is the only caller and always passes `recursive=true`), so a
+delimiter is never used and nothing is ever collapsed. The API pages the
+responses; it is the accumulation that is unbounded.
 
 **Fix:** stream pages to the caller instead of accumulating, which changes the
 `ISystem.List` signature.
+
+## 9. S3 fetches attributes it was already given, one call per object
+
+`s3.toAttrs` needs exactly three things: `Size`, `ModTime` and `CRC32`.
+
+`ListObjectsV2` already returns `Size` and `LastModified` for every object, and
+`listObjectsAndSubPaths` throws them away:
+
+```go
+for _, o := range objects {
+    subPaths = append(subPaths, *o.Key)   // Size and LastModified discarded
+}
+```
+
+`batchAttrs` then issues one `GetObjectAttributes` call per key to fetch back
+the size and mtime it just dropped. Only `CRC32C` genuinely requires the extra
+call, since the listing does not carry it.
+
+That single decision causes most of what is wrong with the S3 path:
+
+- **The request explosion.** One call per object is what #39 had to put a
+  concurrency cap on.
+- **Partial failure.** A million independent calls fail independently, and
+  `S3Attrs` reports every failure as "not an object" (item 3), so a failed
+  lookup silently drops that object from the result. GCS has no equivalent: its
+  attributes arrive with the listing, so a failure fails the whole listing and
+  `du` exits non-zero rather than returning a short answer.
+- **The nil handling.** Every nil check in `List` and `DiskUsage` exists to cope
+  with the nil entries this produces.
+
+**Fix, in this order -- the order matters:**
+
+1. Retry the per-object fetch with the existing `common.DoWithRetrySimple`, as
+   `s3.Download` already does, so a transient error is not a permanent skip.
+2. Then have `S3Attrs` return `(nil, nil)` only for a genuine NoSuchKey and
+   propagate everything else. `batchAttrs` already collects an `errs` slice and
+   returns the first non-nil entry, so the plumbing exists and the errors simply
+   never arrive. This makes S3 fail as loudly as GCS.
+
+   Not the other way round: with a million independent calls, even a 0.01%
+   transient failure rate means roughly a hundred failures per run. Made fatal
+   without retries first, `du` over a large prefix would fail every time.
+3. Then stop making the calls. Build `Attrs` from the list response and set
+   `Attrs.CalcCRC32C` to a closure that fetches the checksum for that one key on
+   demand. The hook already exists and the linux backend already uses it exactly
+   this way, so that `ls` never hashes a file it was only asked to list.
+
+   That takes `ls`, `du`, `cat` and `rm` to zero per-object calls. `rsync` needs
+   one more change to benefit: `Attrs.Same` calls `CalcCRC32C` unconditionally
+   whenever it is set, even without `-v`, so it should short-circuit when the
+   sizes already differ.
+
+**Unverified, and worth checking first:** `s3.Upload` does a plain `PutObject`
+with no checksum algorithm requested, so objects gsg uploaded may carry no
+stored CRC32C at all. If so, `crc32c` is 0 on both sides and the comparison is
+already a no-op, which changes how much of step 3 is even needed.
+
+## 10. A non-recursive `du` reports zero for every directory
+
+With `recursive=false` the listing uses a delimiter, so subdirectories come back
+as common prefixes: a path and no size. `DiskUsage` adds them to the tree so
+they appear in the output, but nothing can fill in their size, and the objects
+underneath were never listed.
+
+Measured against a prefix holding `top.txt` (5 bytes) and a subtree of 19000
+bytes:
+
+```
+DiskUsage(recursive=true)         DiskUsage(recursive=false)
+  5      nr/top.txt                 0      nr/sub/
+  ...                               5      nr/top.txt
+  19000  nr/sub/                    5      nr/
+  19005  nr/
+```
+
+The subtree reports 0 and the root total is wrong. This is inherent to a
+delimiter listing -- the size is not in the response, and computing it means
+walking the subtree, which is what the delimiter exists to avoid.
+
+Unreachable today: `cmd/du.go` is the only caller and always passes
+`recursive=true`. Reachable through `ISystem.DiskUsage` directly.
+
+**Fix:** either have `DiskUsage` reject `recursive=false`, or descend per prefix
+to get real subtotals, which defeats the point of the delimiter. Rejecting it is
+probably right.
