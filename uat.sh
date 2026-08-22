@@ -578,6 +578,43 @@ do_test() {
         "$(cat $fmany/* | wc -c | tr -d ' ')"
     finish
 
+    start "regression: a bucket in another region"
+    # One S3 client was cached for the whole process, with its region taken
+    # from whichever bucket was touched first, so a later request for a bucket
+    # elsewhere went to the wrong endpoint and came back 301 MovedPermanently.
+    # S3Attrs then reported that as "not an object", so the failure looked like
+    # an absence. Verified by hand against a bucket in us-west-2 while the
+    # client was pinned to ap-southeast-1: an object that exists reads as
+    # ok=false on main and ok=true with the fix.
+    #
+    # Exercising it here needs a second WRITABLE bucket in a DIFFERENT region,
+    # which this harness will not create on someone's account. Name one in
+    # GSG_UAT_BUCKET2 to run it. The classification half -- which errors mean
+    # "absent" and which must be reported -- is covered by TestIsNotFound.
+    if [[ "$mode" != "s3" || -z "${GSG_UAT_BUCKET2:-}" ]]
+    then
+        if [[ "$mode" == "s3" ]]
+        then
+            echo "SKIP: set GSG_UAT_BUCKET2 to a writable bucket in another region to run this"
+        else
+            echo "SKIP: gs has no per-region client to get wrong"
+        fi
+        finish
+    else
+    freg="folder_region"
+    mkdir -p $freg
+    prepare_file $freg/a.txt crossregion
+    # Touch gsg-uat first, then the other bucket, in one process. Before the
+    # fix the second used the first's region.
+    ../gsg -m cp -r $freg $remote_base/$freg
+    assertOk "a cross-region copy in one process succeeds" \
+        ../gsg cp $remote_base/$freg/a.txt "s3://${GSG_UAT_BUCKET2}/$testid/a.txt"
+    assertEq "and the object really landed in the other bucket" \
+        "$(aws s3 cp "s3://${GSG_UAT_BUCKET2}/$testid/a.txt" - 2>/dev/null)" "crossregion"
+    aws s3 rm "s3://${GSG_UAT_BUCKET2}/$testid/a.txt" >/dev/null 2>&1
+    finish
+    fi
+
     start "regression: cat returns exact content"
     assertEq "cat direct.txt" "$(../gsg cat $remote_base/$fdu/direct.txt 2>/dev/null)" "0123456789"
     finish
