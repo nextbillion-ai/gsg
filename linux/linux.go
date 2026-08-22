@@ -141,30 +141,70 @@ func (l *Linux) BatchAttributes(bucket, prefix string, recursive bool) ([]*syste
 // ListObjects lists objects under a prefix
 func (l *Linux) List(bucket, prefix string, isRec bool) ([]*system.FileObject, error) {
 	dir := GetRealPath(prefix)
+	if !common.IsPathExist(dir) {
+		// Syncing into a directory that does not exist yet is normal, so an
+		// absent path lists empty rather than failing.
+		return []*system.FileObject{}, nil
+	}
 	var stdout []byte
 	var err error
 	if isRec {
-		stdout, err = exec.Command("find", dir, "-type", "f").Output()
+		stdout, err = exec.Command("find", dir, "-type", "f", "-print0").Output()
 	} else {
-		stdout, err = exec.Command("find", dir, "-type", "f", "-maxdepth", "1").Output()
+		stdout, err = exec.Command("find", dir, "-maxdepth", "1", "-type", "f", "-print0").Output()
 	}
 	if err != nil {
-		logger.Debug(module, "failed with %s", err)
-		return nil, nil
+		// A failed listing must not be reported as an empty one. find exits
+		// non-zero for a single unreadable subdirectory too, and rsync -d
+		// deletes everything at the destination the source listing omits, so
+		// swallowing this could wipe the destination.
+		logger.Info(module, "listing [%s] failed with %s", dir, err)
+		return nil, err
 	}
-	res := strings.Split(string(stdout), "\n")
+	res := splitPaths(stdout)
 	objs := []*system.FileObject{}
 	for i, v := range res {
 		if i%100000 == 0 && i != 0 {
 			logger.Info(module, "ListObjects %d/%d", i, len(res))
 		}
-		v = strings.Trim(v, " \t\n")
-
-		if len(v) > 0 && !common.IsTempFile(v) {
-			objs = append(objs, l.toFileObject(v))
+		if fo := l.listedFileObject(v); fo != nil {
+			objs = append(objs, fo)
 		}
 	}
 	return objs, nil
+}
+
+// listedFileObject turns one path from find into a file object, or nil if it
+// should not be listed.
+//
+// find and the stat below are separate steps, so a file can disappear between
+// them -- a temp file cleaned up mid-sync, say. That used to yield a file
+// object with nil Attributes, and callers dereference Attributes without
+// checking (cmd/rsync.go listRelatively assigns to Attributes.RelativePath),
+// so the placeholder became a nil dereference there.
+func (l *Linux) listedFileObject(path string) *system.FileObject {
+	if len(path) == 0 || common.IsTempFile(path) {
+		return nil
+	}
+	fo := l.toFileObject(path)
+	if fo == nil || fo.Attributes == nil {
+		logger.Debug(module, "skipping [%s]: disappeared while listing", path)
+		return nil
+	}
+	return fo
+}
+
+// splitPaths splits the NUL-terminated output of find -print0.
+//
+// Splitting find's default output on "\n" broke apart any filename that
+// contains one, turning a single file into two paths that name nothing.
+func splitPaths(stdout []byte) []string {
+	res := strings.Split(string(stdout), "\x00")
+	// -print0 terminates rather than separates, so the tail is always empty.
+	if n := len(res); n > 0 && res[n-1] == "" {
+		res = res[:n-1]
+	}
+	return res
 }
 
 // ListTempFiles lists objects under a prefix
@@ -173,18 +213,18 @@ func ListTempFiles(dir string, isRec bool) []string {
 	var stdout []byte
 	var err error
 	if isRec {
-		stdout, err = exec.Command("find", dir, "-type", "f").Output()
+		stdout, err = exec.Command("find", dir, "-type", "f", "-print0").Output()
 	} else {
-		stdout, err = exec.Command("find", dir, "-type", "f", "-maxdepth", "1").Output()
+		stdout, err = exec.Command("find", dir, "-maxdepth", "1", "-type", "f", "-print0").Output()
 	}
 	if err != nil {
-		logger.Debug(module, "failed with %s", err)
+		// Only leaves stale temp files behind, so this is not fatal -- but it
+		// should not be invisible either.
+		logger.Info(module, "listing temp files under [%s] failed with %s", dir, err)
 		return nil
 	}
-	res := strings.Split(string(stdout), "\n")
 	objs := []string{}
-	for _, v := range res {
-		v = strings.Trim(v, " \t\n")
+	for _, v := range splitPaths(stdout) {
 		if len(v) > 0 && common.IsTempFile(v) {
 			objs = append(objs, v)
 		}
@@ -204,15 +244,23 @@ func (l *Linux) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskU
 	res := strings.Split(string(stdout), "\n")
 	for _, v := range res {
 		v = strings.Trim(v, " \t\n")
-		if len(v) > 0 {
-			items := whiteSpaces.Split(v, 2)
-			logger.Debug(module, "%s,%s", items[0], items[1])
-			size, err := strconv.ParseInt(items[0], 10, 64)
-			if err != nil {
-				continue
-			}
-			objs = append(objs, system.DiskUsage{Size: size, Name: items[1]})
+		if len(v) == 0 {
+			continue
 		}
+		items := whiteSpaces.Split(v, 2)
+		if len(items) < 2 {
+			// du emits "<size>\t<path>". A line without whitespace is not one
+			// -- a filename containing a newline splits across lines, and the
+			// continuation carries no size. items[1] used to panic on it.
+			logger.Debug(module, "skipping unparsable du line [%s]", v)
+			continue
+		}
+		logger.Debug(module, "%s,%s", items[0], items[1])
+		size, err := strconv.ParseInt(items[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		objs = append(objs, system.DiskUsage{Size: size, Name: items[1]})
 	}
 	return objs, nil
 }

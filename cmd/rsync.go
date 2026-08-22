@@ -268,6 +268,20 @@ func listRelatively(base *system.FileObject, isRec bool) map[string]*system.File
 	}
 	r := map[string]*system.FileObject{}
 	for _, fo := range fos {
+		// An entry a backend could not stat must not be treated as absent:
+		// with -d that makes rsync delete the matching destination file. Stop
+		// instead. (The continue matters only when Exit is disabled, as in
+		// tests, where it keeps the assignment below from dereferencing nil.)
+		if fo == nil {
+			logger.Info(module, "aborting: listing of [%s] contains an empty entry", base.Prefix)
+			common.Exit()
+			continue
+		}
+		if fo.Attributes == nil {
+			logger.Info(module, "aborting: [%s] has no attributes", fo.Prefix)
+			common.Exit()
+			continue
+		}
 		fo.Attributes.RelativePath = common.GetRelativePath(base.Prefix, fo.Prefix)
 		if fo.Attributes.RelativePath == "" {
 			continue
