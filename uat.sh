@@ -615,6 +615,29 @@ do_test() {
     finish
     fi
 
+    start "regression: -v verifies, and a repeated rsync is a no-op"
+    # Two faults that shared a cause. S3 reports a checksum as base64 of the
+    # raw bytes, and it was parsed with ParseUint base 10, so every object's
+    # checksum read back as 0. Nothing local ever matched, so an rsync from s3
+    # re-downloaded the whole tree on every run. And -v never verified at all:
+    # forceChecksum only set ChecksumMode on the request, and the function that
+    # compares was defined and called from nowhere.
+    fver="folder_verify"
+    mkdir -p $fver
+    prepare_file $fver/a.txt verify_a
+    prepare_file $fver/b.txt verify_b
+    ../gsg -m cp -r $fver $remote_base/$fver
+    rm -rf ${fver}_down && mkdir -p ${fver}_down
+    assertEq "cp -v actually checks the downloaded files" \
+        "$(../gsg -m cp -r -v $remote_base/$fver ${fver}_down 2>&1 | grep -c 'CRC32C checking success')" "2"
+
+    rm -rf ${fver}_sync && mkdir -p ${fver}_sync
+    ../gsg -m rsync -r $remote_base/$fver ${fver}_sync >/dev/null 2>&1
+    assertEq "a second rsync copies nothing" \
+        "$(../gsg -m rsync -r $remote_base/$fver ${fver}_sync 2>&1 | grep -c 'No diff detected')" "1"
+    assertOk "and the tree still matches" diff -r $fver ${fver}_sync
+    finish
+
     start "regression: a listing that spans more than one page"
     # ListObjectsV2 returns at most 1000 keys per page. The loop used to stop
     # when a page carried no Contents, which is wrong for a delimited listing:
@@ -665,16 +688,10 @@ do_test() {
     # and every later run decoded it as a uint32 and panicked with
     # "index out of range [3] with length 0".
     #
-    # gs only. S3.Download never verifies the downloaded file: it takes
-    # forceChecksum but uses it solely to set ChecksumMode on the GetObject
-    # request, and S3.MustEqualCRC32C is defined and never called from
-    # anywhere. So -v computes no checksum on the s3 path and writes no cache
-    # for this case to corrupt. Enable this for s3 once that is fixed.
-    if [[ "$mode" != "gs" ]]
-    then
-        echo "SKIP: s3 downloads do not verify checksums, so -v writes no crc32c cache"
-        finish
-    else
+    # Runs on both backends now. It used to be gs only, because S3.Download
+    # took forceChecksum, used it solely to set ChecksumMode on the GetObject
+    # request, and never called MustEqualCRC32C -- so -v computed no checksum
+    # on the s3 path and left no cache for this case to corrupt.
     fcrc="folder_crc"
     mkdir -p $fcrc
     prepare_file $fcrc/one.txt crc_one
@@ -699,7 +716,6 @@ do_test() {
     assertOk "rsync -v survives a truncated crc32c cache" \
         ../gsg -m rsync -r -v $remote_base/$fcrc ${fcrc}_down
     finish
-    fi
 
     start "regression: a truncated lock cache must not crash unlock"
     # Same shape as the crc32c cache: the generation was decoded from /tmp with

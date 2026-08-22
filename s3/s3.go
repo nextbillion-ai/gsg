@@ -5,13 +5,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,19 +73,47 @@ func (s *S3) toAttrs(attrs *S3Attributes) *system.Attrs {
 	if attrs.S3Attrs == nil {
 		return nil
 	}
-	var crc32c uint64 = 0
-	if attrs.S3Attrs.Checksum != nil && attrs.S3Attrs.Checksum.ChecksumCRC32C != nil {
-		crc32c, _ = strconv.ParseUint(*attrs.S3Attrs.Checksum.ChecksumCRC32C, 10, 32)
-	}
+	crc32c, _ := crc32cOf(attrs)
 	var size int64 = 0
 	if attrs.S3Attrs.ObjectSize != nil {
 		size = *attrs.S3Attrs.ObjectSize
 	}
 	return &system.Attrs{
 		Size:    size,
-		CRC32:   uint32(crc32c),
+		CRC32:   crc32c,
 		ModTime: getR2ModificationTime(attrs),
 	}
+}
+
+// crc32cOf returns the object's CRC32C and whether it carries one.
+//
+// S3 reports a checksum as base64 of the raw bytes, big endian -- "SPPMDQ==",
+// not a number. It was read with ParseUint base 10, which cannot parse that, so
+// every object's checksum came back 0. A locally computed checksum therefore
+// never matched, which is why an rsync from s3 re-downloaded every file on
+// every run while the same rsync from gs reported no diff.
+func crc32cOf(attrs *S3Attributes) (uint32, bool) {
+	if attrs == nil || attrs.S3Attrs == nil || attrs.S3Attrs.Checksum == nil {
+		return 0, false
+	}
+	// A multipart object's checksum is derived from its parts, not from the
+	// whole object -- measured, single-part uploads report FULL_OBJECT and
+	// multipart ones COMPOSITE. Comparing a composite against a whole-file
+	// CRC32C would reject a perfectly good object and make rsync copy it again
+	// every run, so only a whole-object checksum counts as comparable.
+	if attrs.S3Attrs.Checksum.ChecksumType != types.ChecksumTypeFullObject {
+		return 0, false
+	}
+	enc := attrs.S3Attrs.Checksum.ChecksumCRC32C
+	if enc == nil || *enc == "" {
+		return 0, false
+	}
+	raw, err := base64.StdEncoding.DecodeString(*enc)
+	if err != nil || len(raw) != 4 {
+		logger.Debug(module, "cannot read checksum %q", *enc)
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(raw), true
 }
 
 func getR2ModificationTime(attrs *S3Attributes) time.Time {
@@ -480,9 +509,10 @@ func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 		return err
 	}
 	if _, err = c.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(prefix),
-		Body:   from,
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(prefix),
+		Body:              from,
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
 	}); err != nil {
 		return err
 	}
@@ -716,6 +746,12 @@ func (s *S3) Download(
 		return err
 	}
 	common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
+	// The point of -v. forceChecksum only ever set ChecksumMode on the request
+	// and then discarded the answer; MustEqualCRC32C was defined and called
+	// from nowhere, so the flag verified nothing on this backend.
+	if err = s.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -738,10 +774,15 @@ func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) error
 	//modTime := common.GetFileModificationTime(srcFile)
 	logger.Info(module, "uploading %s to %s/%s", srcFile, bucket, prefix)
 	// upload file
+	// Ask for CRC32C specifically. The SDK otherwise picks its own algorithm --
+	// CRC32 today -- and everything here compares against a locally computed
+	// CRC32C, so an object uploaded without this carries a checksum nothing in
+	// gsg can use.
 	if _, err = c.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(prefix),
-		Body:   f,
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(prefix),
+		Body:              f,
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
 	}); err != nil {
 		logger.Info(module, "upload object failed when copy file with %s", err)
 		return err
@@ -822,20 +863,28 @@ func (s *S3) IsDirectory(bucket, prefix string) (bool, error) {
 
 // equalCRC32C return true if CRC32C values are the same
 // - compare a local file with an object from gcp
-func (s *S3) equalCRC32C(localPath, bucket, object string) (bool, error) {
-	localCRC32C := common.GetFileCRC32C(localPath)
-	r2CRC32C := uint32(0)
-	var err error
+// equalCRC32C compares a local file against the object's stored checksum. The
+// second result says whether there was a checksum to compare with at all:
+// objects written before gsg asked for CRC32C carry a different algorithm or
+// none, and reading that as zero would reject every one of them.
+func (s *S3) equalCRC32C(localPath, bucket, object string) (equal, comparable bool, err error) {
 	var attr *S3Attributes
 	if attr, err = s.S3Attrs(bucket, object); err != nil {
-		return false, err
+		return false, false, err
 	}
-	if attr != nil {
-		r2CRC32C = s.toAttrs(attr).CRC32
+	if attr == nil {
+		// Verification was asked for and the object is not there. That is a
+		// failure, not something to pass over.
+		return false, false, fmt.Errorf("cannot verify s3://%s/%s: no such object", bucket, object)
 	}
+	remote, ok := crc32cOf(attr)
+	if !ok {
+		return false, false, nil
+	}
+	local := common.GetFileCRC32C(localPath)
 	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
-		localPath, bucket, object, localCRC32C, r2CRC32C)
-	return localCRC32C == r2CRC32C, nil
+		localPath, bucket, object, local, remote)
+	return local == remote, true, nil
 }
 
 // MustEqualCRC32C compare CRC32C values if flag is set
@@ -846,9 +895,16 @@ func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) error 
 		return nil
 	}
 	var err error
-	var ok bool
-	if ok, err = s.equalCRC32C(localPath, bucket, object); err != nil {
+	var ok, comparable bool
+	if ok, comparable, err = s.equalCRC32C(localPath, bucket, object); err != nil {
 		return err
+	}
+	if !comparable {
+		// Nothing to check against. Saying so is the honest outcome: failing
+		// would reject every object written before gsg asked for CRC32C, and
+		// passing silently is what this flag already did.
+		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, object)
+		return nil
 	}
 	if !ok {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
