@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -29,6 +31,9 @@ import (
 
 const (
 	module = "S3"
+	// legacyLockETag is the ETag every lock carried before each acquisition got
+	// its own body: the content was always the single byte "1".
+	legacyLockETag = `"c4ca4238a0b923820dcc509a6f75849b"`
 	// lockCachePerm keeps the cache private. os.ModePerm made it world
 	// readable and writable, and cross-user unlock cannot work anyway: the
 	// ETag is specific to whoever acquired the lock.
@@ -763,6 +768,17 @@ func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) error 
 }
 
 // DoAttemptUnlock takes ETag as input and returns potential error
+// newLockToken returns a value unique to one lock acquisition, so that the
+// object's ETag identifies this lock rather than merely the fact that a lock
+// exists.
+func newLockToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("cannot generate a lock token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
 // validLockETag reports whether etag is shaped like the quoted entity-tag S3
 // returns from PutObject, which is what AttemptLock stores verbatim. Anything
 // else -- empty, "*", a bare hash, something carrying CR or LF -- is refused
@@ -786,6 +802,13 @@ func (s *S3) DoAttemptUnlock(bucket, object string, etag string) error {
 	// treat as an error. "*" is the dangerous one: If-Match: * matches any
 	// object, so a receipt corrupted to that would delete whoever holds the
 	// lock, which is the very thing this condition exists to prevent.
+	// The ETag every lock shared before acquisitions carried a distinct body.
+	// A receipt holding it cannot identify one lock, so it is refused: during a
+	// mixed rollout it would otherwise delete any lock an older gsg still holds.
+	if etag == legacyLockETag {
+		logger.Info(module, "DoAttemptUnlock: receipt for s3://%s/%s predates unique lock bodies", bucket, object)
+		return fmt.Errorf("cannot release the lock on s3://%s/%s: its receipt predates unique lock bodies and cannot identify one lock", bucket, object)
+	}
 	if !validLockETag(etag) {
 		logger.Info(module, "DoAttemptUnlock: unusable ETag %q for s3://%s/%s", etag, bucket, object)
 		return fmt.Errorf("cannot release the lock on s3://%s/%s: %q is not an ETag that proves it is ours", bucket, object, etag)
@@ -828,44 +851,53 @@ func (s *S3) DoAttemptLock(bucket, object string, ttl time.Duration) (string, er
 		return "", err
 	}
 
-	// First, check if lock object already exists
-	_, err = s.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+	// An existing lock is either still held, in which case we lose, or expired,
+	// in which case it is cleared out of the way -- conditionally, so that a
+	// lock someone else acquired between the read and the delete survives.
+	head, herr := s.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(object),
 	})
-
-	if err == nil {
-		// Lock object exists, check if it's expired
-		attrs, err1 := s.S3Attrs(bucket, object)
-		if err1 != nil {
-			return "", err1
+	if herr == nil {
+		if head.LastModified != nil && !head.LastModified.Add(ttl).Before(time.Now()) {
+			return "", fmt.Errorf("lock already exists and not expired")
 		}
-
-		if attrs != nil && attrs.S3Attrs.LastModified != nil {
-			// Check if lock is expired based on TTL
-			if attrs.S3Attrs.LastModified.Add(ttl).Before(time.Now()) {
-				logger.Debug(module, "DoAttemptLock expired. delete and try lock again")
-				// Try to delete the expired lock
-				_, _ = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-					Bucket: aws.String(bucket),
-					Key:    aws.String(object),
-				})
-			} else {
-				// Lock is still valid, return error
-				return "", fmt.Errorf("lock already exists and not expired")
-			}
+		logger.Debug(module, "DoAttemptLock: clearing an expired lock")
+		del := &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(object)}
+		if head.ETag != nil {
+			del.IfMatch = head.ETag
+		}
+		if _, derr := s.client.DeleteObject(context.TODO(), del); derr != nil {
+			// Someone else cleared or replaced it first. Theirs now.
+			logger.Debug(module, "DoAttemptLock: expired lock changed underneath us: %s", derr)
+			return "", fmt.Errorf("lock already exists and not expired")
 		}
 	}
 
-	// Try to create the lock object
+	// A distinct body per acquisition, so the ETag identifies THIS lock. The
+	// ETag is derived from the content, so while every lock held the same byte
+	// every lock had the same ETag, and the If-Match in DoAttemptUnlock matched
+	// anybody's lock rather than this one -- the very thing it is there to
+	// prevent. GCS needs no equivalent: a generation is unique per write
+	// regardless of what was written.
+	token, terr := newLockToken()
+	if terr != nil {
+		return "", terr
+	}
+	// If-None-Match: * creates only when the key is absent, so exactly one of
+	// several contenders wins. Without it both the Head above and this Put were
+	// unconditional, and every contender came away believing it held the lock.
 	putOutput, err := s.client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(object),
-		Body:   strings.NewReader("1"),
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(object),
+		Body:        strings.NewReader(token),
+		IfNoneMatch: aws.String("*"),
 	})
-
 	if err != nil {
-		return "", err
+		// A 412 here means another contender created it first, which is a lost
+		// race rather than a failure of this call.
+		logger.Debug(module, "DoAttemptLock: could not create the lock: %s", err)
+		return "", fmt.Errorf("lock already exists and not expired")
 	}
 
 	// Successfully acquired lock, return ETag

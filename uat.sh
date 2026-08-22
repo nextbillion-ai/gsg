@@ -270,6 +270,14 @@ snapshotTmp() {
     ls /tmp > .tmp_before 2>/dev/null || true
 }
 
+# newTmpCaches prints the md5-named files that appeared in /tmp since the last
+# snapshotTmp. gsg names a lock receipt after a hash of bucket and object, which
+# the shell cannot recompute portably, so it is found by diffing instead.
+newTmpCaches() {
+    ls /tmp > .tmp_after 2>/dev/null || true
+    comm -13 .tmp_before .tmp_after 2>/dev/null | grep -E '^[0-9a-f]{32}$' || true
+}
+
 # poisonNewTmp <expected-size-in-bytes>
 poisonNewTmp() {
     local want="$1" n=0 f
@@ -671,28 +679,69 @@ do_test() {
     # took an etag argument, logged it, and deleted unconditionally, so A's
     # unlock removed B's lock and reported success. Both backends are checked
     # here so the two cannot drift again.
+    # B's lock is taken by gsg itself, not written out of band. That matters:
+    # an earlier version of this case substituted an object with different
+    # content, and passed even while the bug was live, because every gsg lock
+    # used to hold the same byte and therefore the same ETag -- so s3's
+    # If-Match matched anybody's lock. Only two real locks exercise that.
     aunl="unlock_other.lock"
-    ../gsg lock $remote_base/$aunl 3600            # A locks, receipt cached locally
+    snapshotTmp
+    ../gsg lock $remote_base/$aunl 3600            # A locks
+    receipt=""
+    for f in $(newTmpCaches); do receipt="/tmp/$f"; done
+    if [[ -z "$receipt" ]]
+    then
+        echo "FATAL: lock left no receipt in /tmp to work with"
+        exit 1
+    fi
+    cp "$receipt" .A.receipt
+
+    # A's lock goes away and B takes a fresh one at the same path.
     case $mode in
-    gs)
-        gsutil rm "$remote_base/$aunl" >/dev/null 2>&1
-        echo "B" | gsutil cp - "$remote_base/$aunl" >/dev/null 2>&1
-        ;;
-    s3)
-        aws s3api delete-object --bucket gsg-uat --key "$testid/$aunl" >/dev/null 2>&1
-        printf 'B' | aws s3 cp - "$remote_base/$aunl" >/dev/null 2>&1
-        ;;
+    gs) gsutil rm "$remote_base/$aunl" >/dev/null 2>&1 ;;
+    s3) aws s3api delete-object --bucket gsg-uat --key "$testid/$aunl" >/dev/null 2>&1 ;;
     esac
+    ../gsg lock $remote_base/$aunl 3600            # B locks, overwriting the receipt
+    cp .A.receipt "$receipt"                       # A still holds its own, now stale
+
     if ../gsg unlock $remote_base/$aunl >/dev/null 2>&1
     then
         echo "FATAL: unlock reported success on a lock held by someone else"
         exit 1
     fi
     echo "OK: unlock refuses a lock it does not hold"
-    assertValue $aunl B remote
+    if ! ../gsg cat $remote_base/$aunl >/dev/null 2>&1
+    then
+        echo "FATAL: the other holder's lock was deleted"
+        exit 1
+    fi
+    echo "OK: the other holder's lock survives"
+    rm -f .A.receipt "$receipt"
     case $mode in
     gs) gsutil rm "$remote_base/$aunl" >/dev/null 2>&1 ;;
     s3) aws s3api delete-object --bucket gsg-uat --key "$testid/$aunl" >/dev/null 2>&1 ;;
+    esac
+    finish
+
+    start "regression: only one of several contenders may take a lock"
+    # gsg lock existed for mutual exclusion but s3 never provided any: the
+    # acquire path headed the object, deleted it unconditionally if expired,
+    # then put unconditionally, so every contender came away believing it held
+    # the lock. Measured on main, eight racing processes: seven acquired.
+    # A fresh key per run, because gs rate limits writes to one object name.
+    aexcl="contended-$$.lock"
+    rm -f .winners; touch .winners
+    for i in 1 2 3 4 5 6 7 8
+    do
+        ( ../gsg lock $remote_base/$aexcl 300 >/dev/null 2>&1; echo $? >> .winners ) &
+    done
+    wait
+    assertEq "exactly one of eight contenders acquires the lock" \
+        "$(grep -c '^0$' .winners)" "1"
+    rm -f .winners
+    case $mode in
+    gs) gsutil rm "$remote_base/$aexcl" >/dev/null 2>&1 ;;
+    s3) aws s3api delete-object --bucket gsg-uat --key "$testid/$aexcl" >/dev/null 2>&1 ;;
     esac
     finish
 
