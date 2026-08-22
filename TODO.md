@@ -330,3 +330,39 @@ client is cached after the first call.
 **Also:** `uat.sh` gained `GSG_UAT_RACE=1`, which builds with the race detector
 and aborts on any race. It cannot be turned on in earnest until this and item 7
 are fixed.
+
+## 13. Two copies of the atomic-write logic, and the older one is worse
+
+`common.WriteFileAtomic` (added with the lock cache fix) and
+`common.writeCRC32cCache` (added with the crc32c cache fix) do the same thing:
+create a temp file beside the target, write, chmod, sync, close, rename. They
+live in the same package, a few hundred lines apart.
+
+They are not identical, and the difference matters. `writeCRC32cCache` chmods
+**before** writing:
+
+```go
+if err = cf.Chmod(0644); err != nil { ... }
+if _, err = cf.Write(crcBytes); err != nil { ... }
+```
+
+so between those two calls the temp file is group and world readable while
+still empty or partial. A process killed there leaks a short, widely readable
+file. `WriteFileAtomic` was reviewed later and writes first, chmods second, for
+exactly that reason. The older copy never got the correction because it had
+already merged.
+
+`writeCRC32cCache` also swallows every error and logs at debug, so a caller
+cannot tell whether the cache was written; `WriteFileAtomic` returns the error.
+
+**Fix:** reduce `writeCRC32cCache` to marshalling four bytes and calling
+`common.WriteFileAtomic(cacheFileName, crcBytes, 0644)`, keeping its debug log
+on the returned error. That deletes roughly thirty lines and removes the
+chmod-ordering flaw. Note the modes differ on purpose -- 0644 for the crc32c
+cache, since a cache written by one user staying readable by another is a real
+saving, and 0600 for the lock caches, where cross-user unlock cannot work
+anyway -- so the parameter stays.
+
+Worth checking at the same time whether the lock-generation encode/decode
+should be shared too: gcs and linux both marshal a uint64 the same way and both
+guard the length on the way back.
