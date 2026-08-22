@@ -649,6 +649,86 @@ do_test() {
     assertValue $fdu/sub/deep/low.txt 0123456789ab remote
     finish
 
+    start "regression: local listing and du survive awkward filenames"
+    # Everything above lists remote prefixes. The local backend shells out to
+    # find and du and parses their text output, which is where a separate set
+    # of bugs lived, and nothing here exercised it directly.
+    flocal="folder_local"
+    nl=$'\n'
+    mkdir -p $flocal/sub
+    prepare_file "$flocal/normal.txt" plain
+    prepare_file "$flocal/with spaces.txt" spaced
+    prepare_file "$flocal/sub/nested.txt" nested
+    printf 'x' > "$flocal/trailing "          # basename ENDS in a space
+    printf 'y' > "$flocal/we${nl}ird.txt"     # newline inside the name
+
+    # find's output was split on newlines, so the name above became two paths
+    # naming nothing. Those reached callers with no attributes, and rsync
+    # dereferenced them. The trailing space was corrupted the same way, by a
+    # strings.Trim over the whole path.
+    assertOk "ls -r exits cleanly" ../gsg ls -r $flocal
+    assertEq "ls -r keeps the trailing space" \
+        "$(../gsg ls -r $flocal 2>/dev/null | grep -c "/trailing \$")" "1"
+    # Compared after turning newlines into \001, and matched against \001 -- a
+    # newline inside a grep pattern separates alternatives, so grepping for
+    # "we<newline>ird.txt" would really just be grepping for "we", which the
+    # broken output contains too.
+    assertEq "ls -r keeps the newline name in one piece" \
+        "$(../gsg ls -r $flocal 2>/dev/null | tr '\n' '\001' | grep -c "we"$'\001'"ird.txt")" "1"
+
+    # du shells out to "du -aB1" and split its output on newlines too. The
+    # newline name produces a continuation line carrying no size, and reading
+    # its second field panicked with "index out of range [1] with length 1".
+    assertOk "du -s exits cleanly over those names" ../gsg du -s $flocal
+    assertEq "du -s agrees with the system du" \
+        "$(../gsg du -s $flocal 2>/dev/null | awk '{print $1}')" \
+        "$(du -sB1 $flocal 2>/dev/null | awk '{print $1}')"
+
+    # A local round trip: the trailing-space name alone used to abort this with
+    # a nil dereference, syncing nothing at all.
+    rm -rf ${flocal}_copy
+    ../gsg -m rsync -r $flocal ${flocal}_copy
+    assertOk "a local rsync reproduces the tree exactly" diff -r $flocal ${flocal}_copy
+    finish
+
+    start "regression: an unreadable subdirectory must fail, not list empty"
+    # find exits non-zero for one unreadable subdirectory while still printing
+    # what it found, and List discarded the lot and reported success with an
+    # empty result. rsync -d deletes whatever the source listing omits, so a
+    # permission error under the source could empty the destination.
+    if [[ "$(id -u)" == "0" ]]
+    then
+        echo "SKIP: running as root, which can read the directory regardless of its mode"
+        finish
+    else
+    # Exit status alone proves nothing here: the unfixed code also exits
+    # non-zero, because its empty listing makes ls print "No objects found"
+    # and quit. What distinguishes them is what -d does to the destination.
+    mkdir -p $flocal/denied
+    prepare_file $flocal/denied/hidden.txt hidden
+    chmod 000 $flocal/denied
+    ../gsg ls -r $flocal > .lsout 2>&1 || true
+    chmod 755 $flocal/denied
+    if grep -q "No objects found" .lsout
+    then
+        echo "FATAL: an unreadable subdirectory was reported as an empty listing"
+        exit 1
+    fi
+    echo "OK: an unreadable subdirectory is reported as a failure, not as empty"
+
+    # The destination must survive. -d deletes whatever the source listing
+    # omits, and an empty listing omits everything: against the unfixed code
+    # this exits 0 and removes every file in the destination.
+    chmod 000 $flocal/denied
+    ../gsg -m rsync -r -d $flocal ${flocal}_copy > .rsout 2>&1 || true
+    chmod 755 $flocal/denied
+    assertValue ${flocal}_copy/normal.txt plain
+    assertValue "${flocal}_copy/with spaces.txt" spaced
+    assertValue ${flocal}_copy/sub/nested.txt nested
+    rm -f .lsout .rsout
+    finish
+    fi
+
     start "rm -r removes a whole tree"
     # cmd/rm.go schedules recursive deletes through the worker pool, and
     # nothing here exercised that at all.
