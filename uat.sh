@@ -609,6 +609,20 @@ do_test() {
     # panic just as well as the error, so the output is inspected instead.
     assertNoCrash "unlock does not crash on a truncated lock cache" \
         ../gsg unlock $remote_base/lockfile
+
+    # Not crashing is not enough. Without the generation the remote lock cannot
+    # be released, so unlock has to say so: reporting success would leave the
+    # next locker blocked until the TTL with nobody aware of why.
+    if ../gsg unlock $remote_base/lockfile >/dev/null 2>&1
+    then
+        echo "FATAL: unlock reported success despite an unusable lock cache"
+        exit 1
+    fi
+    echo "OK: unlock reports the failure rather than claiming success"
+
+    # And the claim is accurate: the lock really is still held.
+    assertValue lockfile 1 remote
+
     assertOk "gsg still runs afterwards" ../gsg ls -r $remote_base/$fdu
     ../gsg rm $remote_base/lockfile >/dev/null 2>&1 || true
     finish
