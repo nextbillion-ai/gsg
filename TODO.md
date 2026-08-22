@@ -388,3 +388,33 @@ built with the fallback region instead of failing.
 **Fix:** cache clients keyed by region (or by bucket), and treat a failed region
 lookup as a failed `Init`. If one region per process is the intended invariant,
 say so and enforce it rather than leaving it to call order.
+
+## 15. Acquiring an S3 lock is not mutually exclusive
+
+`S3.DoAttemptLock` decides whether it may take the lock, then takes it, with
+nothing binding the two together:
+
+```go
+_, err = s.client.HeadObject(...)          // is there a lock?
+... if expired ...
+_, _ = s.client.DeleteObject(...)          // unconditional: may delete a NEW holder's lock
+...
+putOutput, err := s.client.PutObject(...)  // unconditional: overwrites whoever got there first
+```
+
+Two contenders can both come through it holding what each believes is the lock.
+The expired-lock cleanup deletes unconditionally, so a lock taken between the
+Head and the Delete is destroyed; and the create overwrites rather than failing
+when the object already exists.
+
+The gcs backend does neither: it creates with `DoesNotExist: true`, and its
+expired-lock cleanup deletes with `GenerationMatch`.
+
+Raised while reviewing the fix for item 5, which conditioned the *release* on
+the caller's ETag. Release is now safe on AWS; acquire is not, so S3 locking is
+still not a correct distributed lock.
+
+**Fix:** `IfNoneMatch: "*"` on the create, treating 412 as "not acquired", and
+`IfMatch` with the observed ETag on the expired-lock delete. Both are the same
+conditional-request feature item 5 uses, so they carry the same question about
+providers that ignore or reject it -- see the note there.
