@@ -183,7 +183,6 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]st
 	var lo *s3.ListObjectsV2Output
 	objects := []types.Object{}
 	commonPrefixes := map[string]struct{}{}
-	index := 0
 	for {
 		if lo, err = s.client.ListObjectsV2(context.TODO(), &li); err != nil {
 			logger.Info(module, "get objects attributes failed with %s", err)
@@ -194,12 +193,32 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]st
 				commonPrefixes[*cp.Prefix] = struct{}{}
 			}
 		}
-		if len(lo.Contents) == 0 {
+		objects = append(objects, lo.Contents...)
+
+		// IsTruncated is the only thing that says whether more pages exist. The
+		// loop used to stop on an empty Contents instead, which is wrong for a
+		// delimited listing: a page whose keys all collapsed into common
+		// prefixes carries no Contents at all, so a prefix with more than one
+		// page of subdirectories stopped after the first and the rest were
+		// silently missing.
+		if lo.IsTruncated == nil || !*lo.IsTruncated {
 			break
 		}
-		index++
-		objects = append(objects, lo.Contents...)
-		li.StartAfter = objects[len(objects)-1].Key
+		// And continue with the token the server gave us. StartAfter is a
+		// starting key, not a cursor: it ignores common prefixes entirely, so
+		// it cannot resume a delimited listing.
+		//
+		// A truncated page must carry a token, and a new one, or there is no
+		// way forward. AWS always does; failing here rather than trusting it
+		// means a provider that does not turns into an error instead of a loop
+		// that re-fetches one page until it runs out of memory.
+		if lo.NextContinuationToken == nil || *lo.NextContinuationToken == "" {
+			return nil, fmt.Errorf("listing bucket[%s] prefix[%s] was truncated without a continuation token", bucket, prefix)
+		}
+		if li.ContinuationToken != nil && *li.ContinuationToken == *lo.NextContinuationToken {
+			return nil, fmt.Errorf("listing bucket[%s] prefix[%s] repeated its continuation token", bucket, prefix)
+		}
+		li.ContinuationToken = lo.NextContinuationToken
 	}
 
 	subPaths := []string{}
