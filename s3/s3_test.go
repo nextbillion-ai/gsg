@@ -1,6 +1,13 @@
 package s3
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+)
 
 func TestValidLockETag(t *testing.T) {
 	for _, c := range []struct {
@@ -19,6 +26,34 @@ func TestValidLockETag(t *testing.T) {
 	} {
 		if got := validLockETag(c.etag); got != c.want {
 			t.Errorf("validLockETag(%q) = %v, want %v", c.etag, got, c.want)
+		}
+	}
+}
+
+func TestIsNotFound(t *testing.T) {
+	// Only a genuine absence may read as "not an object". Anything else has to
+	// reach the caller, or a failed request becomes a missing object.
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"NoSuchKey", &types.NoSuchKey{}, true},
+		{"NotFound", &types.NotFound{}, true},
+		{"code NoSuchKey", &smithy.GenericAPIError{Code: "NoSuchKey"}, true},
+		{"code NotFound", &smithy.GenericAPIError{Code: "NotFound"}, true},
+		// A missing bucket is a 404 as well, so matching on status alone would
+		// report a bucket that is not there as an object that is not there.
+		{"code NoSuchBucket", &smithy.GenericAPIError{Code: "NoSuchBucket"}, false},
+		{"code AccessDenied", &smithy.GenericAPIError{Code: "AccessDenied"}, false},
+		{"code SlowDown", &smithy.GenericAPIError{Code: "SlowDown"}, false},
+		{"code PermanentRedirect", &smithy.GenericAPIError{Code: "PermanentRedirect"}, false},
+		{"a plain error", errors.New("connection reset"), false},
+		{"wrapped NoSuchKey", fmt.Errorf("listing: %w", &types.NoSuchKey{}), true},
+	} {
+		if got := isNotFound(c.err); got != c.want {
+			t.Errorf("isNotFound(%s) = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

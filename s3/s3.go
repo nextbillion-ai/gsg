@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -27,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -41,11 +43,16 @@ const (
 )
 
 type S3 struct {
-	// mu guards the lazy client, for the same reason as in the gcs backend:
-	// one S3 is registered for the whole process and every worker goroutine
-	// calls Init.
-	mu     sync.Mutex
-	client *s3.Client
+	// mu guards the lazily built clients. One S3 is registered for the whole
+	// process and every worker goroutine reaches for a client, so this is
+	// shared state.
+	//
+	// A client is per bucket rather than per process because its region is
+	// fixed at construction. A single cached client meant the first bucket
+	// touched decided the region for every later one, and a request for a
+	// bucket elsewhere came back 301 MovedPermanently.
+	mu      sync.Mutex
+	clients map[string]*s3.Client
 }
 
 func (s *S3) Scheme() string {
@@ -107,7 +114,8 @@ func (s *S3) toFileObject(attrs *S3Attributes) *system.FileObject {
 
 func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return nil, err
 	}
 	var oat types.ObjectAttributes
@@ -115,19 +123,54 @@ func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 		return nil, nil
 	}
 	var attrs *s3.GetObjectAttributesOutput
-	if attrs, err = s.client.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
+	if attrs, err = c.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
 		Bucket:           aws.String(bucket),
 		Key:              aws.String(prefix),
 		ObjectAttributes: oat.Values(),
 	}); err != nil {
-		logger.Debug(module, "failed with s3://%s/%s %s", bucket, prefix, err)
-		return nil, nil
+		// Only a genuine absence is "not an object". Everything else --
+		// throttling, auth, a region redirect, a network blip -- used to come
+		// back as (nil, nil) too, so a request that failed was indistinguishable
+		// from a key that is not there. Callers then treated the object as
+		// absent, which is how a listing quietly loses entries and how a
+		// cross-region 301 reads as "no such object".
+		if isNotFound(err) {
+			logger.Debug(module, "no object at s3://%s/%s", bucket, prefix)
+			return nil, nil
+		}
+		logger.Info(module, "failed with s3://%s/%s %s", bucket, prefix, err)
+		return nil, err
 	}
 	return &S3Attributes{
 		S3Attrs: attrs,
 		Bucket:  bucket,
 		Prefix:  prefix,
 	}, nil
+}
+
+// isNotFound reports whether err says the key does not exist, as opposed to
+// saying the request could not be answered.
+func isNotFound(err error) bool {
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	// Deliberately not "any 404". A missing bucket is a 404 too -- measured,
+	// code NoSuchBucket -- and that is a failure to answer, not an absent key.
+	// Matching on the code keeps the two apart where the modelled types do not
+	// reach us.
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+	return false
 }
 
 // GetObjectAttributes gets the attributes of an object
@@ -162,7 +205,8 @@ func matchImmediateSubPath(prefix, path string) string {
 
 func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]string, error) {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return nil, err
 	}
 	var ok bool
@@ -184,7 +228,7 @@ func (s *S3) listObjectsAndSubPaths(bucket, prefix string, recursive bool) ([]st
 	objects := []types.Object{}
 	commonPrefixes := map[string]struct{}{}
 	for {
-		if lo, err = s.client.ListObjectsV2(context.TODO(), &li); err != nil {
+		if lo, err = c.ListObjectsV2(context.TODO(), &li); err != nil {
 			logger.Info(module, "get objects attributes failed with %s", err)
 			return nil, err
 		}
@@ -363,10 +407,11 @@ func (s *S3) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsag
 }
 func (s *S3) DeleteObject(bucket, prefix string) error {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return err
 	}
-	_, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+	_, err = c.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket: &bucket,
 		Key:    &prefix,
 	})
@@ -376,10 +421,11 @@ func (s *S3) DeleteObject(bucket, prefix string) error {
 // DeleteObject deletes an object
 func (s *S3) Delete(bucket, prefix string) error {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return err
 	}
-	if _, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+	if _, err = c.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket: &bucket,
 		Key:    &prefix,
 	}); err != nil {
@@ -393,7 +439,11 @@ func (s *S3) Delete(bucket, prefix string) error {
 // CopyObject copies an object
 func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	var err error
-	if err = s.Init(srcBucket); err != nil {
+	// The destination's client: CopyObject is issued against the bucket
+	// being written to, and using the source's client sent it to the wrong
+	// endpoint whenever the two lived in different regions.
+	c, err := s.clientFor(dstBucket)
+	if err != nil {
 		return err
 	}
 	var s3a *S3Attributes
@@ -407,7 +457,7 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 		return fmt.Errorf(log)
 	}
 
-	if _, err = s.client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+	if _, err = c.CopyObject(context.TODO(), &s3.CopyObjectInput{
 		Bucket:     aws.String(dstBucket),
 		Key:        aws.String(dstPrefix),
 		CopySource: aws.String(fmt.Sprintf("%v/%v", srcBucket, srcPrefix)),
@@ -425,10 +475,11 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 
 func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return err
 	}
-	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+	if _, err = c.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
 		Body:   from,
@@ -438,49 +489,62 @@ func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 	return nil
 }
 
+// Init satisfies ISystem. It exists to fail early on a bad bucket or missing
+// credentials; the client it builds is kept for clientFor to hand out.
 func (s *S3) Init(buckets ...string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.client != nil {
-		return nil
-	}
 	if len(buckets) == 0 {
 		common.Exit()
 		return fmt.Errorf("S3 initialization need target bucket")
 	}
+	_, err := s.clientFor(buckets[0])
+	return err
+}
 
-	bucket := buckets[0]
+// clientFor returns the client for one bucket, building it on first use.
+func (s *S3) clientFor(bucket string) (*s3.Client, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c, ok := s.clients[bucket]; ok {
+		return c, nil
+	}
 
-	cfg, e1 := config.LoadDefaultConfig(context.TODO(), func(options *config.LoadOptions) error {
-		var region string
-		var err error
-		if region, err = s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, "ap-southeast-1"); err != nil {
-			return nil
-		}
-		options.Region = region
-		return nil
-	})
+	// The bucket's own region, and a failure to find it is a failure to build
+	// the client. This used to return nil from the callback, leaving the
+	// fallback region in place, so a lookup that failed produced a client
+	// quietly pointed at the wrong place.
+	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, "ap-southeast-1")
+	if rerr != nil {
+		logger.Info(module, "cannot determine the region of bucket[%s]: %s", bucket, rerr)
+		return nil, rerr
+	}
+	cfg, e1 := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if e1 != nil {
 		logger.Info(module, "failed in loading defaultConfig with error: %s", e1)
 		common.Exit()
-		return e1
+		return nil, e1
 	}
 	// Check if credentials are valid
 	if _, err := cfg.Credentials.Retrieve(context.TODO()); err != nil {
-		return err
+		return nil, err
 	}
 
-	s.client = s3.NewFromConfig(cfg)
-	return nil
+	c := s3.NewFromConfig(cfg)
+	if s.clients == nil {
+		s.clients = map[string]*s3.Client{}
+	}
+	s.clients[bucket] = c
+	logger.Debug(module, "built a client for bucket[%s] in region[%s]", bucket, region)
+	return c, nil
 }
 
 func (s *S3) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return nil, err
 	}
 	var goo *s3.GetObjectOutput
-	if goo, err = s.client.GetObject(context.TODO(), &s3.GetObjectInput{
+	if goo, err = c.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix)}); err != nil {
 		return nil, err
@@ -495,7 +559,8 @@ func (s *S3) Download(
 	ctx system.RunContext,
 ) error {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return err
 	}
 	var attrs *S3Attributes
@@ -563,7 +628,7 @@ func (s *S3) Download(
 				if forceChecksum {
 					gi.ChecksumMode = types.ChecksumModeEnabled
 				}
-				oo, oe := s.client.GetObject(context.TODO(), &gi)
+				oo, oe := c.GetObject(context.TODO(), &gi)
 				if oe != nil {
 					logger.Info(module, "download object failed when create reader with %s", oe)
 					common.Exit()
@@ -657,7 +722,8 @@ func (s *S3) Download(
 // UploadObject uploads an object from a file
 func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) error {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return err
 	}
 	// open source file
@@ -672,7 +738,7 @@ func (s *S3) Upload(srcFile, bucket, prefix string, ctx system.RunContext) error
 	//modTime := common.GetFileModificationTime(srcFile)
 	logger.Info(module, "uploading %s to %s/%s", srcFile, bucket, prefix)
 	// upload file
-	if _, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+	if _, err = c.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
 		Body:   f,
@@ -702,11 +768,12 @@ func (s *S3) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 func (s *S3) Cat(bucket, prefix string) ([]byte, error) {
 	var err error
 	// create reader
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return nil, err
 	}
 	var o *s3.GetObjectOutput
-	if o, err = s.client.GetObject(context.TODO(), &s3.GetObjectInput{
+	if o, err = c.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(prefix),
 	}); err != nil {
@@ -818,7 +885,8 @@ func validLockETag(etag string) bool {
 
 func (s *S3) DoAttemptUnlock(bucket, object string, etag string) error {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return err
 	}
 	// A receipt that is not a well formed entity-tag proves nothing, so there is
@@ -845,7 +913,7 @@ func (s *S3) DoAttemptUnlock(bucket, object string, etag string) error {
 	// had just acquired, seconds after this caller's own lock expired. The gcs
 	// backend has always conditioned its delete on the generation it stored;
 	// this is the same guarantee.
-	_, err = s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+	_, err = c.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket:  aws.String(bucket),
 		Key:     aws.String(object),
 		IfMatch: aws.String(etag),
@@ -872,14 +940,15 @@ func (s *S3) AttemptUnLock(bucket, object string) error {
 // DoAttemptLock returns ETag and potential error
 func (s *S3) DoAttemptLock(bucket, object string, ttl time.Duration) (string, error) {
 	var err error
-	if err = s.Init(bucket); err != nil {
+	c, err := s.clientFor(bucket)
+	if err != nil {
 		return "", err
 	}
 
 	// An existing lock is either still held, in which case we lose, or expired,
 	// in which case it is cleared out of the way -- conditionally, so that a
 	// lock someone else acquired between the read and the delete survives.
-	head, herr := s.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+	head, herr := c.HeadObject(context.TODO(), &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(object),
 	})
@@ -892,7 +961,7 @@ func (s *S3) DoAttemptLock(bucket, object string, ttl time.Duration) (string, er
 		if head.ETag != nil {
 			del.IfMatch = head.ETag
 		}
-		if _, derr := s.client.DeleteObject(context.TODO(), del); derr != nil {
+		if _, derr := c.DeleteObject(context.TODO(), del); derr != nil {
 			// Someone else cleared or replaced it first. Theirs now.
 			logger.Debug(module, "DoAttemptLock: expired lock changed underneath us: %s", derr)
 			return "", fmt.Errorf("lock already exists and not expired")
@@ -912,7 +981,7 @@ func (s *S3) DoAttemptLock(bucket, object string, ttl time.Duration) (string, er
 	// If-None-Match: * creates only when the key is absent, so exactly one of
 	// several contenders wins. Without it both the Head above and this Put were
 	// unconditional, and every contender came away believing it held the lock.
-	putOutput, err := s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+	putOutput, err := c.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:      aws.String(bucket),
 		Key:         aws.String(object),
 		Body:        strings.NewReader(token),
