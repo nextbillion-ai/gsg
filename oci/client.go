@@ -60,6 +60,14 @@ func (o *OCI) clientAndNamespace(bucketSpec string) (*objectstorage.ObjectStorag
 
 // resolve is the form every operation wants: the client, the namespace, and
 // the bucket name with any "@namespace" suffix already stripped off.
+//
+// It also establishes that the bucket exists, once. That matters for what a
+// 404 on an object means: a HEAD has no response body, so the SDK reports a
+// missing object, a missing bucket and a missing namespace identically, and
+// the three cannot be told apart from the reply alone. Knowing the bucket is
+// there beforehand is what makes a later 404 mean "no such object" -- so
+// headObject does not have to ask about the bucket every time one is missing,
+// which over a large listing would be a bucket lookup per absent object.
 func (o *OCI) resolve(bucketSpec string) (*objectstorage.ObjectStorageClient, string, string, error) {
 	c, ns, err := o.clientAndNamespace(bucketSpec)
 	if err != nil {
@@ -69,5 +77,39 @@ func (o *OCI) resolve(bucketSpec string) (*objectstorage.ObjectStorageClient, st
 	if name == "" {
 		return nil, "", "", fmt.Errorf("oci: no bucket given")
 	}
+	if err = o.verifyBucket(c, ns, name); err != nil {
+		return nil, "", "", err
+	}
 	return c, ns, name, nil
+}
+
+// verifyBucket checks that a bucket exists, at most once per bucket.
+//
+// The lock is held across the request on purpose. Under -m the first operation
+// on a bucket starts many workers at once, and releasing the lock before the
+// call would send all of them to the service for the same answer.
+func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket string) error {
+	key := ns + "/" + bucket
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err, known := o.buckets[key]; known {
+		return err
+	}
+
+	var err error
+	// GetBucket, not HeadBucket: a HEAD gives the same empty body the object
+	// calls do, so its 404 carries no code. GetBucket answers with
+	// BucketNotFound, which is worth having in the message.
+	if _, gerr := c.GetBucket(context.Background(), objectstorage.GetBucketRequest{
+		NamespaceName: &ns, BucketName: &bucket,
+	}); gerr != nil {
+		logger.Info(module, "cannot reach bucket oci://%s: %s", bucket, gerr)
+		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q: %w", bucket, ns, gerr)
+	}
+	if o.buckets == nil {
+		o.buckets = map[string]error{}
+	}
+	o.buckets[key] = err
+	return err
 }

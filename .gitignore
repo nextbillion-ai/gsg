@@ -8,7 +8,10 @@ build
 vendor
 gsg
 uat_temp
-uat
+# "uat" used to be here. It was added incidentally in 3e5a804, whose only other
+# change was to lib/object/object.go, and nothing builds an artefact by that
+# name -- but it matched the uat/ directory, so every OCI test case written
+# under uat/oci was silently untracked and invisible to review.
 _icw_
 
 # Test binary, built with `go test -c`
