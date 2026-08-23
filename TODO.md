@@ -31,7 +31,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 14 | PR #46 | yes -- 301 MovedPermanently across regions | fix, with 3 |
 | 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
 | 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
-| 17 | open | yes -- a 6-object promotion landed 1 object, exit 1 | fix, small |
+| 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1 | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 
@@ -633,6 +633,33 @@ dst  a%20b.txt -> "I am the SPACE key"      wrong object, exit 0, no error
 
 Rarer, since it needs both keys to exist, but it is why this is a correctness
 bug rather than an ergonomics one.
+
+**GCS is immune, verified by running the same case.** The identical key set
+copied gs -> gs landed 6 of 6 at exit 0, and `a%20b.txt` kept its own contents:
+
+| | s3 -> s3 | gs -> gs |
+|---|---|---|
+| 6-object tree with `+05:30`, `café`, `%20` | 1 landed, exit 1 | 6 landed, exit 0 |
+| `a%20b.txt` contents | wrong object, silently | correct |
+
+Two independent reasons. `GCS.Copy` passes the key as a typed value the client
+library encodes itself, so no string is assembled; and the GCS copy API takes
+source bucket and object as separate fields rather than one composite header.
+
+**This is the only such place in the s3 backend.** Every `Sprintf` and every
+non-trivial `aws.String(...)` in `s3/s3.go` was checked: `CopySource` here,
+`Range: bytes=%d-%d` (numbers only), and `prefix + match[1]` (a result string,
+not an API value). Everywhere else the key is a plain parameter the SDK encodes,
+which is why `ls`, `du`, `cat`, upload and download all handle these names
+fine. So an s3 -> s3 copy is the only unsafe operation, whether or not the two
+buckets differ.
+
+**Deferred (Aug 2026), repo owner's call:** s3 is not the current focus and the
+fix is not worth the effort right now. Nothing about the analysis is
+outstanding -- the mechanism, scope and blast radius are all recorded above, so
+picking this up later is just the encoding change plus tests. Worth doing before
+any campaign that moves data between s3 prefixes or buckets, since that is the
+one operation it breaks.
 
 Found while reviewing the region fix; independent of it.
 
