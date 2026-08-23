@@ -31,8 +31,8 @@ several are not worth fixing. The evidence is recorded under each one.
 | 14 | PR #46 | yes -- 301 MovedPermanently across regions | fix, with 3 |
 | 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
 | 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
-| 17 | open | yes -- keys with # or non-ascii silently fail to copy | fix, small |
-| 18 | open | yes -- measured: non-gsg objects re-download on every rsync | fix with 4's other half |
+| 17 | open | yes -- a 6-object promotion landed 1 object, exit 1 | fix, small |
+| 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
@@ -582,18 +582,57 @@ CopySource: aws.String(fmt.Sprintf("%v/%v", srcBucket, srcPrefix)),
 AWS requires that value URL-encoded. Unencoded, a key carrying a character
 that means something in a URL is misread, and the copy does not happen.
 
-**Reproduced** against real S3, copying each key from one prefix to another:
+S3 **URL-decodes** that header, so `+` becomes a space, `%20` becomes a space,
+and raw non-ascii is not valid in a header at all. S3 then looks up a key nobody
+wrote and truthfully reports it missing.
+
+**Re-reproduced after #46** (the earlier note here was wrong on two counts:
+`#` copies fine, and the failures are not silent -- they surface as NoSuchKey):
 
 ```
 "plain.txt"        landed: yes
 "with space.txt"   landed: yes
-"hash#tag.txt"     landed: NO
-"café.txt"         landed: NO
+"hash#tag.txt"     landed: yes   <- earlier note said no
+"café.txt"         landed: NO    NoSuchKey
+"plus+sign.txt"    landed: NO    NoSuchKey   <- + decodes to space
 ```
 
-No error surfaces at the gsg level, so the object simply is not there
-afterwards. `Copy` is what `cp` and `rsync` use between two cloud paths, so a
-tree containing such a name syncs incompletely.
+Scope: s3 -> s3 only, including within one bucket. Cross-cloud copies go through
+`interCloudCopy`, which downloads and re-uploads and never builds this header.
+`GCS.Copy` uses typed object handles, so it cannot have the bug.
+
+**What it costs, on a realistic tree.** Promoting a staging export to prod,
+where a Hive partition is named by an ISO timestamp -- IST puts `+05:30` in the
+key -- and a POI file has an accent:
+
+```
+exports/run=2026-08-23T02:00:00+05:30/{roads,places}.parquet, _SUCCESS
+poi/mumbai/café-leopold.json
+poi/mumbai/gateway-of-india.json
+poi/delhi/khan-market.json
+```
+
+`gsg -m cp -r` landed **1 of 6** and exited 1. The whole operator-visible output
+was one line: `NoSuchKey: The specified key does not exist` -- which does not
+name the key, and reads as a lie, since the key is plainly there in staging.
+
+Note the blast radius exceeds the bad keys: `gateway-of-india.json` is plain
+ascii and did not land either, because gsg aborts on the first error while the
+other copies are still in flight under `-m`. Which objects survive is a race.
+The destination is left partially written rather than empty or complete.
+
+**The silent variant.** If a key exists that is the URL-decoding of another key,
+S3 finds it and the copy succeeds with the wrong contents:
+
+```
+src  a%20b.txt -> "I am the LITERAL percent key"
+src  a b.txt   -> "I am the SPACE key"
+after cp -r:
+dst  a%20b.txt -> "I am the SPACE key"      wrong object, exit 0, no error
+```
+
+Rarer, since it needs both keys to exist, but it is why this is a correctness
+bug rather than an ergonomics one.
 
 Found while reviewing the region fix; independent of it.
 
@@ -678,6 +717,35 @@ single-part objects this is caller-fixable. Two caveats:
 So multipart objects will never have a whole-file CRC32C to compare, which is
 the argument for fixing `Same` rather than expecting callers to upload
 differently: without it those objects re-copy on every run forever.
+
+### What knowing "there is no checksum" would buy
+
+Presence tracking is not itself the fix; it is what makes a fallback
+expressible. Today `Same` has no choice to make. Three become available:
+
+1. **ETag/MD5.** Every S3 object has an ETag, and for a single-part upload it
+   is the MD5 of the content. `GetObjectAttributesOutput.ETag` is already
+   fetched and ignored, and `common.GetFileMD5` already exists. That covers the
+   `aws s3 cp` case with a real content comparison rather than a proxy.
+   Multipart ETags carry a `-N` suffix and are not MD5, so they are detectable
+   and excluded, the same way COMPOSITE is.
+2. **Size plus mtime.** Works because `Download` already stamps the local file
+   with the remote mtime, so after the first sync the two agree and the second
+   run reports no diff. This is the only option for multipart objects. Note
+   `Same` ignores mtime under `-v`, so it covers plain `rsync` only.
+3. **Saying so.** Two remote objects that both lack a checksum currently give
+   `0 == 0` and compare equal, so a cloud-to-cloud `rsync` treats two different
+   files as identical -- including under `-v`. With presence tracking that
+   becomes an MD5 comparison or an honest "cannot verify", never a silent pass.
+
+**Priority: low, decided by the repo owner (Aug 2026).** The re-download cost is
+real and recurring but it is wasted work, not a wrong answer, and the one
+genuine correctness case in (3) needs two checksum-less objects being compared
+against each other. Revisit if S3 rsync cost becomes visible, or if
+cloud-to-cloud `rsync -v` starts being relied on.
+
+If picked up, (2) and (3) are the mechanical part; (1) is a design decision that
+roughly doubles the change and can be a follow-up.
 
 ---
 
