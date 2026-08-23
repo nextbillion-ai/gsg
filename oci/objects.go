@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
@@ -37,6 +38,26 @@ func (o *OCI) walkObjects(bucketSpec, prefix string, recursive bool) ([]objectst
 	c, ns, bucket, err := o.resolve(bucketSpec)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// "some/dir" and "some/dir/" are different requests. Asked for the former
+	// with a delimiter, the service answers with one common prefix -- the
+	// directory itself -- rather than its contents, so `gsg ls oci://b/dir`
+	// would print just the directory it was asked about. The other two
+	// backends resolve this the same way: if the path is not an object, treat
+	// it as a directory and give the service the trailing slash it needs.
+	//
+	// Only when a delimiter is in play. A recursive listing wants every key
+	// under the prefix and a slash would exclude an object named exactly
+	// "some/dir".
+	if !recursive && prefix != "" && !strings.HasSuffix(prefix, "/") {
+		r, herr := o.headObject(bucketSpec, prefix)
+		if herr != nil {
+			return nil, nil, herr
+		}
+		if r == nil {
+			prefix = common.SetPrefixAsDirectory(prefix)
+		}
 	}
 
 	var (
@@ -112,11 +133,4 @@ func dedupePrefixes(in []string) []string {
 		out = append(out, p)
 	}
 	return out
-}
-
-// isDirectoryMarker reports whether a key is one of the zero-length "folder"
-// objects other tools create. They are an artefact of presenting a flat
-// keyspace as a tree, not files a user asked for.
-func isDirectoryMarker(name string) bool {
-	return strings.HasSuffix(name, "/")
 }
