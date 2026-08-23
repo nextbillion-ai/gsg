@@ -615,6 +615,46 @@ do_test() {
     finish
     fi
 
+    start "regression: a listing that spans more than one page"
+    # ListObjectsV2 returns at most 1000 keys per page. The loop used to stop
+    # when a page carried no Contents, which is wrong for a delimited listing:
+    # a page whose keys all collapsed into common prefixes has none, so a
+    # prefix with more than a page of subdirectories stopped after the first
+    # and the rest went missing with no error. Measured on main: 1000 of 1005.
+    #
+    # s3 only. The gs backend hands pagination to the client's iterator and
+    # already returns all of them; uploading a second 1005 object fixture to
+    # prove that costs minutes and shows nothing new.
+    if [[ "$mode" != "s3" ]]
+    then
+        echo "SKIP: gs paginates through its client iterator and was never affected"
+        finish
+    else
+    fpage="folder_paged"
+    mkdir -p $fpage
+    i=1
+    while [[ $i -le 1005 ]]
+    do
+        d=$fpage/$(printf 'd%04d' $i)
+        mkdir -p "$d" && printf 'x' > "$d/f.txt"
+        i=$((i + 1))
+    done
+    # Uploaded with the provider CLI rather than gsg: it parallelises well, and
+    # the point of the case is what gsg reads back, not how it got there.
+    aws s3 cp --recursive --quiet $fpage "$remote_base/$fpage/" >/dev/null 2>&1
+    assertEq "the provider really has 1005 subdirectories" \
+        "$(aws s3 ls "$remote_base/$fpage/" | grep -c PRE)" "1005"
+    assertEq "ls without -r returns every one of them" \
+        "$(../gsg ls $remote_base/$fpage 2>/dev/null | wc -l | tr -d ' ')" "1005"
+    assertEq "ls -r returns every object" \
+        "$(../gsg ls -r $remote_base/$fpage 2>/dev/null | wc -l | tr -d ' ')" "1005"
+    assertEq "du -s totals all of them" \
+        "$(../gsg du -s $remote_base/$fpage 2>/dev/null | awk '{print $1}')" "1005"
+    aws s3 rm "$remote_base/$fpage" --recursive --quiet >/dev/null 2>&1
+    rm -rf $fpage
+    finish
+    fi
+
     start "regression: cat returns exact content"
     assertEq "cat direct.txt" "$(../gsg cat $remote_base/$fdu/direct.txt 2>/dev/null)" "0123456789"
     finish
