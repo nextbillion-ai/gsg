@@ -34,6 +34,14 @@ func (o *OCI) clientAndNamespace(bucketSpec string) (*objectstorage.ObjectStorag
 			return nil, "", fmt.Errorf("oci: cannot build client: %w", err)
 		}
 		o.client = &c
+		// Region comes from the same provider as the credentials. A copy needs
+		// it on every request, so reading it once here avoids re-parsing the
+		// config file per object.
+		if reg, rerr := p.Region(); rerr == nil {
+			o.region = reg
+		} else {
+			logger.Debug(module, "cannot read region from config: %s", rerr)
+		}
 	}
 
 	// An explicit namespace needs no lookup, and must not overwrite the cached
