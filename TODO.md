@@ -34,6 +34,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1 | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
+| 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -800,3 +801,35 @@ uploads too, so the two interact.
 threshold and handles the part bookkeeping. Set `ChecksumAlgorithm` on it as
 the single-PUT path now does, and pair it with item 18 so a COMPOSITE result
 reads as "no comparable checksum" rather than as a mismatch.
+
+---
+
+## 20. A command that fails on a backend error can exit in silence
+
+The command layer discards the error it was given. `cmd/ls.go` is the clearest
+case:
+
+```go
+if objs, err = fo.System.List(fo.Bucket, fo.Prefix, isRec); err != nil {
+    common.Exit()
+}
+```
+
+`common.Exit` is a bare `os.Exit(1)`, so nothing is printed. There are 21 sites
+in `cmd/` that discard an error this way, and none of them log it first.
+
+Today this is mostly hidden, because gs and s3 log inside the calls their `List`
+makes -- so an error usually has been reported by the time it reaches here, by
+something further down. It is luck rather than design: any backend error that
+was not logged deeper produces exit 1 and an empty screen.
+
+**Found while adding the OCI skeleton**, whose stubs return an error without
+making any lower-level call that could log it. `gsg ls oci://bucket/` exited 1
+and printed nothing at all. The skeleton works around it by logging inside
+`errNotImplemented`, which is why that helper logs as well as returning.
+
+**Fix:** log the error at the point it is discarded, or -- better, since it is
+21 sites -- give `common.Exit` an error-taking form (`common.ExitWith(err)`)
+that reports before exiting, and convert the sites to it. Worth doing before
+the OCI backend is finished, so its real operations do not each need the same
+workaround the stubs use.

@@ -162,7 +162,7 @@ func ParseFileObject(path string) *FileObject {
 		logger.Debug("parse", "failed with %s", err)
 		return nil
 	}
-	// from gcs or s3
+	// from gcs, s3 or oci
 	if len(u.Scheme) > 0 {
 		system, ok := _systems[u.Scheme]
 		if !ok {
@@ -170,9 +170,19 @@ func ParseFileObject(path string) *FileObject {
 			common.Exit()
 		}
 		if ok {
+			// A path may name the authority as user@host. OCI uses that to
+			// carry an explicit namespace -- oci://bucket@namespace/x -- and
+			// keeping the two joined lets Bucket stay a single opaque string
+			// that only the backend concerned has to interpret. It also
+			// round-trips: GetFullPath reassembles the path it came from.
+			// gs and s3 never produce this form, so they are unaffected.
+			bucket := u.Host
+			if u.User != nil {
+				bucket = u.User.Username() + "@" + u.Host
+			}
 			fo := &FileObject{
 				System: system,
-				Bucket: u.Host,
+				Bucket: bucket,
 				Prefix: strings.TrimLeft(u.Path, "/"),
 				Remote: true,
 			}

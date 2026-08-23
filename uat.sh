@@ -45,6 +45,28 @@ assertValue() {
                 exit 1
             fi
             ;;
+        oci)
+            # $remote_base is oci://<bucket>/<testid>, so the object name is
+            # everything after the bucket. head is the cheapest existence
+            # check; get --file - streams the body to stdout.
+            if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                --name "$testid/$1" >/dev/null 2>&1
+            then
+                content="$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                    --name "$testid/$1" --file - 2>/dev/null)"
+                if [[ "$content" == "$2" ]]
+                then
+                    echo OK: $1 exists with correct content remotely.
+                else
+                    echo FATAL: required file $1 does not have correct content remotely.
+                    echo "  wanted [$2] got [$content]"
+                    exit 1
+                fi
+            else
+                echo FATAL: required file $1 does not exists remotely.
+                exit 1
+            fi
+            ;;
         s3)
             if aws s3 cp "$remote_base/$1" .temp &>/dev/null
             then
@@ -103,6 +125,28 @@ assert() {
                 exit 1
             fi
             ;;
+        oci)
+            # $remote_base is oci://<bucket>/<testid>, so the object name is
+            # everything after the bucket. head is the cheapest existence
+            # check; get --file - streams the body to stdout.
+            if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                --name "$testid/$1" >/dev/null 2>&1
+            then
+                content="$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                    --name "$testid/$1" --file - 2>/dev/null)"
+                if [[ "$content" == "$testid" ]]
+                then
+                    echo OK: $1 exists with correct content remotely.
+                else
+                    echo FATAL: required file $1 does not have correct content remotely.
+                    echo "  wanted [$testid] got [$content]"
+                    exit 1
+                fi
+            else
+                echo FATAL: required file $1 does not exists remotely.
+                exit 1
+            fi
+            ;;
         s3)
             if aws s3 cp "$remote_base/$1" .temp &>/dev/null
             then
@@ -147,6 +191,16 @@ assert_not() {
         case $mode in
         gs)
             if gsutil ls "$remote_base/$1" &>/dev/null
+            then
+                echo FATAL: required file $1 does exists remotely.
+                exit 1
+            else
+                echo OK: required file $1 does not exists remotely.
+            fi
+            ;;
+        oci)
+            if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                --name "$testid/$1" >/dev/null 2>&1
             then
                 echo FATAL: required file $1 does exists remotely.
                 exit 1
@@ -1032,11 +1086,104 @@ do_test() {
     finish "everything OK with $mode !"
 }
 
+# do_test_oci runs the OCI cases.
+#
+# It is deliberately separate from do_test rather than another branch inside
+# it. The OCI backend is being built one operation per pull request, and if
+# every one of those appended to the shared body they would all conflict at the
+# same anchor -- which is exactly what happened while landing #45, #46 and #47.
+# Instead each case lives in its own file under uat/oci, so a pull request adds
+# a file and touches nothing another one touches.
+#
+# Files are sourced in name order, so the NN- prefix decides sequencing when a
+# later case depends on an earlier one. They run inside $testbase with
+# $remote_base already set, and may use every helper defined above.
+do_test_oci() {
+    mode=oci
+    oci_bucket="${GSG_UAT_OCI_BUCKET:-nb-oci-sin-test}"
+    remote_base="oci://$oci_bucket/$testid"
+
+    # A run that cannot reach OCI has not tested OCI. Saying "everything OK"
+    # here would be a false green on the one target whose whole purpose is to
+    # exercise this backend, so an explicit `uat.sh oci` fails instead.
+    if ! oci_ns=$(oci os ns get --query data --raw-output 2>/dev/null) || [[ -z "$oci_ns" ]]
+    then
+        if [[ "$target" == "oci" ]]
+        then
+            echo "FATAL: oci mode needs a working ~/.oci/config -- could not resolve the namespace"
+            exit 1
+        fi
+        echo "skipping oci: could not resolve the namespace from ~/.oci/config"
+        return 0
+    fi
+
+    trap 'code=$?; if [[ $code -ne 0 ]]; then
+        echo
+        echo "test data left behind for inspection at: $remote_base"
+        echo "remove it with: oci os object bulk-delete --namespace '"$oci_ns"' \\"
+        echo "                  --bucket-name '"$oci_bucket"' --prefix '"$testid"' --force"
+    fi' EXIT
+
+    start "prepare test ground for mode: oci (namespace $oci_ns, bucket $oci_bucket)"
+    rm -rf uat_temp || true
+    testbase="uat_temp"
+    mkdir $testbase
+    finish
+
+    start "entering $testbase"
+    pushd $testbase
+    finish
+
+    ran=0
+    for caseFile in "$repoRoot"/uat/oci/*.sh
+    do
+        [[ -e "$caseFile" ]] || continue
+        # shellcheck source=/dev/null
+        source "$caseFile"
+        ran=$((ran + 1))
+    done
+    if [[ $ran -eq 0 ]]
+    then
+        # Same reasoning: an explicit oci run that executed no case at all must
+        # not print "everything OK". While the backend is a skeleton that is
+        # the expected state, so it is reported rather than treated as failure,
+        # but the wording must never suggest anything was verified.
+        echo "note: no case files in uat/oci yet -- nothing was verified"
+    fi
+
+    start "leaving $testbase"
+    popd
+    finish
+
+    start "cleanup test ground"
+    rm -rf uat_temp || true
+    cleaned=true
+    oci os object bulk-delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
+    if [[ "$cleaned" != "true" ]]
+    then
+        echo "WARNING: could not remove $remote_base -- objects may still be there"
+    fi
+    finish
+
+    trap - EXIT
+    if [[ $ran -eq 0 ]]
+    then
+        finish "oci harness ran, but there are no cases yet -- nothing verified"
+    else
+        finish "everything OK with oci ($ran case file(s)) !"
+    fi
+}
+
 usage() {
-    echo "usage: $0 [gs|s3|all]    (default: all)"
+    echo "usage: $0 [gs|s3|oci|all]    (default: all)"
     echo
     echo "  gs   requires gsutil and GOOGLE_APPLICATION_CREDENTIALS"
     echo "  s3   requires the aws cli and its credentials"
+    echo "  oci  requires the oci cli and ~/.oci/config"
+    echo
+    echo "OCI cases live one per file in uat/oci and are sourced in name"
+    echo "order. Override the bucket with GSG_UAT_OCI_BUCKET."
     echo
     echo "Objects are written under <scheme>://gsg-uat/<timestamp> and that"
     echo "prefix is removed at the end."
@@ -1059,9 +1206,13 @@ requireTool() {
 
 target="${1:-all}"
 case "$target" in
-gs|s3|all) ;;
+gs|s3|oci|all) ;;
 *) usage ;;
 esac
+
+# Case files under uat/oci are sourced by absolute path: do_test_oci runs from
+# inside $testbase, so a relative path would not resolve.
+repoRoot="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 start "building gsg binary"
 # GSG_UAT_RACE=1 builds with the race detector and makes any data race abort
@@ -1089,4 +1240,22 @@ if [[ "$target" == "s3" || "$target" == "all" ]]
 then
     requireTool aws s3
     do_test s3
+fi
+
+if [[ "$target" == "oci" || "$target" == "all" ]]
+then
+    # Only a run that explicitly asked for oci may demand the cli. Adding it to
+    # the "all" default would break every machine that runs the suite for gs
+    # and s3 today and has no reason to have the oci cli installed.
+    if ! command -v oci &>/dev/null
+    then
+        if [[ "$target" == "oci" ]]
+        then
+            echo "FATAL: oci is required for mode oci but is not installed"
+            exit 1
+        fi
+        echo "skipping oci: the oci cli is not installed"
+    else
+        do_test_oci
+    fi
 fi
