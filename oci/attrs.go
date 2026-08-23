@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"time"
 
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
@@ -110,6 +111,27 @@ func crc32cOf(b64 *string) (uint32, bool) {
 	return binary.BigEndian.Uint32(raw), true
 }
 
+// modTime normalises a timestamp to whole seconds.
+//
+// OCI reports an object's modification time at two different precisions
+// depending on how it is asked. A listing carries JSON timestamps with
+// milliseconds; a HEAD carries the last-modified HTTP header, which is RFC
+// 1123 and has only seconds. Download sets the local file's mtime from the
+// HEAD, so the same object read two ways differed by a fraction of a second:
+//
+//	remote (listing) 07:35:02.81 +0000
+//	local  (head)    07:35:02.00 +0000
+//
+// Attrs.Same compares instants, so every object looked modified and rsync
+// re-copied the whole tree on every run -- the same end result as the s3
+// checksum bug in #47, from an unrelated cause. Truncating both sides to the
+// precision the weaker source can carry is what makes them comparable; a
+// local filesystem cannot round-trip more than this from an HTTP header
+// anyway.
+func modTime(t time.Time) time.Time {
+	return t.Truncate(time.Second)
+}
+
 // Attributes returns size, mtime and checksum for one object, or (nil, nil) if
 // there is no such object.
 func (o *OCI) Attributes(bucket, prefix string) (*system.Attrs, error) {
@@ -122,7 +144,7 @@ func (o *OCI) Attributes(bucket, prefix string) (*system.Attrs, error) {
 		a.Size = *r.ContentLength
 	}
 	if r.LastModified != nil {
-		a.ModTime = r.LastModified.Time
+		a.ModTime = modTime(r.LastModified.Time)
 	}
 	var stored bool
 	if a.CRC32, stored = crc32cOf(r.OpcContentCrc32c); !stored {
@@ -165,9 +187,9 @@ func (o *OCI) summaryToAttrs(bucketSpec string, s objectstorage.ObjectSummary) *
 	// creation time, and an mtime of zero would make every comparison that
 	// looks at it fail.
 	if s.TimeModified != nil {
-		a.ModTime = s.TimeModified.Time
+		a.ModTime = modTime(s.TimeModified.Time)
 	} else if s.TimeCreated != nil {
-		a.ModTime = s.TimeCreated.Time
+		a.ModTime = modTime(s.TimeCreated.Time)
 	}
 	if s.Name != nil {
 		name := *s.Name
