@@ -32,7 +32,8 @@ several are not worth fixing. The evidence is recorded under each one.
 | 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
 | 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
 | 17 | open | yes -- keys with # or non-ascii silently fail to copy | fix, small |
-| 18 | open | yes -- two checksum-less objects compare equal | fix with 4's other half |
+| 18 | open | yes -- measured: non-gsg objects re-download on every rsync | fix with 4's other half |
+| 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -626,3 +627,81 @@ run.
 rather than comparing zeroes. This is the same shape as the other half of item
 4, where `GetFileCRC32C` has no way to say it could not compute one, so the two
 are worth doing together.
+
+### Measured after #47, against a real bucket
+
+Three objects of identical content in one prefix, differing only in who wrote
+them, then `rsync -r` run three times into the same local directory:
+
+| object written by | checksum S3 holds | re-downloaded every run |
+|---|---|---|
+| `gsg cp` | `CRC32C`, FULL_OBJECT | no |
+| `aws s3 cp` | none | **yes** |
+| multipart, 12 MB | none, 2 parts | **yes** |
+
+Stable on runs 2 and 3, so it is permanent rather than a warm-up effect. #47
+therefore makes `rsync` incremental only for objects gsg itself uploaded; for a
+bucket populated by anything else, every run still transfers everything. That
+is still strictly better than before #47, where every S3 object read back as 0
+and so nothing was ever incremental.
+
+`-v` handles the same case correctly -- it logs `no CRC32C stored` and skips --
+so the gap is specifically in `Same`, not in the verification path.
+
+### Where the missing checksums come from (not a gsg defect)
+
+Worth recording because it decides how much of item 18 is gsg's to fix. S3 does
+not compute checksums on its own; it stores what the uploader sends. Measured
+with `aws-cli/2.15.30`:
+
+| upload method | stores CRC32C? |
+|---|---|
+| `aws s3 cp` | no |
+| `aws s3 cp` with `AWS_REQUEST_CHECKSUM_CALCULATION=when_supported` | no -- setting postdates this CLI |
+| `aws s3api put-object --checksum-algorithm CRC32C` | yes |
+
+With the explicit flag, a second `rsync` does report `No diff detected`, so for
+single-part objects this is caller-fixable. Two caveats:
+
+- `aws s3 cp` on 2.15.30 has no checksum flag at all; only `s3api` does. CLI
+  v2.23+ (Jan 2025) adds one and defaults to `when_supported` -- but that
+  default computes **CRC32, not CRC32C**, which gsg cannot use either. The
+  explicit `--checksum-algorithm CRC32C` is needed regardless of version.
+- Multipart cannot be fixed this way. A multipart upload with CRC32C on every
+  part stored `jDbzjw==` while the file's whole-file CRC32C is `SxGpLQ==` --
+  a checksum of the part checksums, for identical bytes. gsg reads
+  `ChecksumType="COMPOSITE"` and correctly declines to compare. AWS added
+  full-object multipart checksums in Jan 2025, but `create-multipart-upload`
+  on this CLI has no `--checksum-type` flag, so on 2.15.30 a multipart object
+  cannot carry a comparable checksum at all.
+
+So multipart objects will never have a whole-file CRC32C to compare, which is
+the argument for fixing `Same` rather than expecting callers to upload
+differently: without it those objects re-copy on every run forever.
+
+---
+
+## 19. An S3 upload is a single PutObject, so >5 GB fails and nothing resumes
+
+`S3.Upload` and `S3.PutObject` in `s3/s3.go` both send the whole file as one
+`PutObject` body. There is no `manager.Uploader` anywhere in the tree, so gsg
+never uploads multipart.
+
+Two consequences. S3 caps a single `PutObject` at 5 GB, so a larger file cannot
+be uploaded at all -- the API rejects it. And because the transfer is one
+request with no part boundaries, a network failure partway through a large
+upload restarts from zero rather than resuming.
+
+Not reproduced: confirming the first would mean pushing a >5 GB object, which
+costs real transfer and storage. It is a documented S3 limit rather than an
+inference, but it has not been observed here.
+
+Note this is also why every gsg-written object is FULL_OBJECT and therefore
+always has a comparable checksum -- the single-PUT path is what makes item 4's
+fix work. Adding multipart would mean handling COMPOSITE checksums on gsg's own
+uploads too, so the two interact.
+
+**Fix:** use `feature/s3/manager.Uploader`, which switches to multipart above a
+threshold and handles the part bookkeeping. Set `ChecksumAlgorithm` on it as
+the single-PUT path now does, and pair it with item 18 so a COMPOSITE result
+reads as "no comparable checksum" rather than as a mismatch.
