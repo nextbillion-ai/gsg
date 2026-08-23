@@ -1032,11 +1032,87 @@ do_test() {
     finish "everything OK with $mode !"
 }
 
+# do_test_oci runs the OCI cases.
+#
+# It is deliberately separate from do_test rather than another branch inside
+# it. The OCI backend is being built one operation per pull request, and if
+# every one of those appended to the shared body they would all conflict at the
+# same anchor -- which is exactly what happened while landing #45, #46 and #47.
+# Instead each case lives in its own file under uat/oci, so a pull request adds
+# a file and touches nothing another one touches.
+#
+# Files are sourced in name order, so the NN- prefix decides sequencing when a
+# later case depends on an earlier one. They run inside $testbase with
+# $remote_base already set, and may use every helper defined above.
+do_test_oci() {
+    mode=oci
+    oci_bucket="${GSG_UAT_OCI_BUCKET:-nb-oci-sin-test}"
+    remote_base="oci://$oci_bucket/$testid"
+
+    if ! oci_ns=$(oci os ns get --query data --raw-output 2>/dev/null) || [[ -z "$oci_ns" ]]
+    then
+        echo "SKIP: oci mode needs a working ~/.oci/config -- could not resolve the namespace"
+        return 0
+    fi
+
+    trap 'code=$?; if [[ $code -ne 0 ]]; then
+        echo
+        echo "test data left behind for inspection at: $remote_base"
+        echo "remove it with: oci os object bulk-delete --namespace '"$oci_ns"' \\"
+        echo "                  --bucket-name '"$oci_bucket"' --prefix '"$testid"' --force"
+    fi' EXIT
+
+    start "prepare test ground for mode: oci (namespace $oci_ns, bucket $oci_bucket)"
+    rm -rf uat_temp || true
+    testbase="uat_temp"
+    mkdir $testbase
+    finish
+
+    start "entering $testbase"
+    pushd $testbase
+    finish
+
+    ran=0
+    for caseFile in "$repoRoot"/uat/oci/*.sh
+    do
+        [[ -e "$caseFile" ]] || continue
+        # shellcheck source=/dev/null
+        source "$caseFile"
+        ran=$((ran + 1))
+    done
+    if [[ $ran -eq 0 ]]
+    then
+        echo "note: no case files in uat/oci yet -- the backend is still a skeleton"
+    fi
+
+    start "leaving $testbase"
+    popd
+    finish
+
+    start "cleanup test ground"
+    rm -rf uat_temp || true
+    cleaned=true
+    oci os object bulk-delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
+    if [[ "$cleaned" != "true" ]]
+    then
+        echo "WARNING: could not remove $remote_base -- objects may still be there"
+    fi
+    finish
+
+    trap - EXIT
+    finish "everything OK with oci !"
+}
+
 usage() {
-    echo "usage: $0 [gs|s3|all]    (default: all)"
+    echo "usage: $0 [gs|s3|oci|all]    (default: all)"
     echo
     echo "  gs   requires gsutil and GOOGLE_APPLICATION_CREDENTIALS"
     echo "  s3   requires the aws cli and its credentials"
+    echo "  oci  requires the oci cli and ~/.oci/config"
+    echo
+    echo "OCI cases live one per file in uat/oci and are sourced in name"
+    echo "order. Override the bucket with GSG_UAT_OCI_BUCKET."
     echo
     echo "Objects are written under <scheme>://gsg-uat/<timestamp> and that"
     echo "prefix is removed at the end."
@@ -1059,9 +1135,13 @@ requireTool() {
 
 target="${1:-all}"
 case "$target" in
-gs|s3|all) ;;
+gs|s3|oci|all) ;;
 *) usage ;;
 esac
+
+# Case files under uat/oci are sourced by absolute path: do_test_oci runs from
+# inside $testbase, so a relative path would not resolve.
+repoRoot="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 start "building gsg binary"
 # GSG_UAT_RACE=1 builds with the race detector and makes any data race abort
@@ -1089,4 +1169,10 @@ if [[ "$target" == "s3" || "$target" == "all" ]]
 then
     requireTool aws s3
     do_test s3
+fi
+
+if [[ "$target" == "oci" || "$target" == "all" ]]
+then
+    requireTool oci oci
+    do_test_oci
 fi
