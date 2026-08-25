@@ -35,6 +35,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 | 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
+| 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -833,3 +834,42 @@ and printed nothing at all. The skeleton works around it by logging inside
 that reports before exiting, and convert the sites to it. Worth doing before
 the OCI backend is finished, so its real operations do not each need the same
 workaround the stubs use.
+
+---
+
+## 21. Moving an object onto itself deletes it, on gs
+
+`gsg mv` does not call `System.Move`. `cmd/mv.go` copies and then deletes the
+source itself:
+
+```go
+doCopy(src, dst, true, isRec)
+...
+case system.FileType_Object:
+    if err = src.System.Delete(src.Bucket, src.Prefix); err != nil {
+```
+
+So whether a self-move destroys the object depends entirely on whether that
+backend's `Copy` fails when the source and destination are the same. Measured,
+one object per backend, `gsg mv <path> <same path>`:
+
+| backend | outcome |
+|---|---|
+| s3 | survives -- AWS rejects a copy onto itself, so the command exits before the delete |
+| **gs** | **object is gone** |
+| oci | survives -- `Copy` refuses a self-copy for exactly this reason |
+
+The gs case is data loss from a plausible typo, and nothing warns. It is luck
+rather than design that s3 escapes: AWS happens to reject the request, and the
+`Delete` that follows is unconditional in both.
+
+Found while building the OCI backend, where the same shape was reachable a
+second way: `oci://b/k` and `oci://b@namespace/k` are one object with two
+spellings, so a raw string comparison of source and destination misses it. That
+one is fixed in the OCI backend.
+
+**Fix:** `cmd/mv.go` should not delete when the source and destination resolve
+to the same object -- once, in the command, rather than relying on each
+backend's `Copy` to fail. Comparing raw strings is not enough where a backend
+has more than one spelling for a path. A guard in `GCS.Copy` would close the
+measured case, but the command-level fix is the one that covers every backend.
