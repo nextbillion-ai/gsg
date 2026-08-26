@@ -60,6 +60,14 @@ func (o *OCI) clientAndNamespace(bucketSpec string) (*objectstorage.ObjectStorag
 
 // resolve is the form every operation wants: the client, the namespace, and
 // the bucket name with any "@namespace" suffix already stripped off.
+//
+// It also establishes that the bucket exists, once. That matters for what a
+// 404 on an object means: a HEAD has no response body, so the SDK reports a
+// missing object, a missing bucket and a missing namespace identically, and
+// the three cannot be told apart from the reply alone. Knowing the bucket is
+// there beforehand is what makes a later 404 mean "no such object" -- so
+// headObject does not have to ask about the bucket every time one is missing,
+// which over a large listing would be a bucket lookup per absent object.
 func (o *OCI) resolve(bucketSpec string) (*objectstorage.ObjectStorageClient, string, string, error) {
 	c, ns, err := o.clientAndNamespace(bucketSpec)
 	if err != nil {
@@ -69,5 +77,57 @@ func (o *OCI) resolve(bucketSpec string) (*objectstorage.ObjectStorageClient, st
 	if name == "" {
 		return nil, "", "", fmt.Errorf("oci: no bucket given")
 	}
+	if err = o.verifyBucket(c, ns, name); err != nil {
+		return nil, "", "", err
+	}
 	return c, ns, name, nil
+}
+
+// verifyBucket checks that a bucket exists, at most once per bucket.
+func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket string) error {
+	return o.verifyBucketWith(ns, bucket, func() error {
+		// GetBucket, not HeadBucket: a HEAD gives the same empty body the
+		// object calls do, so its 404 carries no code. GetBucket answers with
+		// BucketNotFound, which is worth having in the message.
+		_, err := c.GetBucket(context.Background(), objectstorage.GetBucketRequest{
+			NamespaceName: &ns, BucketName: &bucket,
+		})
+		return err
+	})
+}
+
+// verifyBucketWith is verifyBucket with the request itself supplied, so that
+// what gets remembered and what does not can be tested without a live service.
+//
+// The lock is held across the check on purpose. Under -m the first operation
+// on a bucket starts many workers at once, and releasing the lock before the
+// call would send all of them to the service for the same answer.
+func (o *OCI) verifyBucketWith(ns, bucket string, check func() error) error {
+	key := ns + "/" + bucket
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err, known := o.buckets[key]; known {
+		return err
+	}
+
+	var err error
+	if cerr := check(); cerr != nil {
+		logger.Info(module, "cannot reach bucket oci://%s: %s", bucket, cerr)
+		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q: %w", bucket, ns, cerr)
+		// Only a definite answer is worth remembering. A throttle, a 5xx or a
+		// dropped connection says nothing about whether the bucket exists, and
+		// caching it would make the first unlucky moment of a run permanent:
+		// common.DoWithRetrySimple would retry, get the remembered error back
+		// without a request, and fail every time. So transient failures are
+		// returned and forgotten, and the next attempt asks again.
+		if !isNotFound(cerr) {
+			return err
+		}
+	}
+	if o.buckets == nil {
+		o.buckets = map[string]error{}
+	}
+	o.buckets[key] = err
+	return err
 }

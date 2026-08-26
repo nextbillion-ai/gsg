@@ -66,6 +66,12 @@ type OCI struct {
 	mu        sync.Mutex
 	client    *objectstorage.ObjectStorageClient
 	namespace string
+	// buckets remembers the outcome of checking that a bucket exists, keyed
+	// by "namespace/bucket". Existence is a property of the bucket, not of
+	// each object in it, so it is established once and reused -- the same
+	// shape as the s3 backend, where clientFor resolves a bucket's region
+	// once and caches the client.
+	buckets map[string]error
 }
 
 // Scheme returns the URL scheme this backend answers to.
