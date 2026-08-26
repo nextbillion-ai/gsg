@@ -66,6 +66,10 @@ type OCI struct {
 	mu        sync.Mutex
 	client    *objectstorage.ObjectStorageClient
 	namespace string
+	// region is what the configured tenancy is talking to. CopyObject makes
+	// the destination region mandatory even when it is the same one, so it is
+	// resolved with the client rather than per call.
+	region string
 	// buckets remembers the outcome of checking that a bucket exists, keyed
 	// by "namespace/bucket". Existence is a property of the bucket, not of
 	// each object in it, so it is established once and reused -- the same
