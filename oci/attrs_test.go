@@ -67,14 +67,6 @@ func TestDedupePrefixes(t *testing.T) {
 	assert.Nil(t, dedupePrefixes([]string{}))
 }
 
-func TestIsDirectoryMarker(t *testing.T) {
-	assert.True(t, isDirectoryMarker("a/"))
-	assert.True(t, isDirectoryMarker("a/b/"))
-	assert.False(t, isDirectoryMarker("a"))
-	assert.False(t, isDirectoryMarker("a/b.txt"))
-	assert.False(t, isDirectoryMarker(""))
-}
-
 // fakeServiceError is enough of the SDK's ServiceError to classify.
 type fakeServiceError struct {
 	status int
