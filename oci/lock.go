@@ -59,15 +59,24 @@ func (o *OCI) DoAttemptLock(bucket, object string, ttl time.Duration) (string, e
 		NamespaceName: &ns, BucketName: &name, ObjectName: &object,
 	})
 	if herr == nil {
-		if head.LastModified != nil && !head.LastModified.Time.Add(ttl).Before(time.Now()) {
+		// Both fields are required to proceed, and their absence means lose
+		// rather than take. Without LastModified there is no way to tell an
+		// expired lock from a held one, and treating it as expired would clear
+		// somebody's live lock. Without an ETag the delete below could not be
+		// conditional, so it would remove whatever is there -- including a
+		// fresh lock somebody acquired between this head and that delete.
+		if head.LastModified == nil || head.ETag == nil {
+			logger.Info(module, "DoAttemptLock: oci://%s/%s exists but reports no %s; treating it as held",
+				name, object, map[bool]string{true: "modification time", false: "ETag"}[head.LastModified == nil])
+			return "", fmt.Errorf("lock already exists and not expired")
+		}
+		if !head.LastModified.Time.Add(ttl).Before(time.Now()) {
 			return "", fmt.Errorf("lock already exists and not expired")
 		}
 		logger.Debug(module, "DoAttemptLock: clearing an expired lock")
 		del := objectstorage.DeleteObjectRequest{
 			NamespaceName: &ns, BucketName: &name, ObjectName: &object,
-		}
-		if head.ETag != nil {
-			del.IfMatch = head.ETag
+			IfMatch: head.ETag,
 		}
 		if _, derr := c.DeleteObject(context.Background(), del); derr != nil {
 			// Somebody else cleared or replaced it first. Theirs now.
@@ -139,6 +148,12 @@ func (o *OCI) AttemptLock(bucket, object string, ttl time.Duration) error {
 	logger.Debug(module, "AttemptLock: storing ETag: %s", etag)
 	if err = common.WriteFileAtomic(lockReceiptPath(bucket, object), []byte(etag), lockCachePerm); err != nil {
 		logger.Info(module, "AttemptLock: cache lock ETag failed: %s", err)
+		// The lock exists remotely but nothing local can prove it is ours, so
+		// nothing will ever release it and everyone else waits out the TTL.
+		// Give it back while the ETag is still in hand.
+		if rerr := o.DoAttemptUnlock(bucket, object, etag); rerr != nil {
+			logger.Info(module, "AttemptLock: could not release the lock it just took: %s", rerr)
+		}
 		return err
 	}
 	return nil
@@ -155,11 +170,19 @@ func (o *OCI) AttemptUnLock(bucket, object string) error {
 	path := lockReceiptPath(bucket, object)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		// Said out loud rather than logged at debug. The exit code stays 0 to
-		// match gs, s3 and linux, which all treat a missing receipt as nothing
-		// to do -- but if the lock object is in fact still there, held by
-		// someone else or by an earlier run of ours, "unlocked" is a
-		// misleading thing for silence to imply.
+		if !os.IsNotExist(err) {
+			// The receipt is there and unreadable -- a permission problem, a
+			// directory in its place, a failing disk. That is not "nothing to
+			// unlock": a lock may well be held and this is the only thing that
+			// could have released it.
+			logger.Info(module, "cannot read the receipt for oci://%s/%s at %s: %s", bucket, object, path, err)
+			return fmt.Errorf("cannot release the lock on oci://%s/%s: its receipt at %s cannot be read: %w", bucket, object, path, err)
+		}
+		// Genuinely absent. The exit code stays 0 to match gs, s3 and linux,
+		// which all treat that as nothing to do -- but said out loud rather
+		// than at debug, because if the lock object is still there, held by
+		// someone else or by an earlier run, "unlocked" is a misleading thing
+		// for silence to imply.
 		logger.Info(module, "no receipt for oci://%s/%s at %s: nothing was released", bucket, object, path)
 		return nil
 	}
@@ -168,11 +191,12 @@ func (o *OCI) AttemptUnLock(bucket, object string) error {
 		logger.Debug(module, "AttemptUnLock: %s", err)
 		return err
 	}
-	// The receipt has served its purpose and naming a released lock is
-	// misleading. Failing to remove it is not fatal: the next acquisition
-	// replaces it atomically.
-	if rerr := os.Remove(path); rerr != nil {
-		logger.Debug(module, "AttemptUnLock: could not remove %s: %s", path, rerr)
-	}
+	// The receipt is deliberately left in place, as gs and s3 leave theirs.
+	// Removing it looks tidier and is a race: between the delete above and the
+	// remove, another process can acquire the lock and write its own receipt
+	// over this path, and removing it would strand that lock -- its holder
+	// would later find no receipt, exit 0, and release nothing. A stale
+	// receipt is harmless by comparison: the next acquisition replaces it
+	// atomically, and an unlock using it is refused by if-match.
 	return nil
 }

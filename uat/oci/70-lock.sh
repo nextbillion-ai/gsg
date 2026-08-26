@@ -61,12 +61,19 @@ assertEq "exactly one of eight contenders wins" "$winners" "1"
 
 finish
 
-start "lock: unlock must not release a lock someone else now holds"
+start "lock: a receipt from an earlier holder cannot release the current lock"
 
 # The defect #44 fixed on s3: unlock deleted whichever lock was present, so a
 # caller whose own lock had expired would release the one another process had
-# since acquired. Both use the same short ttl, because expiry is judged as
-# LastModified + the ttl the *acquirer* asks for.
+# since acquired.
+#
+# A and B here stand in for two machines. The receipt is copied aside and back
+# because on ONE machine both share the same /tmp path, so A would simply read
+# B's receipt -- see the case below, and TODO item 24. What this pins is the
+# remote guarantee: an if-match carrying an old ETag is refused.
+#
+# Both use the same short ttl, because expiry is judged as LastModified plus
+# the ttl the *acquirer* asks for.
 sk="$testid/lock/steal.lock"
 rcpt="$(oci_receipt "$sk")"
 rm -f "$rcpt"
@@ -95,6 +102,31 @@ assertEq "and B's lock survived" \
 cp receiptB "$rcpt"
 assertOk "B can still release its own" ../gsg unlock "oci://$oci_bucket/$sk"
 rm -f receiptA receiptB
+
+finish
+
+start "lock: on one machine the receipt is shared, and that is a known hole"
+
+# Pinning behaviour that is wrong, so a fix is noticed rather than silent.
+#
+# The receipt is one file per bucket and object. If A takes a lock, lets it
+# expire, B takes it over on the same machine, and A then unlocks, A reads B's
+# receipt and releases B's lock. The remote if-match cannot help: the ETag it
+# carries really is the current holder's.
+#
+# Not introduced here -- s3 behaves identically, measured -- and fixing it
+# needs the receipt to identify a holder rather than an object. TODO item 24.
+# If this case ever fails, the hole has been closed and it should become an
+# assertion that B's lock survived.
+hk="$testid/lock/shared.lock"
+rm -f "$(oci_receipt "$hk")"
+assertOk "A takes the lock" ../gsg lock "oci://$oci_bucket/$hk" 1
+sleep 3
+assertOk "B takes it over once expired" ../gsg lock "oci://$oci_bucket/$hk" 1
+assertOk "A's unlock still exits 0" ../gsg unlock "oci://$oci_bucket/$hk"
+assertEq "and it released B's lock -- the known hole" \
+    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --name "$hk" >/dev/null 2>&1 && echo present || echo absent)" "absent"
 
 finish
 
