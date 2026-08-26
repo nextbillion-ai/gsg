@@ -34,6 +34,14 @@ import (
 // bucket instead of being re-asked whenever an object turns out to be
 // missing -- which over a large listing would be one extra request per absent
 // object.
+//
+// The gap that leaves is a bucket that disappears part-way through a run:
+// its objects would then read as absent rather than as an error. Re-asking on
+// every 404 is what closes it, and that is the cost this deliberately avoids.
+// It is a narrow gap in practice -- OCI will not delete a bucket that still
+// holds objects, so "everything under it is absent" is a true answer by the
+// time the bucket can go, and losing access mid-run gives 401 or 403, which
+// is not a 404 and is reported as the error it is.
 func (o *OCI) headObject(bucketSpec, prefix string) (*objectstorage.HeadObjectResponse, error) {
 	c, ns, bucket, err := o.resolve(bucketSpec)
 	if err != nil {

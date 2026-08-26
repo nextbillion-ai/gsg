@@ -3,6 +3,7 @@ package oci
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,4 +73,44 @@ func TestIsDirectoryMarker(t *testing.T) {
 	assert.False(t, isDirectoryMarker("a"))
 	assert.False(t, isDirectoryMarker("a/b.txt"))
 	assert.False(t, isDirectoryMarker(""))
+}
+
+// fakeServiceError is enough of the SDK's ServiceError to classify.
+type fakeServiceError struct {
+	status int
+	code   string
+}
+
+func (f fakeServiceError) GetHTTPStatusCode() int  { return f.status }
+func (f fakeServiceError) GetMessage() string      { return "fake" }
+func (f fakeServiceError) GetCode() string         { return f.code }
+func (f fakeServiceError) GetOpcRequestID() string { return "fake-request-id" }
+func (f fakeServiceError) Error() string           { return "fake service error" }
+
+// isNotFound decides two things: whether a HEAD means the object is absent,
+// and whether a failed bucket check is worth remembering. Both go wrong in a
+// costly way if a transient failure is read as a definite answer -- a cached
+// "no such bucket" would make the first unlucky moment of a run permanent,
+// and retries would return it without asking again.
+func TestIsNotFoundOnlyAcceptsADefiniteAnswer(t *testing.T) {
+	for _, c := range []struct {
+		label string
+		err   error
+		want  bool
+	}{
+		{"404", fakeServiceError{status: 404, code: "BadErrorResponse"}, true},
+		{"404 with a real code", fakeServiceError{status: 404, code: "BucketNotFound"}, true},
+
+		// None of these say anything about whether the thing exists.
+		{"429 throttled", fakeServiceError{status: 429, code: "TooManyRequests"}, false},
+		{"500", fakeServiceError{status: 500, code: "InternalServerError"}, false},
+		{"503", fakeServiceError{status: 503, code: "ServiceUnavailable"}, false},
+		{"401", fakeServiceError{status: 401, code: "NotAuthenticated"}, false},
+		{"403", fakeServiceError{status: 403, code: "NotAuthorizedOrNotFound"}, false},
+		{"409 conflict", fakeServiceError{status: 409, code: "Conflict"}, false},
+		{"a plain network error", errors.New("dial tcp: connection refused"), false},
+		{"nil", nil, false},
+	} {
+		assert.Equal(t, c.want, isNotFound(c.err), "%s", c.label)
+	}
 }

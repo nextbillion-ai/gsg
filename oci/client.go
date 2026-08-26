@@ -84,11 +84,25 @@ func (o *OCI) resolve(bucketSpec string) (*objectstorage.ObjectStorageClient, st
 }
 
 // verifyBucket checks that a bucket exists, at most once per bucket.
+func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket string) error {
+	return o.verifyBucketWith(ns, bucket, func() error {
+		// GetBucket, not HeadBucket: a HEAD gives the same empty body the
+		// object calls do, so its 404 carries no code. GetBucket answers with
+		// BucketNotFound, which is worth having in the message.
+		_, err := c.GetBucket(context.Background(), objectstorage.GetBucketRequest{
+			NamespaceName: &ns, BucketName: &bucket,
+		})
+		return err
+	})
+}
+
+// verifyBucketWith is verifyBucket with the request itself supplied, so that
+// what gets remembered and what does not can be tested without a live service.
 //
-// The lock is held across the request on purpose. Under -m the first operation
+// The lock is held across the check on purpose. Under -m the first operation
 // on a bucket starts many workers at once, and releasing the lock before the
 // call would send all of them to the service for the same answer.
-func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket string) error {
+func (o *OCI) verifyBucketWith(ns, bucket string, check func() error) error {
 	key := ns + "/" + bucket
 
 	o.mu.Lock()
@@ -98,14 +112,18 @@ func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket stri
 	}
 
 	var err error
-	// GetBucket, not HeadBucket: a HEAD gives the same empty body the object
-	// calls do, so its 404 carries no code. GetBucket answers with
-	// BucketNotFound, which is worth having in the message.
-	if _, gerr := c.GetBucket(context.Background(), objectstorage.GetBucketRequest{
-		NamespaceName: &ns, BucketName: &bucket,
-	}); gerr != nil {
-		logger.Info(module, "cannot reach bucket oci://%s: %s", bucket, gerr)
-		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q: %w", bucket, ns, gerr)
+	if cerr := check(); cerr != nil {
+		logger.Info(module, "cannot reach bucket oci://%s: %s", bucket, cerr)
+		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q: %w", bucket, ns, cerr)
+		// Only a definite answer is worth remembering. A throttle, a 5xx or a
+		// dropped connection says nothing about whether the bucket exists, and
+		// caching it would make the first unlucky moment of a run permanent:
+		// common.DoWithRetrySimple would retry, get the remembered error back
+		// without a request, and fail every time. So transient failures are
+		// returned and forgotten, and the next attempt asks again.
+		if !isNotFound(cerr) {
+			return err
+		}
 	}
 	if o.buckets == nil {
 		o.buckets = map[string]error{}
