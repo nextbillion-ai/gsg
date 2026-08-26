@@ -36,6 +36,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 | 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
 | 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
+| 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -873,3 +874,52 @@ to the same object -- once, in the command, rather than relying on each
 backend's `Copy` to fail. Comparing raw strings is not enough where a backend
 has more than one spelling for a path. A guard in `GCS.Copy` would close the
 measured case, but the command-level fix is the one that covers every backend.
+
+---
+
+## 22. IsDirectory lists the whole directory to answer a yes or no
+
+`IsDirectory` asks whether anything exists under a path. Both backends answer
+it by listing and counting.
+
+`s3.IsDirectory` lists **recursively**:
+
+```go
+if objs, err = s.listObjectsAndSubPaths(bucket, prefix, true); err != nil {
+```
+
+so a prefix holding a million keys walks all million to return one boolean.
+`gcs.IsDirectory` lists non-recursively, which is bounded by the number of
+immediate children rather than everything beneath -- better, and correct, but
+still a full page walk.
+
+Measured against 1005 objects, warm clients, versus the same call on a
+one-object directory:
+
+| backend | 1 object | 1005 objects |
+|---|---|---|
+| gs | 75ms | 198ms |
+| oci | -- | 17ms |
+
+`FileType` calls this before nearly every command -- there are 27 call sites
+across `cp`, `rm`, `ls`, `du`, `mv`, `rsync`, `lock` and `stat` -- so the cost
+lands on all of them. A recursive copy pays it twice: once to decide the path
+is a directory, then again to list it. The result is cached per `FileObject`,
+so it is once per path rather than per object, but once per path at
+O(objects beneath) is still the wrong shape.
+
+**Fix:** ask for one entry rather than all of them. The OCI backend does this:
+a single `ListObjects` with `Limit: 1` and a delimiter, so the service neither
+returns a page nor walks the keyspace, and the work is constant regardless of
+what is under the path. The equivalent is `MaxKeys: 1` with a delimiter on
+`ListObjectsV2` for s3, and `Query{Delimiter: "/"}` with the iterator stopped
+after the first item for gs.
+
+Worth checking while there: a listing that carries only common prefixes and no
+objects still has to count as a directory. Measured on OCI, `Limit: 1` does
+return the prefixes, so a directory whose children are all sub-directories is
+still recognised -- the same shape that truncated an s3 listing in item 2, so
+it should not be assumed for `MaxKeys`.
+
+Found while reviewing the OCI backend, whose first version copied the s3
+shape.
