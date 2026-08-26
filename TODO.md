@@ -37,6 +37,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
 | 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
 | 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
+| 23 | open | yes -- a gs upload is stored with a checksum of whatever arrived | fix, two lines |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -923,3 +924,47 @@ it should not be assumed for `MaxKeys`.
 
 Found while reviewing the OCI backend, whose first version copied the s3
 shape.
+
+## 23. A gs upload is not checked on arrival
+
+`GCS.Upload` sets only the writer's metadata. It never sets `CRC32C` or
+`SendCRC32C`, so no checksum is transmitted and GCS computes one from whatever
+reached it.
+
+That checksum is then what everything else compares against. An upload
+corrupted in transit is stored with a checksum of the corrupted bytes, so
+`rsync` sees a matching object and `-v` verifies the corruption against itself
+and passes. Nothing anywhere reports a problem.
+
+The mechanism exists and is unused. Measured against a real bucket:
+
+| upload | outcome |
+|---|---|
+| no checksum sent -- what gsg does | succeeds; server computes CRC32C from what arrived |
+| correct checksum sent | succeeds |
+| wrong checksum sent | rejected: `Provided CRC32C "WG07Ig==" doesn't match calculated CRC32C "WG07IQ=="` |
+
+Where the three backends now stand:
+
+| backend | upload checked on arrival? |
+|---|---|
+| s3 | yes -- the aws sdk computes the checksum client-side and sends it, since #47 |
+| **gs** | **no** |
+| oci | yes -- gsg computes it and sends `opc-content-crc32c` |
+
+**Fix:** two lines in `GCS.Upload`, before the first write --
+
+```go
+wc.CRC32C = common.GetFileCRC32C(srcFile)
+wc.SendCRC32C = true
+```
+
+Both must be set, and both before the first `Write`: the library ignores
+`SendCRC32C` afterwards, and zero is a valid checksum so it is not transmitted
+on its own. Note `GetFileCRC32C` returns 0 both for a real zero and for a read
+it could not complete (the other half of item 4), so a failed read would send a
+zero and have a good upload rejected. That fails closed rather than storing bad
+data, but it is worth fixing item 4 alongside, or computing the checksum here
+in a form that can report failure.
+
+Found while reviewing the OCI backend, which had the same gap.
