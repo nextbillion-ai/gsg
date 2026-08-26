@@ -56,36 +56,19 @@ func (o *OCI) IsObject(bucket, prefix string) (bool, error) {
 }
 
 // IsDirectory reports whether prefix names a directory: something with at
-// least one object strictly beneath it.
+// least one object beneath it.
 //
-// An object at the path itself does not make it one -- "a/b.txt" is not a
-// directory just because it exists -- so the listing is compared against the
-// prefix rather than merely counted. A single entry equal to the prefix is the
-// object itself; anything longer is something underneath.
+// The trailing slash is what makes the question mean that. Without it the
+// service matches on the raw prefix, so "edge/ab" would look like a directory
+// because "edge/abc.txt" exists, and "edge/d" like one because "edge/dir/"
+// does.
+//
+// An object at the path itself does not make it a directory: asking about
+// "a/b.txt" appends the slash, and nothing lives under "a/b.txt/".
 func (o *OCI) IsDirectory(bucket, prefix string) (bool, error) {
-	// Ask about the path as a directory. Without the slash, "a/bc.txt" would
-	// count as being under "a/b" on a plain string prefix match.
 	asDir := prefix
 	if asDir != "" && !strings.HasSuffix(asDir, "/") {
 		asDir += "/"
 	}
-	objects, prefixes, err := o.walkObjects(bucket, asDir, true)
-	if err != nil {
-		return false, err
-	}
-	if len(prefixes) > 0 {
-		return true, nil
-	}
-	for i := range objects {
-		if objects[i].Name == nil {
-			continue
-		}
-		// A zero-length marker named exactly "a/" says a directory was meant
-		// to exist, but on its own it holds nothing; treating it as a
-		// directory keeps gsg consistent with the tools that write them.
-		if len(*objects[i].Name) >= len(asDir) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return o.anyEntryUnder(bucket, asDir)
 }

@@ -66,3 +66,40 @@ assertEq "an object is not a directory" "$(isdir edge/abc.txt)" "no"
 assertEq "something absent is not a directory" "$(isdir edge/nothing-here)" "no"
 
 finish
+
+start "isdirectory: a directory bigger than one page is still just one question"
+
+# IsDirectory asks whether anything exists under a path, so it asks for a
+# single entry. Answering it by listing and counting costs a page per thousand
+# objects -- measured at 237ms for 1005 objects, and minutes for a prefix
+# holding a million. FileType calls this before nearly every command, so the
+# cost lands on cp, rm, du, mv and rsync alike.
+#
+# This case pins the correctness half at a size past one page. The cost half
+# cannot be asserted from a shell, but a regression to listing-and-counting
+# would show up here as a visibly slower run.
+fbig="folder_big"
+mkdir -p $fbig
+i=1
+while [[ $i -le 1005 ]]
+do
+    printf 'x' > "$fbig/f$(printf '%04d' $i).txt"
+    i=$((i + 1))
+done
+oci os object bulk-upload --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --src-dir $fbig --object-prefix "$testid/$fbig/" --overwrite \
+    --parallel-upload-count 40 >/dev/null 2>&1
+
+assertEq "the provider really has more than one page of objects" \
+    "$(oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --prefix "$testid/$fbig/" --all --query 'length(data)' 2>/dev/null)" "1005"
+
+assertEq "a directory of 1005 objects is a directory" "$(isdir $fbig)" "yes"
+assertEq "and one of its objects is not" "$(isdir $fbig/f0001.txt)" "no"
+assertEq "nor is a partial name inside it" "$(isdir $fbig/f000)" "no"
+
+oci os object bulk-delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --prefix "$testid/$fbig/" --force >/dev/null 2>&1
+rm -rf $fbig
+
+finish
