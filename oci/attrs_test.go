@@ -106,3 +106,18 @@ func TestIsNotFoundOnlyAcceptsADefiniteAnswer(t *testing.T) {
 		assert.Equal(t, c.want, isNotFound(c.err), "%s", c.label)
 	}
 }
+
+// crc32cToBase64 is what gets sent on upload, so the service can reject a
+// body that did not arrive intact. It has to be the exact inverse of
+// crc32cOf, which reads the same form back: a disagreement between the two
+// would make the service refuse every upload.
+func TestCrc32cToBase64RoundTrips(t *testing.T) {
+	for _, v := range []uint32{0, 1, 0x7fffffff, 0x80000000, 0xffffffff, 1487740670} {
+		e := crc32cToBase64(v)
+		got, ok := crc32cOf(&e)
+		assert.True(t, ok, "encoding of %d should read back", v)
+		assert.Equal(t, v, got, "round trip of %d", v)
+	}
+	// The value measured against a real object, from both directions.
+	assert.Equal(t, "WK0e/g==", crc32cToBase64(1487740670))
+}

@@ -134,14 +134,25 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		body = io.TeeReader(f, pb)
 	}
 
-	// Ask the service to record a CRC32C.
+	// Record a CRC32C, and send our own so the upload is checked on arrival.
 	//
-	// Without this OCI stores only an MD5, and every checksum comparison gsg
-	// makes is CRC32C -- so the object would come back with no comparable
-	// checksum, rsync would copy it again on every run, and -v would have
-	// nothing to verify against. This is the same fix #47 made for s3. Unlike
-	// s3 the checksum stays whole-object even if the upload is multipart, so
-	// there is no composite case to worry about.
+	// Two separate things. Without opc-checksum-algorithm, OCI stores only an
+	// MD5, and every comparison gsg makes is CRC32C -- so the object would come
+	// back with no comparable checksum, rsync would copy it again on every run,
+	// and -v would have nothing to verify against. That is the fix #47 made for
+	// s3. Unlike s3 the checksum stays whole-object even for a multipart
+	// upload, measured: a 20MB object stored in four parts reports the same
+	// CRC32C as the whole file, while its MD5 is the composite-of-parts kind.
+	//
+	// But the algorithm header alone only asks the service to compute a
+	// checksum of whatever reached it. Unlike the aws sdk, this one never
+	// computes a checksum itself -- the field is documented as "computed by
+	// the server" -- so an upload corrupted in transit would be stored with a
+	// checksum of the corrupted bytes, and a later -v would compare the two
+	// and pass. Sending opc-content-crc32c makes the service compare against
+	// what we measured locally and reject the object with HTTP 400 if they
+	// differ, so corruption fails the upload instead of being preserved.
+	localCRC := crc32cToBase64(common.GetFileCRC32C(srcFile))
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,
@@ -149,6 +160,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		ContentLength:        &size,
 		PutObjectBody:        io.NopCloser(body),
 		OpcChecksumAlgorithm: objectstorage.PutObjectOpcChecksumAlgorithmCrc32c,
+		OpcContentCrc32c:     &localCRC,
 	}); err != nil {
 		logger.Info(module, "cannot upload %s to oci://%s/%s: %s", srcFile, name, object, err)
 		return err

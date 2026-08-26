@@ -15,23 +15,17 @@ import (
 // object rather than admit the check could not be made. This is the shape #47
 // arrived at for s3, for the same reason.
 func (o *OCI) equalCRC32C(localPath, bucket, object string) (equal, comparable bool, err error) {
-	attrs, err := o.Attributes(bucket, object)
-	if err != nil {
-		return false, false, err
-	}
-	if attrs == nil {
-		// Verification was asked for and the object is not there. That is a
-		// failure, not something to pass over.
-		return false, false, fmt.Errorf("cannot verify oci://%s/%s: no such object", bucket, object)
-	}
-	// Attributes cannot say "no checksum" -- TODO item 18 -- so the head is
-	// repeated here to ask that question directly rather than guessing from a
-	// zero.
+	// headObject rather than Attributes: Attributes cannot say "no checksum"
+	// -- it returns a bare uint32, TODO item 18 -- so the raw response is what
+	// answers the question. An earlier version called both, which asked the
+	// service the same thing twice for every object verified.
 	head, err := o.headObject(bucket, object)
 	if err != nil {
 		return false, false, err
 	}
 	if head == nil {
+		// Verification was asked for and the object is not there. That is a
+		// failure, not something to pass over.
 		return false, false, fmt.Errorf("cannot verify oci://%s/%s: no such object", bucket, object)
 	}
 	remote, stored := crc32cOf(head.OpcContentCrc32c)

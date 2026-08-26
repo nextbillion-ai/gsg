@@ -31,6 +31,16 @@ else
     exit 1
 fi
 
+# gsg also sends that checksum, so the service checks the body on arrival
+# rather than merely recording a checksum of whatever reached it. The stored
+# value must therefore equal what the bytes on disk hash to -- if gsg sent a
+# wrong one the upload would have been rejected outright with
+# "does not match the expected CRC32C checksum", which is what makes this
+# assertion meaningful rather than tautological.
+local_b64=$(../gsg hash "$remote_base/$fx/a.txt" 2>/dev/null | awk '/Hash/ {print $NF}')
+stored_dec=$((16#$(printf '%s' "$stored_crc" | base64 -d 2>/dev/null | xxd -p)))
+assertEq "the stored checksum is the one the bytes hash to" "$local_b64" "$stored_dec"
+
 rm -rf ${fx}_down && mkdir ${fx}_down
 ../gsg -m cp -r "$remote_base/$fx" ${fx}_down >/dev/null 2>&1
 assertOk "the downloaded tree matches the original" diff -r $fx ${fx}_down

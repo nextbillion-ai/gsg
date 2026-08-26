@@ -132,6 +132,14 @@ func modTime(t time.Time) time.Time {
 	return t.Truncate(time.Second)
 }
 
+// crc32cToBase64 is the wire form of a checksum: four big-endian bytes,
+// base64 encoded, which is how OCI both reports and accepts one.
+func crc32cToBase64(v uint32) string {
+	raw := make([]byte, 4)
+	binary.BigEndian.PutUint32(raw, v)
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
 // Attributes returns size, mtime and checksum for one object, or (nil, nil) if
 // there is no such object.
 func (o *OCI) Attributes(bucket, prefix string) (*system.Attrs, error) {
