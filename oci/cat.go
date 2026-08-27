@@ -3,6 +3,9 @@ package oci
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"hash/crc32"
+	"io"
 	"strings"
 
 	"github.com/nextbillion-ai/gsg/logger"
@@ -71,4 +74,60 @@ func (o *OCI) IsDirectory(bucket, prefix string) (bool, error) {
 		asDir += "/"
 	}
 	return o.anyEntryUnder(bucket, asDir)
+}
+
+// GetObjectReader streams an object's bytes.
+//
+// The library API (lib/object) reads through this rather than Cat, so that a
+// large object is not held in memory in its entirety just to be copied
+// somewhere else. The caller closes it.
+func (o *OCI) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
+	c, ns, name, err := o.resolve(bucket)
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.GetObject(context.Background(), objectstorage.GetObjectRequest{
+		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
+	})
+	if err != nil {
+		logger.Info(module, "cannot read oci://%s/%s: %s", name, prefix, err)
+		return nil, err
+	}
+	if r.Content == nil {
+		return nil, fmt.Errorf("oci: oci://%s/%s returned no body", name, prefix)
+	}
+	return r.Content, nil
+}
+
+// PutObject stores what the reader yields.
+//
+// Unlike Upload it takes a reader rather than a path, which is what the
+// library API needs. The content length has to be known in advance because
+// the service requires it, so a reader of unknown length is read into memory
+// first -- the same trade the s3 backend makes.
+func (o *OCI) PutObject(bucket, prefix string, from io.Reader) error {
+	c, ns, name, err := o.resolve(bucket)
+	if err != nil {
+		return err
+	}
+	body, err := io.ReadAll(from)
+	if err != nil {
+		logger.Info(module, "cannot read the body for oci://%s/%s: %s", name, prefix, err)
+		return err
+	}
+	size := int64(len(body))
+	// The same integrity check Upload makes: the service compares this against
+	// what arrives and rejects the object if they differ, rather than storing
+	// a checksum of whatever it received.
+	sum := crc32cToBase64(crc32.Checksum(body, crc32.MakeTable(crc32.Castagnoli)))
+	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
+		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
+		ContentLength: &size, PutObjectBody: io.NopCloser(bytes.NewReader(body)),
+		OpcChecksumAlgorithm: objectstorage.PutObjectOpcChecksumAlgorithmCrc32c,
+		OpcContentCrc32c:     &sum,
+	}); err != nil {
+		logger.Info(module, "cannot write oci://%s/%s: %s", name, prefix, err)
+		return err
+	}
+	return nil
 }
