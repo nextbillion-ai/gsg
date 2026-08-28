@@ -605,6 +605,35 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	wc.Metadata = map[string]string{
 		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
 	}
+
+	// Send the checksum, so the service checks the body it received against
+	// what was measured here and refuses the object if they differ.
+	//
+	// Without this nothing verified the transfer. GCS still records a CRC32C,
+	// but it computes it from whatever arrived -- so an upload corrupted on
+	// the way was stored together with a checksum of the corrupted bytes.
+	// Everything downstream then agreed: rsync saw a matching object, and -v
+	// verified the corruption against itself and passed. s3 has been checked
+	// since #47 and oci since #52; this was the last one that was not.
+	//
+	// Both fields are required and both must be set before the first Write:
+	// the library ignores SendCRC32C afterwards, and zero is a valid checksum
+	// so it is never transmitted on its own.
+	//
+	// The checksum has to be known up front, which means reading the file once
+	// before sending it. That read is usually already paid for -- rsync
+	// computes the same value to decide whether to copy at all, and the result
+	// is cached by path and mtime.
+	crc, ok := common.GetFileCRC32CChecked(srcFile)
+	if !ok {
+		// Sending a zero here would have the service reject a file that is
+		// probably fine, with a message about checksums rather than about the
+		// read that actually failed.
+		logger.Info(module, "cannot compute the checksum of %s, so the upload cannot be verified", srcFile)
+		return fmt.Errorf("cannot upload %s: its checksum could not be computed", srcFile)
+	}
+	wc.CRC32C = crc
+	wc.SendCRC32C = true
 	if _, err = io.Copy(io.MultiWriter(wc, pb), f); err != nil {
 		logger.Info(module, "upload object failed when copy file with %s", err)
 		abort()

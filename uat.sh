@@ -917,6 +917,62 @@ do_test() {
     assertOk "odd names round-trip identically" diff -r $fodd ${fodd}_down
     finish
 
+    start "regression: an upload is checked on arrival, not after it"
+    # gs stores a CRC32C for every object whether asked or not -- but it
+    # computes it from whatever reached it. Nothing was transmitted, so a body
+    # corrupted in transit was stored together with a checksum of the corrupted
+    # bytes: rsync then saw a matching object and -v verified the corruption
+    # against itself and passed. Sending the checksum makes the service compare
+    # and refuse.
+    #
+    # gs only. s3 has been checked since #47, where the aws sdk computes and
+    # sends it, and oci since #52.
+    if [[ "$mode" != "gs" ]]
+    then
+        echo "SKIP: only the gs upload path was missing this"
+        finish
+    else
+    fint="folder_integrity"
+    mkdir -p $fint
+    prepare_file $fint/a.txt
+    ../gsg cp $fint/a.txt $remote_base/$fint/a.txt
+    assert $fint/a.txt remote
+
+    # The teeth of this case. The checksum gsg sends is read through the
+    # crc32c cache in /tmp, so poisoning that entry makes gsg transmit a value
+    # that does not describe the body -- which is exactly what a corrupted
+    # transfer looks like from the service's side. It must refuse the object.
+    #
+    # If the checksum were not transmitted at all, as before this fix, the
+    # upload would simply succeed and the wrong value would go unnoticed.
+    #
+    # The first upload is what populates the cache: nothing else in a plain cp
+    # computes a local checksum.
+    prepare_file $fint/poisoned.txt
+    snapshotTmp
+    ../gsg cp $fint/poisoned.txt "$remote_base/$fint/first.txt"
+    poisoned=0
+    for f in $(newTmpCaches)
+    do
+        if [[ -f "/tmp/$f" && "$(wc -c < "/tmp/$f" | tr -d ' ')" == "4" ]]
+        then
+            printf '\xde\xad\xbe\xef' > "/tmp/$f"
+            poisoned=$((poisoned+1))
+        fi
+    done
+    assertEq "the local checksum cache was poisoned" "$poisoned" "1"
+
+    if ../gsg cp $fint/poisoned.txt "$remote_base/$fint/poisoned.txt" >/dev/null 2>&1
+    then
+        echo "FATAL: an upload carrying a checksum that does not match its body was accepted"
+        exit 1
+    else
+        echo "OK: an upload whose checksum does not match its body is refused"
+    fi
+    assert_not $fint/poisoned.txt remote
+    finish
+    fi
+
     start "regression: an upload the server rejects must not report success"
     # GCS finalizes an upload in Close, and that is where the server's answer
     # arrives -- io.Copy only fills the writer's buffer. Upload deferred that

@@ -37,7 +37,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
 | 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
 | 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
-| 23 | open | yes -- a gs upload is stored with a checksum of whatever arrived | fix, two lines |
+| 23 | fixed | yes -- a gs upload is stored with a checksum of whatever arrived | fixed: the upload now sends its checksum |
 | 24 | open | yes -- A releases B's lock after its own expired, on one machine | fix, design change |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
@@ -952,6 +952,15 @@ Where the three backends now stand:
 | s3 | yes -- the aws sdk computes the checksum client-side and sends it, since #47 |
 | **gs** | **no** |
 | oci | yes -- gsg computes it and sends `opc-content-crc32c` |
+
+**Fixed.** `GCS.Upload` now sends the checksum, so the service compares it
+against the body that arrived and refuses the object if they differ. The
+`GetFileCRC32C` ambiguity below was closed at the same time, since sending a
+zero that meant "could not compute" would have had good uploads rejected: a
+new `GetFileCRC32CChecked` reports whether the number is real, which is half of
+item 4.
+
+The original note follows.
 
 **Fix:** two lines in `GCS.Upload`, before the first write --
 
