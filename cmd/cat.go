@@ -26,7 +26,7 @@ var catCmd = &cobra.Command{
 		var output []byte
 		var err error
 		if output, err = fo.System.Cat(fo.Bucket, fo.Prefix); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		logger.Output(string(output))
 	},

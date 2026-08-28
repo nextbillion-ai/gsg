@@ -31,7 +31,7 @@ var lsCmd = &cobra.Command{
 		var err error
 		var objs []*system.FileObject
 		if objs, err = fo.System.List(fo.Bucket, fo.Prefix, isRec); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		if len(objs) == 0 {
 			logger.Info(module, "No objects found with bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)

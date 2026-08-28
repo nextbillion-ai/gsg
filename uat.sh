@@ -364,6 +364,10 @@ do_test() {
     fi' EXIT
 
     start "prepare test ground for mode: $mode"
+    # chmod first: a case that sets a directory to 000 restores it afterwards,
+    # but a run killed in between leaves one behind that rm cannot enter, and
+    # every later run then fails at setup with "Directory not empty".
+    chmod -R u+rwX uat_temp 2>/dev/null || true
     rm -rf uat_temp || true
     testbase="uat_temp"
     mkdir $testbase
@@ -1225,6 +1229,48 @@ GOHELPER
     assertValue ${flocal}_copy/normal.txt plain
     assertValue "${flocal}_copy/with spaces.txt" spaced
     assertValue ${flocal}_copy/sub/nested.txt nested
+
+    # A command that fails must say so. common.Exit is a bare os.Exit(1), and
+    # the command layer used to discard the error it was handed, so a failure
+    # the backend had not already logged left an empty screen and a 1.
+    # Measured before the fix: du and cp -r over this same directory both
+    # exited 1 printing nothing at all.
+    #
+    # And the message has to name the reason, not just report a status. "exit
+    # status 1" is what exec gives back; the tool wrote the real cause to
+    # stderr, which is what should reach the user.
+    chmod 000 $flocal/denied
+    # `x=$(cmd)` takes cmd's exit status, and the suite runs under `set -e`, so
+    # capturing a command that is meant to fail kills the run with no message
+    # at all. `&& rc=0 || rc=$?` keeps both the output and the status.
+    duout=$(../gsg du $flocal 2>&1) && durc=0 || durc=$?
+    cpout=$(../gsg cp -r $flocal ${flocal}_silent 2>&1) && cprc=0 || cprc=$?
+    lsout=$(../gsg ls -r $flocal 2>&1) && lsrc=0 || lsrc=$?
+    chmod 755 $flocal/denied
+    rm -rf ${flocal}_silent
+
+    # The exit status is asserted as well as the text. Code that printed a
+    # reason and then exited 0 would satisfy the message checks alone, and a
+    # command that fails has to fail.
+    assertEq "du of an unreadable tree fails" "$durc" "1"
+    assertEq "cp -r of an unreadable tree fails" "$cprc" "1"
+    assertEq "ls -r of an unreadable tree fails" "$lsrc" "1"
+
+    # And each has to name the reason the tool gave, not a bare status. "exit
+    # status 1" is what exec hands back; find, du and cp each wrote the real
+    # cause to stderr.
+    for pair in "du|$duout" "cp|$cpout" "ls|$lsout"
+    do
+        what="${pair%%|*}"; text="${pair#*|}"
+        # At least once, not exactly once: cp's own stderr reaches the
+        # terminal alongside gsg's message, so the reason legitimately appears
+        # twice there.
+        assertEq "$what says why it failed" \
+            "$([ "$(echo "$text" | grep -c 'Permission denied')" -ge 1 ] && echo yes || echo no)" "yes"
+        assertEq "$what does not merely report an exit status" \
+            "$(echo "$text" | grep -c 'exit status')" "0"
+    done
+
     rm -f .lsout .rsout
     finish
     fi
@@ -1249,6 +1295,7 @@ GOHELPER
 
     start "cleanup test ground"
     # The /tmp snapshots live inside uat_temp, so this covers them.
+    chmod -R u+rwX uat_temp 2>/dev/null || true
     rm -rf uat_temp || true
     # Only this run's own prefix. This used to delete every object in the
     # bucket, which is fine on a scratch bucket and destructive anywhere else.

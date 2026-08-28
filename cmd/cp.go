@@ -32,7 +32,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 		if isRec {
 			var objs []*system.FileObject
 			if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
-				common.Exit()
+				common.ExitWith(err)
 			}
 			for _, obj := range objs {
 				op := obj.Prefix
@@ -41,7 +41,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 				pool.Add(func() {
 					defer wg.Done()
 					if e := dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars}); e != nil {
-						common.Exit()
+						common.ExitWith(e)
 					}
 				})
 			}
@@ -59,7 +59,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 		pool.Add(func() {
 			defer wg.Done()
 			if e := dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars}); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 		})
 	case system.FileType_Invalid:
@@ -75,7 +75,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 		if isRec {
 			var objs []*system.FileObject
 			if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
-				common.Exit()
+				common.ExitWith(err)
 			}
 			for _, obj := range objs {
 				dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
@@ -90,7 +90,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 					// another goroutine overwriting it in between let a
 					// goroutine miss its own failure and report nothing.
 					if e := src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
-						common.Exit()
+						common.ExitWith(e)
 					}
 				})
 			}
@@ -105,7 +105,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 			dstPrefix = common.JoinPath(dst.Prefix, name)
 		}
 		if err = src.System.Download(src.Bucket, src.Prefix, dstPrefix, forceChecksum, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 	case system.FileType_Invalid:
 		logger.Info(module, "Invalid bucket[%s] with prefix[%s]", src.Bucket, src.Prefix)
@@ -146,7 +146,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			prepareWorkDir()
 			var objs []*system.FileObject
 			if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
-				common.Exit()
+				common.ExitWith(err)
 			}
 			for _, obj := range objs {
 				interPath := common.GetDstPath(src.Prefix, obj.Prefix, interChange.Prefix)
@@ -157,7 +157,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 					var err error
 					defer wg.Done()
 					if err = src.System.Download(src.Bucket, srcPath, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
-						common.Exit()
+						common.ExitWith(err)
 					}
 					interFile := system.ParseFileObject(interPath)
 					if interFile.FileType() != system.FileType_Object {
@@ -165,11 +165,11 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 						common.Exit()
 					}
 					if err = dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool}); err != nil {
-						logger.Error("inter-cloud", "failed to upload intermediate file: %s to %s", interPath, dstPath)
+						logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPath, err)
 						common.Exit()
 					}
 					if err := os.Remove(interPath); err != nil {
-						logger.Error("inter-cloud", "failed to remove intermediate file: %s", interPath)
+						logger.Error("inter-cloud", "failed to remove intermediate file %s: %s", interPath, err)
 						common.Exit()
 					}
 				})
@@ -188,7 +188,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 		}
 		interPath := common.JoinPath(interChange.Prefix, name)
 		if err = src.System.Download(src.Bucket, src.Prefix, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		interFile := system.ParseFileObject(interPath)
 		if interFile.FileType() != system.FileType_Object {
@@ -196,11 +196,11 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			common.Exit()
 		}
 		if err = dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool}); err != nil {
-			logger.Error("inter-cloud", "failed to upload intermediate file: %s to %s", interPath, dstPrefix)
+			logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPrefix, err)
 			common.Exit()
 		}
 		if err := os.Remove(interPath); err != nil {
-			logger.Error("inter-cloud", "failed to remove intermediate file: %s", interPath)
+			logger.Error("inter-cloud", "failed to remove intermediate file %s: %s", interPath, err)
 			common.Exit()
 		}
 		removeWorkDir()
@@ -224,7 +224,7 @@ func cloudCopy(src, dst *system.FileObject, forceCheckum, isRec bool, wg *sync.W
 		}
 		var objs []*system.FileObject
 		if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		for _, obj := range objs {
 			op := obj.Prefix
@@ -233,7 +233,7 @@ func cloudCopy(src, dst *system.FileObject, forceCheckum, isRec bool, wg *sync.W
 			pool.Add(func() {
 				defer wg.Done()
 				if e := src.System.Copy(src.Bucket, op, dst.Bucket, dstPath); e != nil {
-					common.Exit()
+					common.ExitWith(e)
 				}
 			})
 		}
@@ -247,7 +247,7 @@ func cloudCopy(src, dst *system.FileObject, forceCheckum, isRec bool, wg *sync.W
 		pool.Add(func() {
 			defer wg.Done()
 			if e := src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dstPrefix); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 		})
 	case system.FileType_Invalid:
@@ -265,7 +265,7 @@ func localCopy(src, dst *system.FileObject, _, _ bool, wg *sync.WaitGroup) {
 	pool.Add(func() {
 		defer wg.Done()
 		if e := src.System.Copy(src.Bucket, src.Prefix, dst.Bucket, dst.Prefix); e != nil {
-			common.Exit()
+			common.ExitWith(e)
 		}
 	})
 }

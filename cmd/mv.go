@@ -65,7 +65,7 @@ var mvCmd = &cobra.Command{
 			var objs []*system.FileObject
 			var lerr error
 			if objs, lerr = src.System.List(src.Bucket, src.Prefix, isRec); lerr != nil {
-				common.Exit()
+				common.ExitWith(lerr)
 			}
 			for _, obj := range objs {
 				toDelete = append(toDelete, obj.Prefix)
@@ -79,7 +79,7 @@ var mvCmd = &cobra.Command{
 				p := prefix
 				pool.Add(func() {
 					if e := src.System.Delete(src.Bucket, p); e != nil {
-						common.Exit()
+						common.ExitWith(e)
 					}
 				})
 			}
@@ -87,7 +87,7 @@ var mvCmd = &cobra.Command{
 		}
 		if src.FileType() == system.FileType_Object {
 			if err := src.System.Delete(src.Bucket, src.Prefix); err != nil {
-				common.Exit()
+				common.ExitWith(err)
 			}
 		}
 	},

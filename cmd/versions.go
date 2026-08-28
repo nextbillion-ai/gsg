@@ -28,7 +28,7 @@ var versionsCmd = &cobra.Command{
 		var err error
 		var vs []*system.FileObject
 		if vs, err = g.List(versionsBucket, versionsPrefix, true); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		for _, v := range vs {
 			if !strings.HasSuffix(v.Prefix, "/install.sh") {
