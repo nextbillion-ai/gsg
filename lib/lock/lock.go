@@ -8,6 +8,7 @@ import (
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/oci"
 	"github.com/nextbillion-ai/gsg/s3"
 )
 
@@ -51,6 +52,19 @@ func (s *S3Locker) DoAttemptUnlock(bucket, object string, lockId string) error {
 	return s.s3.DoAttemptUnlock(bucket, object, lockId)
 }
 
+// OCILocker wraps OCI to implement StorageLocker interface
+type OCILocker struct {
+	oci *oci.OCI
+}
+
+func (o *OCILocker) DoAttemptLock(bucket, object string, ttl time.Duration) (string, error) {
+	return o.oci.DoAttemptLock(bucket, object, ttl)
+}
+
+func (o *OCILocker) DoAttemptUnlock(bucket, object string, lockId string) error {
+	return o.oci.DoAttemptUnlock(bucket, object, lockId)
+}
+
 type Distributed struct {
 	bucket  string
 	prefix  string
@@ -74,6 +88,14 @@ func NewS3(bucket, prefix string) *Distributed {
 	}
 }
 
+func NewOCI(bucket, prefix string) *Distributed {
+	return &Distributed{
+		bucket:  bucket,
+		prefix:  prefix,
+		storage: &OCILocker{oci: &oci.OCI{}},
+	}
+}
+
 // New creates a GCS distributed lock for backward compatibility
 func New(bucket, prefix string) *Distributed {
 	return NewGCS(bucket, prefix)
@@ -91,8 +113,10 @@ func NewWithUrl(url string) (*Distributed, error) {
 		return NewGCS(bucket, prefix), nil
 	case "s3":
 		return NewS3(bucket, prefix), nil
+	case "oci":
+		return NewOCI(bucket, prefix), nil
 	default:
-		return nil, fmt.Errorf("unsupported scheme: %s (supported: gs, s3)", scheme)
+		return nil, fmt.Errorf("unsupported scheme: %s (supported: gs, s3, oci)", scheme)
 	}
 }
 

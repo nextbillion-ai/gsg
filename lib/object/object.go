@@ -10,6 +10,7 @@ import (
 
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/gcs"
+	"github.com/nextbillion-ai/gsg/oci"
 	"github.com/nextbillion-ai/gsg/s3"
 	"github.com/nextbillion-ai/gsg/system"
 	"golang.org/x/time/rate"
@@ -17,6 +18,10 @@ import (
 
 var gcsNotFoundRe = regexp.MustCompile(`.*storage: object doesn't exist.*`)
 var s3NotFoundRe = regexp.MustCompile(`.*StatusCode: 404.*`)
+
+// OCI names it ObjectNotFound in the error code, and reports 404 in a
+// differently worded status line than the aws sdk does.
+var ociNotFoundRe = regexp.MustCompile(`(?i)ObjectNotFound`)
 
 var ErrObjectNotFound = fmt.Errorf("Object Not Found")
 var ErrObjectURLInvalid = fmt.Errorf("Object URL Not supported")
@@ -69,6 +74,12 @@ func (s *systemCache) Get(scheme, bucket string) system.ISystem {
 		return s.cache["gs"]
 	case "s3":
 		return s.cache["s3://"+bucket]
+	case "oci":
+		// Keyed by bucket like s3 rather than shared like gs. One OCI client
+		// serves a whole region, but a bucket spec may carry its own
+		// namespace -- "bucket@namespace" -- and two namespaces are two
+		// different buckets.
+		return s.cache["oci://"+bucket]
 	default:
 		return nil
 	}
@@ -82,6 +93,8 @@ func (s *systemCache) Set(scheme, bucket string, sys system.ISystem) {
 		s.cache["gs"] = sys
 	case "s3":
 		s.cache["s3://"+bucket] = sys
+	case "oci":
+		s.cache["oci://"+bucket] = sys
 	default:
 	}
 }
@@ -101,6 +114,12 @@ func (s *systemCache) GetOrNew(scheme, bucket string) (system.ISystem, error) {
 			return sys, nil
 		}
 		sys = &s3.S3{}
+	case "oci":
+		sys = s.Get(scheme, bucket)
+		if sys != nil {
+			return sys, nil
+		}
+		sys = &oci.OCI{}
 	default:
 		return nil, ErrObjectURLInvalid
 	}
@@ -126,6 +145,12 @@ func parseError(err error) error {
 		return ErrObjectNotFound
 	}
 	if s3NotFoundRe.MatchString(s) {
+		return ErrObjectNotFound
+	}
+	// OCI names it ObjectNotFound. Without this a consumer checking for
+	// ErrObjectNotFound -- which is why the sentinel exists -- would get a raw
+	// sdk error for oci and none of its existing checks would match.
+	if ociNotFoundRe.MatchString(s) {
 		return ErrObjectNotFound
 	}
 	return err
@@ -193,8 +218,17 @@ func (o *Object) Read(to io.Writer) error {
 		if rc, err = o._system.(*gcs.GCS).GetObjectReader(o.bucket, o.prefix); err != nil {
 			return parseError(err)
 		}
+	case "oci":
+		if rc, err = o._system.(*oci.OCI).GetObjectReader(o.bucket, o.prefix); err != nil {
+			return parseError(err)
+		}
+	default:
+		// Without this the switch falls through with rc still nil and the
+		// deferred Close dereferences it, so an unsupported scheme crashed
+		// the caller rather than being told apart from a read failure.
+		return fmt.Errorf("cannot read %s: scheme %q is not supported", o.url, o.scheme)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	if _, err = io.Copy(to, rc); err != nil {
 		return err
 	}
@@ -219,8 +253,13 @@ func (o *Object) Write(from io.Reader) error {
 			return err
 		}
 		return w.Close()
+	case "oci":
+		return o._system.(*oci.OCI).PutObject(o.bucket, o.prefix, from)
 	}
-	return nil
+	// Reporting nil here said the write succeeded when nothing was written at
+	// all, which is the worst of the three outcomes: the caller believes its
+	// data is stored.
+	return fmt.Errorf("cannot write %s: scheme %q is not supported", o.url, o.scheme)
 }
 
 func (o *Object) Delete() error {
@@ -229,8 +268,12 @@ func (o *Object) Delete() error {
 		return o._system.(*s3.S3).DeleteObject(o.bucket, o.prefix)
 	case "gs":
 		return o._system.(*gcs.GCS).DeleteObject(o.bucket, o.prefix)
+	case "oci":
+		return o._system.(*oci.OCI).Delete(o.bucket, o.prefix)
 	}
-	return nil
+	// Same reasoning as Write: nil meant the object was deleted when nothing
+	// had been.
+	return fmt.Errorf("cannot delete %s: scheme %q is not supported", o.url, o.scheme)
 }
 
 func (o *Object) List(recursive bool) ([]*ObjectResult, error) {
