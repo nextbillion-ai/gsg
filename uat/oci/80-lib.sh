@@ -10,7 +10,9 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/nextbillion-ai/gsg/lib/object"
@@ -63,13 +65,54 @@ func main() {
 		fmt.Printf("FAIL read-after-delete: want ErrObjectNotFound, got %v\n", err)
 		os.Exit(1)
 	}
+	// PutObject needs the body's length and checksum before it sends
+	// anything. A seekable reader -- everything above -- is measured in place
+	// and rewound. Anything else is spooled to a temporary file, and that
+	// route is only reached by a reader that cannot seek, so it needs its own
+	// case or it is never exercised against the service at all.
+	payload := make([]byte, 3*1024*1024)
+	for i := range payload {
+		payload[i] = byte(i * 7 % 251)
+	}
+	before := spoolFiles()
+	big, _ := object.New(base + "/spooled.bin")
+	if err = big.Write(notSeekable{bytes.NewReader(payload)}); err != nil {
+		fmt.Println("FAIL spooled write:", err)
+		os.Exit(1)
+	}
+	var b3 bytes.Buffer
+	if err = big.Read(&b3); err != nil {
+		fmt.Println("FAIL spooled read:", err)
+		os.Exit(1)
+	}
+	if !bytes.Equal(b3.Bytes(), payload) {
+		fmt.Printf("FAIL spooled content: %d bytes back, wanted %d\n", b3.Len(), len(payload))
+		os.Exit(1)
+	}
+	// The spool file must not outlive the upload.
+	if after := spoolFiles(); after > before {
+		fmt.Printf("FAIL: %d spool file(s) left behind\n", after-before)
+		os.Exit(1)
+	}
+	_ = big.Delete()
+
 	_ = d.Delete()
 	fmt.Println("PASS")
+}
+
+// notSeekable hides the Seek a bytes.Reader would otherwise offer.
+type notSeekable struct{ r io.Reader }
+
+func (n notSeekable) Read(p []byte) (int, error) { return n.r.Read(p) }
+
+func spoolFiles() int {
+	m, _ := filepath.Glob(filepath.Join(os.TempDir(), "gsg-oci-put-*"))
+	return len(m)
 }
 GO
 
 out=$(cd .. && go run "$OLDPWD/libprobe.go" "$remote_base/libobj" 2>&1 | tail -1) || true
-assertEq "the library round trips an object on oci" "$out" "PASS"
+assertEq "the library round trips an object on oci, seekable and spooled" "$out" "PASS"
 rm -f libprobe.go
 
 finish
