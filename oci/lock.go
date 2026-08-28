@@ -139,6 +139,36 @@ func (o *OCI) DoAttemptUnlock(bucket, object, etag string) error {
 }
 
 // AttemptLock takes the lock and records the receipt that can release it.
+//
+// # The receipt identifies an object, not a holder
+//
+// The receipt is one file per bucket and object, so it records whatever was
+// locked most recently on this machine rather than any particular holder. That
+// is enough while a lock is held, and stops being enough once one expires:
+//
+//	A takes the lock          receipt = A's ETag
+//	the ttl passes
+//	B takes it over           receipt = B's ETag, overwritten in place
+//	A calls AttemptUnLock     it re-reads the receipt and finds B's ETag
+//	                          B's lock is released
+//
+// The ETag does change when B takes over -- the point is that A never kept its
+// own. It has nowhere to keep one: unlocking happens in a later call, possibly
+// a later process, and the receipt is the only thing carried between them.
+// DoAttemptUnlock's if-match cannot catch it either, because the value it is
+// handed genuinely is the current holder's.
+//
+// This is not specific to OCI. gs stores a generation and s3 an ETag in a file
+// named the same way, and the same sequence measured on s3 releases the lock
+// too. TODO item 24 has the details and what a fix would need.
+//
+// The window is exactly "a holder whose lock expired, then unlocks anyway",
+// which is what a job that overruns its own ttl does. The two runs need not
+// overlap, so one machine running one thing at a time is enough to hit it.
+//
+// Callers that need this to be safe should use lib/lock instead: it keeps the
+// lock id in memory for the lifetime of one Distributed value, so a holder
+// releases what it took and nothing else.
 func (o *OCI) AttemptLock(bucket, object string, ttl time.Duration) error {
 	etag, err := o.DoAttemptLock(bucket, object, ttl)
 	if err != nil {
@@ -160,6 +190,12 @@ func (o *OCI) AttemptLock(bucket, object string, ttl time.Duration) error {
 }
 
 // AttemptUnLock releases a lock using the receipt written when it was taken.
+//
+// It releases whatever that receipt names, which is not necessarily what this
+// caller locked: see AttemptLock on why the receipt identifies an object
+// rather than a holder, and TODO item 24. If the caller's own lock has since
+// expired and something else has taken it, this releases the new holder's lock
+// and reports success.
 //
 // A receipt that is simply absent is not an error: there is nothing to
 // release, and unlocking something never locked is a no-op. All three existing
