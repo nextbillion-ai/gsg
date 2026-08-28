@@ -880,17 +880,22 @@ Checking gsutil settled what the behaviour should be:
 | `mv obj obj` | exit 1, "are the same file - abort" |
 | `mv -r d d/sub` | performed; ends at `d/sub/d/...`, originals gone |
 
-So refusing a self-move is right, but refusing a move into a subdirectory of
-the source is not -- that is a real move. Which exposed the larger bug: mv
-listed the source *after* the copy, so for a destination inside the source the
-listing returned the fresh copies too and deleting them threw the data away.
-Measured on gs, `mv -r d d/sub` took two objects to none.
+That pointed at the larger bug: mv listed the source *after* the copy, so for a
+destination inside the source the listing returned the fresh copies too and
+deleting them threw the data away. Measured on gs, `mv -r d d/sub` took two
+objects to none. The delete list is now decided before the copy.
 
-Now the delete list is decided before the copy, and only the exact same path is
-refused. One deliberate divergence from gsutil: `mv -r d d/` is refused here,
-because gsg's `cp -r` copies a directory's contents where gsutil nests the
-directory itself, so for gsg the two spell the same place and the move would
-write every object over itself before deleting the originals.
+A self-descendant move is nonetheless refused, which is where gsg has to
+diverge from gsutil. gsutil can perform it because its copy nests the source
+directory -- it ends at `d/sub/d/...`, where nothing collides. gsg's `cp -r`
+copies a directory's *contents*, so source and destination keys run into each
+other: with `d/a.txt` holding "root" and `d/sub/a.txt` holding "nested",
+`mv -r d d/sub` writes the first over the second and then deletes the second as
+a source. Measured with the delete list already fixed, that still left one
+object holding the wrong contents. Ordering the copies would not settle it
+either, since they run in a pool.
+
+`mv -r d d/` is refused for the same reason, one keystroke away.
 
 The original note follows.
 

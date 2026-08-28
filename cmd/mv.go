@@ -25,21 +25,27 @@ var mvCmd = &cobra.Command{
 		src := system.ParseFileObject(args[0])
 		dst := system.ParseFileObject(args[1])
 
-		// Moving something onto itself is refused, as gsutil refuses it:
-		// `mv: "gs://b/k" and "gs://b/k" are the same file - abort`.
+		// Refuse a move whose destination is the source, or lives inside it.
 		//
-		// mv is a copy followed by a delete of the source, so without this the
-		// delete runs whatever the copy did. Whether the object survived came
-		// down to whether that backend's Copy happened to fail: measured, s3
-		// escaped only because AWS rejects a copy onto itself, and on gs the
-		// object was simply gone.
+		// mv is a copy followed by a delete of the source, and gsg's cp -r
+		// copies a directory's *contents* rather than the directory itself.
+		// That flattening is what makes a self-descendant move unsafe here:
+		// source keys and destination keys collide. Measured, with d/a.txt
+		// holding "root" and d/sub/a.txt holding "nested", `mv -r d d/sub`
+		// left only d/sub/sub/a.txt and "root" was gone -- d/sub/a.txt was
+		// written by the copy and then deleted as a source, and the two copies
+		// race in the pool besides.
 		//
-		// Only the exact same path, which is where gsutil draws the line too.
-		// A destination inside the source is a real move, and gsutil performs
-		// it -- `mv -r d d/sub` leaves d/sub/d/... with the originals gone.
-		// The ordering below is what lets this do the same.
-		if isSamePath(src, dst) {
-			logger.Info(module, "%s and %s are the same object - abort", args[0], args[1])
+		// gsutil allows the same command because its copy nests the source
+		// directory, ending at d/sub/d/... where nothing collides. gsg cannot
+		// borrow that answer without changing what cp -r means, so it refuses
+		// instead of doing something destructive.
+		//
+		// gsutil does refuse the identical-path case, with "are the same file
+		// - abort", and so does this.
+		if wouldDestroySource(src, dst) {
+			logger.Info(module, "refusing to move %s to %s: the destination is the source, or inside it, and the copy would overwrite what the delete then removes",
+				args[0], args[1])
 			common.Exit()
 		}
 
@@ -87,28 +93,36 @@ var mvCmd = &cobra.Command{
 	},
 }
 
-// isSamePath reports whether two parsed paths name the same thing.
+// wouldDestroySource reports whether moving a onto b would lose data rather
+// than move it.
 //
-// The system pointers are compared rather than the schemes: two FileObjects
-// for one scheme share the single registered backend, so this is both cheaper
-// and exact. A nil system means the path did not parse, and two unparseable
-// paths are not "the same object" in any useful sense.
+// Two shapes qualify. The destination being the source is the obvious one: the
+// copy produces nothing for the delete to spare. The destination living inside
+// the source is the subtle one, and it is specific to how gsg copies -- cp -r
+// writes a directory's contents into the destination rather than nesting the
+// directory, so d/a.txt and d/sub/a.txt both want to become d/sub/a.txt.
 //
-// This compares the paths as given, which is what gsutil does. A backend where
-// one object has more than one spelling catches its own variants -- oci does,
-// for bucket versus bucket@namespace -- because only it can resolve them.
-func isSamePath(a, b *system.FileObject) bool {
+// Trailing slashes are trimmed because they carry no meaning here and the
+// difference is one keystroke. The "inside" test needs a slash boundary, so a
+// sibling whose name merely begins with the source's is left alone: "a.txt" to
+// "a.txt.bak" is a real move, and so is "d" to "dsub".
+//
+// The paths are compared as given. A backend where one object has more than
+// one spelling catches its own variants -- oci does, for bucket versus
+// bucket@namespace -- because only it can resolve them.
+func wouldDestroySource(a, b *system.FileObject) bool {
 	if a == nil || b == nil || a.System == nil || b.System == nil {
 		return false
 	}
+	// Two FileObjects for one scheme share the single registered backend, so
+	// comparing the pointers is both cheaper and exact.
 	if a.System != b.System || a.Bucket != b.Bucket {
 		return false
 	}
-	// Trailing slashes carry no meaning here, and the difference is one
-	// keystroke. gsutil treats "d" and "d/" as different because its copy
-	// nests the source directory inside the destination -- it ends up with
-	// d/d/... . gsg's cp -r copies the contents rather than the directory, so
-	// for gsg the two name the same place: `mv -r d d/` wrote every object
-	// over itself and then deleted the originals, taking two objects to none.
-	return strings.TrimRight(a.Prefix, "/") == strings.TrimRight(b.Prefix, "/")
+	src := strings.TrimRight(a.Prefix, "/")
+	dst := strings.TrimRight(b.Prefix, "/")
+	if src == dst {
+		return true
+	}
+	return src != "" && strings.HasPrefix(dst, src+"/")
 }

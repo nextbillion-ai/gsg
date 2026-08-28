@@ -1078,16 +1078,32 @@ GOHELPER
     assertEq "and nothing was removed" \
         "$(../gsg ls -r $remote_base/$fmv 2>/dev/null | wc -l | tr -d ' ')" "2"
 
-    # Into a directory beneath itself: performed, and nothing lost. This is the
-    # one that used to end with an empty prefix.
-    ../gsg -m mv -r "$remote_base/$fmv" "$remote_base/$fmv/moved"
-    assertEq "a move into a subdirectory of the source keeps every object" \
-        "$(../gsg ls -r $remote_base/$fmv/moved 2>/dev/null | wc -l | tr -d ' ')" "2"
-    # By exact path: a pattern like "/a.txt$" also matches the copy that was
-    # just written to $fmv/moved/a.txt, so it would pass whether or not the
-    # originals survived.
-    assert_not $fmv/a.txt remote
-    assert_not $fmv/sub/b.txt remote
+    # Into a directory beneath itself: also refused, and this is the case with
+    # teeth. gsg's cp -r copies a directory's contents rather than nesting the
+    # directory, so source and destination keys collide: with a.txt at both
+    # $fmv and $fmv/sub, `mv -r $fmv $fmv/sub` would write $fmv/a.txt over
+    # $fmv/sub/a.txt and then delete the latter as a source. Measured before
+    # the guard, that left one object where there had been two, and the
+    # surviving one held the wrong contents.
+    #
+    # gsutil allows the same command because it nests -- it ends at
+    # $fmv/sub/$fmv/... where nothing collides. gsg cannot borrow that without
+    # changing what cp -r means.
+    prepare_file $fmv/collide.txt outer
+    prepare_file $fmv/sub/collide.txt inner
+    ../gsg cp $fmv/collide.txt $remote_base/$fmv/collide.txt
+    ../gsg cp $fmv/sub/collide.txt $remote_base/$fmv/sub/collide.txt
+
+    if ../gsg -m mv -r "$remote_base/$fmv" "$remote_base/$fmv/sub" >/dev/null 2>&1
+    then
+        echo "FATAL: a move into a subdirectory of the source was allowed"
+        exit 1
+    else
+        echo "OK: a move into a subdirectory of the source is refused"
+    fi
+    # Both colliding objects still there, each with its own contents.
+    assertValue $fmv/collide.txt outer remote
+    assertValue $fmv/sub/collide.txt inner remote
 
     finish
 
