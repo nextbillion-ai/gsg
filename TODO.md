@@ -35,7 +35,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 | 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
-| 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
+| 21 | fixed | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
 | 23 | fixed | yes -- a gs upload is stored with a checksum of whatever arrived | fixed: the upload now sends its checksum |
 | 24 | open | yes -- A releases B's lock after its own expired, on one machine | fix, design change |
@@ -870,6 +870,29 @@ Found while building the OCI backend, where the same shape was reachable a
 second way: `oci://b/k` and `oci://b@namespace/k` are one object with two
 spellings, so a raw string comparison of source and destination misses it. That
 one is fixed in the OCI backend.
+
+**Fixed**, and it turned out to be two bugs rather than one.
+
+Checking gsutil settled what the behaviour should be:
+
+| | gsutil |
+|---|---|
+| `mv obj obj` | exit 1, "are the same file - abort" |
+| `mv -r d d/sub` | performed; ends at `d/sub/d/...`, originals gone |
+
+So refusing a self-move is right, but refusing a move into a subdirectory of
+the source is not -- that is a real move. Which exposed the larger bug: mv
+listed the source *after* the copy, so for a destination inside the source the
+listing returned the fresh copies too and deleting them threw the data away.
+Measured on gs, `mv -r d d/sub` took two objects to none.
+
+Now the delete list is decided before the copy, and only the exact same path is
+refused. One deliberate divergence from gsutil: `mv -r d d/` is refused here,
+because gsg's `cp -r` copies a directory's contents where gsutil nests the
+directory itself, so for gsg the two spell the same place and the move would
+write every object over itself before deleting the originals.
+
+The original note follows.
 
 **Fix:** `cmd/mv.go` should not delete when the source and destination resolve
 to the same object -- once, in the command, rather than relying on each

@@ -1050,6 +1050,47 @@ GOHELPER
     finish
     fi
 
+    start "regression: mv must not delete what it just moved"
+    # mv is a copy followed by a delete of the source. The delete used to list
+    # the source *after* the copy, so when the destination lived inside the
+    # source that listing returned the fresh copies too and deleting them threw
+    # away the data the move had produced. Measured on gs: two objects to none.
+    #
+    # And a move onto the same path is refused outright, as gsutil refuses it,
+    # because there the copy produces nothing for the delete to spare.
+    fmv="folder_mv"
+    mkdir -p $fmv/sub
+    prepare_file $fmv/a.txt
+    prepare_file $fmv/sub/b.txt
+    ../gsg -m cp -r $fmv $remote_base/$fmv
+
+    # Onto itself: refused, and everything still there. A trailing slash names
+    # the same place and must be refused too -- it is one keystroke away.
+    for spelling in "$remote_base/$fmv" "$remote_base/$fmv/"
+    do
+        if ../gsg -m mv -r "$remote_base/$fmv" "$spelling" >/dev/null 2>&1
+        then
+            echo "FATAL: moving $fmv onto $spelling was allowed"
+            exit 1
+        fi
+    done
+    echo "OK: a move onto the same path is refused, with or without a trailing slash"
+    assertEq "and nothing was removed" \
+        "$(../gsg ls -r $remote_base/$fmv 2>/dev/null | wc -l | tr -d ' ')" "2"
+
+    # Into a directory beneath itself: performed, and nothing lost. This is the
+    # one that used to end with an empty prefix.
+    ../gsg -m mv -r "$remote_base/$fmv" "$remote_base/$fmv/moved"
+    assertEq "a move into a subdirectory of the source keeps every object" \
+        "$(../gsg ls -r $remote_base/$fmv/moved 2>/dev/null | wc -l | tr -d ' ')" "2"
+    # By exact path: a pattern like "/a.txt$" also matches the copy that was
+    # just written to $fmv/moved/a.txt, so it would pass whether or not the
+    # originals survived.
+    assert_not $fmv/a.txt remote
+    assert_not $fmv/sub/b.txt remote
+
+    finish
+
     start "regression: rm removes exactly what it is asked to"
     before=$(../gsg ls -r $remote_base/$fdu 2>/dev/null | wc -l | tr -d ' ')
     ../gsg rm $remote_base/$fdu/direct.txt
