@@ -38,6 +38,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
 | 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
 | 23 | open | yes -- a gs upload is stored with a checksum of whatever arrived | fix, two lines |
+| 24 | open | yes -- A releases B's lock after its own expired, on one machine | fix, design change |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
 fixing 3 alone converts silence into errors without making the requests
@@ -968,3 +969,51 @@ data, but it is worth fixing item 4 alongside, or computing the checksum here
 in a form that can report failure.
 
 Found while reviewing the OCI backend, which had the same gap.
+
+## 24. A lock receipt identifies an object, not a holder
+
+Releasing a lock needs proof it is ours: gs stores the generation, s3 and oci
+store the ETag, in a /tmp file named from the bucket and object. One file per
+object, so it records whoever locked it most recently on this machine rather
+than any particular holder.
+
+That is enough while a lock is held. It stops being enough once one expires:
+
+| step | |
+|---|---|
+| A takes a lock with a short ttl | receipt = A's |
+| the ttl passes | |
+| B takes it over, same machine | receipt = **B's** |
+| A runs unlock | reads **B's** receipt |
+| | **B's lock is released** |
+
+The conditional delete cannot help. The ETag it carries really is the current
+holder's, so the service is right to honour it -- the wrong value was chosen
+before the request was made.
+
+**Measured on both s3 and oci**, same sequence, same outcome: `RELEASED-BY-A`.
+gs stores a generation the same way and should be assumed to behave alike. Not
+introduced by any recent change; it is how the receipt has always been keyed.
+
+The window is exactly "a holder whose lock expired, then unlocks anyway", which
+is what a long-running job does when it overruns its own ttl -- and the two
+processes need not overlap, so a single-threaded machine is enough.
+
+**Fix:** the receipt has to name a holder, not an object. Either a per-holder
+receipt with the holder passing an identity to unlock, or a token in the lock
+object itself that unlock reads back and compares before deleting. Both change
+the interface, since `gsg unlock <url>` currently carries nothing to identify
+who is asking, which is why this is filed rather than fixed alongside the OCI
+backend.
+
+Worth pairing with item 16, which is about the same filename being shared
+between schemes.
+
+Related, and cheaper: an ambiguous `PutObject` -- one the service committed but
+whose response never arrived -- is read as a lost race on every backend. A
+client-generated token in the lock body would let the caller check whether it
+actually won, instead of assuming it did not. The lock is stranded until its
+ttl either way, so this costs availability rather than correctness.
+
+Found by review of the OCI locking backend; the uat there pins the current
+behaviour so a fix is noticed rather than silent.

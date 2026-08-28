@@ -8,6 +8,7 @@ import (
 	"github.com/nextbillion-ai/gsg/gcs"
 	"github.com/nextbillion-ai/gsg/linux"
 	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/nextbillion-ai/gsg/oci"
 	"github.com/nextbillion-ai/gsg/s3"
 	"github.com/nextbillion-ai/gsg/system"
 
@@ -57,6 +58,14 @@ var lockCmd = &cobra.Command{
 			common.Finish()
 		}
 
+		if fo.System.Scheme() == "oci" {
+			o := fo.System.(*oci.OCI)
+			if e := o.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
+				common.Exit()
+			}
+			common.Finish()
+		}
+
 		if fo.System.Scheme() == "" {
 			lnx := fo.System.(*linux.Linux)
 			if e := lnx.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
@@ -65,6 +74,10 @@ var lockCmd = &cobra.Command{
 			common.Finish()
 		}
 
-		logger.Info(module, "lock not suported in scheme %s", fo.System.Scheme())
+		// Not exiting here reported success for a lock that never happened:
+		// the message went to the log and the command still returned 0, so a
+		// caller relying on mutual exclusion got none and no failure either.
+		logger.Info(module, "lock is not supported for scheme [%s]", fo.System.Scheme())
+		common.Exit()
 	},
 }
