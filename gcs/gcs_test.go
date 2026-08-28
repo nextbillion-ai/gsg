@@ -1,7 +1,10 @@
 package gcs
 
 import (
+	"hash/crc32"
+	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/nextbillion-ai/gsg/common"
@@ -58,4 +61,57 @@ func TestAttemptUnLockWithoutCache(t *testing.T) {
 	assert.NotPanics(t, func() {
 		assert.NoError(t, g.AttemptUnLock(bucket, object))
 	})
+}
+
+// crc32cToSend has to describe the bytes that will actually be uploaded, not
+// whatever the path happens to name by then. A producer that atomically
+// replaces the file after it was opened leaves the fd on the old contents;
+// sending the new file's checksum with the old file's bytes has the service
+// reject an upload that was perfectly fine.
+func TestCRC32CToSendFollowsTheOpenFileNotThePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "moving.txt")
+	original := []byte("the bytes that were opened\n")
+	assert.NoError(t, os.WriteFile(path, original, 0600))
+
+	f, err := os.Open(path)
+	assert.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	// Replace the path with different contents, as an atomic writer would.
+	replacement := filepath.Join(dir, "replacement.txt")
+	assert.NoError(t, os.WriteFile(replacement, []byte("completely different bytes\n"), 0600))
+	assert.NoError(t, os.Rename(replacement, path))
+
+	crc, err := crc32cToSend(f, path)
+	assert.NoError(t, err)
+	assert.Equal(t, crc32.Checksum(original, crc32.MakeTable(crc32.Castagnoli)), crc,
+		"the checksum must describe the opened bytes, not the ones now at that path")
+
+	// And the handle must be back at the start, or the upload sends a
+	// truncated body that then fails the very check this is for.
+	body, err := io.ReadAll(f)
+	assert.NoError(t, err)
+	assert.Equal(t, original, body)
+}
+
+// The ordinary case: the path still names the open file, so the cached value
+// is used and it is the right one.
+func TestCRC32CToSendMatchesTheFileWhenNothingMoved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stable.txt")
+	content := []byte("nothing moved here\n")
+	assert.NoError(t, os.WriteFile(path, content, 0600))
+
+	f, err := os.Open(path)
+	assert.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	crc, err := crc32cToSend(f, path)
+	assert.NoError(t, err)
+	assert.Equal(t, crc32.Checksum(content, crc32.MakeTable(crc32.Castagnoli)), crc)
+
+	body, err := io.ReadAll(f)
+	assert.NoError(t, err)
+	assert.Equal(t, content, body, "the handle is left where the upload needs it")
 }

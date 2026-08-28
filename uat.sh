@@ -962,13 +962,19 @@ do_test() {
     done
     assertEq "the local checksum cache was poisoned" "$poisoned" "1"
 
-    if ../gsg cp $fint/poisoned.txt "$remote_base/$fint/poisoned.txt" >/dev/null 2>&1
+    # The output matters, not just the exit code. Any failure at all would
+    # make a bare non-zero pass -- a local read error, a rejected cache, a
+    # crash before the first byte -- and prove nothing about whether the
+    # service checked anything. The refusal has to be the service's.
+    if intout=$(../gsg cp $fint/poisoned.txt "$remote_base/$fint/poisoned.txt" 2>&1)
     then
         echo "FATAL: an upload carrying a checksum that does not match its body was accepted"
         exit 1
     else
         echo "OK: an upload whose checksum does not match its body is refused"
     fi
+    assertEq "and it was the service that refused it" \
+        "$(echo "$intout" | grep -c "doesn't match calculated CRC32C")" "1"
     assert_not $fint/poisoned.txt remote
     finish
     fi

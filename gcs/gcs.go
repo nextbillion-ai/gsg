@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -619,18 +620,10 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	// Both fields are required and both must be set before the first Write:
 	// the library ignores SendCRC32C afterwards, and zero is a valid checksum
 	// so it is never transmitted on its own.
-	//
-	// The checksum has to be known up front, which means reading the file once
-	// before sending it. That read is usually already paid for -- rsync
-	// computes the same value to decide whether to copy at all, and the result
-	// is cached by path and mtime.
-	crc, ok := common.GetFileCRC32CChecked(srcFile)
-	if !ok {
-		// Sending a zero here would have the service reject a file that is
-		// probably fine, with a message about checksums rather than about the
-		// read that actually failed.
-		logger.Info(module, "cannot compute the checksum of %s, so the upload cannot be verified", srcFile)
-		return fmt.Errorf("cannot upload %s: its checksum could not be computed", srcFile)
+	crc, cerr := crc32cToSend(f, srcFile)
+	if cerr != nil {
+		logger.Info(module, "cannot measure %s, so the upload cannot be verified: %s", srcFile, cerr)
+		return cerr
 	}
 	wc.CRC32C = crc
 	wc.SendCRC32C = true
@@ -785,4 +778,38 @@ func (g *GCS) MustEqualCRC32C(flag bool, localPath, bucket, object string) error
 	}
 	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 	return nil
+}
+
+// crc32cToSend returns the checksum of what f will actually upload.
+//
+// The subtlety is that the checksum and the body must describe the same
+// bytes. Reading the checksum from the path is cheap, because rsync has
+// usually computed and cached it already to decide whether to copy at all --
+// but the path and the open file can stop being the same thing. A producer
+// that atomically replaces srcFile after it was opened leaves the fd on the
+// old contents while the path names the new ones, and sending one checksum
+// with the other's bytes has the service reject an upload that was fine.
+//
+// So the cached value is used only while the path still names the file that
+// was opened, and otherwise the checksum is taken from the fd itself, which
+// cannot disagree with what is about to be sent. That fallback costs a second
+// pass over the file; the alternative is either an unverified upload or a
+// wrongly rejected one.
+func crc32cToSend(f *os.File, srcFile string) (uint32, error) {
+	if opened, err := f.Stat(); err == nil {
+		if named, nerr := os.Stat(srcFile); nerr == nil && os.SameFile(opened, named) {
+			if crc, ok := common.GetFileCRC32CChecked(srcFile); ok {
+				return crc, nil
+			}
+		}
+	}
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, fmt.Errorf("cannot read %s to checksum it: %w", srcFile, err)
+	}
+	// The body is uploaded from this same handle, so it has to go back.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("cannot rewind %s after checksumming it: %w", srcFile, err)
+	}
+	return h.Sum32(), nil
 }
