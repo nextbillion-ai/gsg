@@ -954,11 +954,16 @@ Where the three backends now stand:
 | oci | yes -- gsg computes it and sends `opc-content-crc32c` |
 
 **Fixed.** `GCS.Upload` now sends the checksum, so the service compares it
-against the body that arrived and refuses the object if they differ. The
-`GetFileCRC32C` ambiguity below was closed at the same time, since sending a
-zero that meant "could not compute" would have had good uploads rejected: a
-new `GetFileCRC32CChecked` reports whether the number is real, which is half of
-item 4.
+against the body that arrived and refuses the object if they differ.
+
+The checksum is taken from the open handle rather than from the cache keyed on
+path and mtime. The cache is cheaper -- and an earlier version of this fix used
+it, guarded by `os.SameFile` -- but it is only as good as the assumption that
+content and modification time move together. Where that is wrong the checksum
+describes different bytes than the body does, and the service refuses the
+object: a whole upload spent to be told it was stale. Measured on a 190MB file,
+hashing the handle costs 111ms cold and 50ms warm against a 4s upload, so the
+guess was never worth what it risked.
 
 The original note follows.
 

@@ -117,20 +117,20 @@ func GenTempFileName(parts ...string) string {
 
 }
 
-func readOrComputeCRC32c(path string) (uint32, bool) {
+func readOrComputeCRC32c(path string) uint32 {
 	result := uint32(0)
 	cacheFileName := GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
 
 	if cached, ok := readCRC32cCache(cacheFileName); ok {
 		logger.Debug(module, "loaded crc32c [%s] from catch: %d", cacheFileName, cached)
-		return cached, true
+		return cached
 	}
 
 	logger.Debug(module, "Computing CRC32C for [%s], size: %d bytes, gentle mode: %t", path, GetFileSize(path), GentleIO)
 	file, err := os.Open(path)
 	if err != nil {
 		logger.Debug(module, "failed with %s", err)
-		return 0, false
+		return 0
 	}
 	defer func() { _ = file.Close() }()
 
@@ -186,15 +186,12 @@ func readOrComputeCRC32c(path string) (uint32, bool) {
 	if !complete {
 		// Return the sum anyway -- callers treat a CRC mismatch as a failed
 		// transfer, which is the safe direction -- but caching it would make a
-		// transient read error permanent for this path and mtime. The second
-		// result is what lets a caller tell this apart from a real checksum,
-		// which matters when the number is about to be sent to a service that
-		// will reject the upload if it disagrees.
+		// transient read error permanent for this path and mtime.
 		logger.Debug(module, "not caching crc32c for [%s]: file was not read in full", path)
-		return result, false
+		return result
 	}
 	writeCRC32cCache(cacheFileName, result)
-	return result, true
+	return result
 }
 
 // readCRC32cCache returns the cached crc32c for cacheFileName, reporting false
@@ -252,28 +249,11 @@ func writeCRC32cCache(cacheFileName string, result uint32) {
 	logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
 }
 
-// GetFileCRC32C gets the crc32c of a file.
-//
-// A zero means either that the checksum is zero or that it could not be
-// computed, and there is no way to tell which -- see TODO item 4. Prefer
-// GetFileCRC32CChecked where the difference matters.
+// GetFileCRC32C gets the crc32c of a file
 func GetFileCRC32C(path string) uint32 {
-	v, _ := GetFileCRC32CChecked(path)
-	return v
-}
-
-// GetFileCRC32CChecked gets the crc32c of a file, and says whether it is a
-// real checksum.
-//
-// The second result is false when the file could not be opened, could not be
-// read to the end, or is not a file at all. Callers that merely compare
-// checksums can ignore it: a wrong number reads as a mismatch, which is the
-// safe direction. Callers that send the number to a service cannot, because a
-// zero standing in for "unknown" would have a perfectly good upload rejected.
-func GetFileCRC32CChecked(path string) (uint32, bool) {
 	path, _ = filepath.Abs(path)
 	if IsPathDirectory(path) {
-		return 0, false
+		return 0
 	}
 	return readOrComputeCRC32c(path)
 }

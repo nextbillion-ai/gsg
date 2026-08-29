@@ -922,11 +922,9 @@ do_test() {
     # computes it from whatever reached it. Nothing was transmitted, so a body
     # corrupted in transit was stored together with a checksum of the corrupted
     # bytes: rsync then saw a matching object and -v verified the corruption
-    # against itself and passed. Sending the checksum makes the service compare
-    # and refuse.
+    # against itself and passed.
     #
-    # gs only. s3 has been checked since #47, where the aws sdk computes and
-    # sends it, and oci since #52.
+    # gs only. s3 has been checked since #47 and oci since #52.
     if [[ "$mode" != "gs" ]]
     then
         echo "SKIP: only the gs upload path was missing this"
@@ -938,44 +936,83 @@ do_test() {
     ../gsg cp $fint/a.txt $remote_base/$fint/a.txt
     assert $fint/a.txt remote
 
-    # The teeth of this case. The checksum gsg sends is read through the
-    # crc32c cache in /tmp, so poisoning that entry makes gsg transmit a value
-    # that does not describe the body -- which is exactly what a corrupted
-    # transfer looks like from the service's side. It must refuse the object.
-    #
-    # If the checksum were not transmitted at all, as before this fix, the
-    # upload would simply succeed and the wrong value would go unnoticed.
-    #
-    # The first upload is what populates the cache: nothing else in a plain cp
-    # computes a local checksum.
-    prepare_file $fint/poisoned.txt
-    snapshotTmp
-    ../gsg cp $fint/poisoned.txt "$remote_base/$fint/first.txt"
-    poisoned=0
-    for f in $(newTmpCaches)
-    do
-        if [[ -f "/tmp/$f" && "$(wc -c < "/tmp/$f" | tr -d ' ')" == "4" ]]
-        then
-            printf '\xde\xad\xbe\xef' > "/tmp/$f"
-            poisoned=$((poisoned+1))
-        fi
-    done
-    assertEq "the local checksum cache was poisoned" "$poisoned" "1"
+    # Ordinary work must not pay for the check. A file that changes and is
+    # uploaded again has to succeed on the first attempt, storing the new
+    # bytes -- not fail, recompute and retry.
+    prepare_file $fint/edited.txt first
+    ../gsg cp $fint/edited.txt $remote_base/$fint/edited.txt
+    assertValue $fint/edited.txt first remote
 
-    # The output matters, not just the exit code. Any failure at all would
-    # make a bare non-zero pass -- a local read error, a rejected cache, a
-    # crash before the first byte -- and prove nothing about whether the
-    # service checked anything. The refusal has to be the service's.
-    if intout=$(../gsg cp $fint/poisoned.txt "$remote_base/$fint/poisoned.txt" 2>&1)
+    prepare_file $fint/edited.txt second
+    editout=$(../gsg cp $fint/edited.txt $remote_base/$fint/edited.txt 2>&1) && editrc=0 || editrc=$?
+    assertEq "re-uploading a changed file succeeds" "$editrc" "0"
+    assertEq "and it was not refused and retried" \
+        "$(echo "$editout" | grep -c "doesn't match calculated CRC32C")" "0"
+    assertValue $fint/edited.txt second remote
+
+    # The same, with the modification time put back exactly. The checksum is
+    # taken from the handle the body is read from rather than from the cache
+    # keyed on path and mtime, so this is just another upload -- when it came
+    # from the cache it was a whole upload spent to be told the checksum was
+    # stale.
+    prepare_file $fint/sneaky.txt before
+    ../gsg cp $fint/sneaky.txt $remote_base/$fint/sneaky.txt
+
+    # Rewritten by a helper rather than by touch, because touch works to the
+    # second while the cache key carries nanoseconds -- a touched file lands on
+    # a different key and is recomputed, so it would pass whatever the code
+    # did. Putting the modification time back exactly is what makes the cache
+    # look valid when it is not.
+    cat > sneaky_helper.go <<'GOHELPER'
+package main
+
+import (
+	"os"
+	"time"
+)
+
+func main() {
+	p, content := os.Args[1], os.Args[2]
+	fi, err := os.Stat(p)
+	if err != nil {
+		os.Exit(1)
+	}
+	mt := fi.ModTime()
+	if err = os.WriteFile(p, []byte(content+"\n"), 0600); err != nil {
+		os.Exit(1)
+	}
+	if err = os.Chtimes(p, time.Now(), mt); err != nil {
+		os.Exit(1)
+	}
+}
+GOHELPER
+    (cd .. && go run "$OLDPWD/sneaky_helper.go" "$OLDPWD/$fint/sneaky.txt" afterx)
+    rm -f sneaky_helper.go
+    sneakout=$(../gsg cp $fint/sneaky.txt $remote_base/$fint/sneaky.txt 2>&1) && sneakrc=0 || sneakrc=$?
+    assertEq "a change that keeps the modification time still uploads" "$sneakrc" "0"
+    assertEq "and is not refused either" \
+        "$(echo "$sneakout" | grep -c "doesn't match calculated CRC32C")" "0"
+    assertValue $fint/sneaky.txt afterx remote
+
+    # And the checksum really is transmitted. Built with an overlay so the
+    # source tree is untouched: a gsg that sends a checksum one off from the
+    # body must have the object refused. Without the checksum being sent at
+    # all, this upload would simply succeed.
+    ovdir=$(mktemp -d)
+    sed 's/return h.Sum32(), nil/return h.Sum32() + 1, nil/' ../gcs/gcs.go > "$ovdir/gcs.go"
+    printf '{"Replace":{"%s/gcs/gcs.go":"%s/gcs.go"}}' "$repoRoot" "$ovdir" > "$ovdir/overlay.json"
+    (cd .. && go build -overlay "$ovdir/overlay.json" -o "$ovdir/gsg_wrongcrc" .) >/dev/null 2>&1
+
+    if "$ovdir/gsg_wrongcrc" cp $fint/a.txt "$remote_base/$fint/wrongcrc.txt" >/dev/null 2>&1
     then
         echo "FATAL: an upload carrying a checksum that does not match its body was accepted"
+        rm -rf "$ovdir"
         exit 1
     else
         echo "OK: an upload whose checksum does not match its body is refused"
     fi
-    assertEq "and it was the service that refused it" \
-        "$(echo "$intout" | grep -c "doesn't match calculated CRC32C")" "1"
-    assert_not $fint/poisoned.txt remote
+    assert_not $fint/wrongcrc.txt remote
+    rm -rf "$ovdir"
     finish
     fi
 

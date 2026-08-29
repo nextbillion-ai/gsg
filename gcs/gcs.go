@@ -780,34 +780,28 @@ func (g *GCS) MustEqualCRC32C(flag bool, localPath, bucket, object string) error
 	return nil
 }
 
-// crc32cToSend returns the checksum of what f will actually upload.
+// crc32cToSend returns the checksum of exactly the bytes f will upload.
 //
-// The subtlety is that the checksum and the body must describe the same
-// bytes. Reading the checksum from the path is cheap, because rsync has
-// usually computed and cached it already to decide whether to copy at all --
-// but the path and the open file can stop being the same thing. A producer
-// that atomically replaces srcFile after it was opened leaves the fd on the
-// old contents while the path names the new ones, and sending one checksum
-// with the other's bytes has the service reject an upload that was fine.
+// It reads the handle rather than consulting the cached value for the path,
+// and that is deliberate. The cache is keyed on path and mtime, so it is only
+// as trustworthy as the assumption that content and mtime change together --
+// and when that assumption is wrong the checksum sent describes different
+// bytes than the body does. GCS recomputes on arrival and rejects the object,
+// so the price of a stale entry is a whole upload spent to be told it was
+// wrong. Measured against a 190MB file, hashing the handle costs 111ms cold
+// and 50ms warm; a wasted upload of the same file costs orders of magnitude
+// more, and fails work that should have succeeded.
 //
-// So the cached value is used only while the path still names the file that
-// was opened, and otherwise the checksum is taken from the fd itself, which
-// cannot disagree with what is about to be sent. That fallback costs a second
-// pass over the file; the alternative is either an unverified upload or a
-// wrongly rejected one.
+// Reading the handle cannot be stale: it is the same descriptor the body is
+// read from, so nothing can substitute the file underneath it.
+//
+// The handle is rewound afterwards, because the upload reads from where this
+// left it.
 func crc32cToSend(f *os.File, srcFile string) (uint32, error) {
-	if opened, err := f.Stat(); err == nil {
-		if named, nerr := os.Stat(srcFile); nerr == nil && os.SameFile(opened, named) {
-			if crc, ok := common.GetFileCRC32CChecked(srcFile); ok {
-				return crc, nil
-			}
-		}
-	}
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	if _, err := io.Copy(h, f); err != nil {
 		return 0, fmt.Errorf("cannot read %s to checksum it: %w", srcFile, err)
 	}
-	// The body is uploaded from this same handle, so it has to go back.
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return 0, fmt.Errorf("cannot rewind %s after checksumming it: %w", srcFile, err)
 	}
