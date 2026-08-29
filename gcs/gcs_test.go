@@ -1,8 +1,12 @@
 package gcs
 
 import (
+	"hash/crc32"
+	"io"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nextbillion-ai/gsg/common"
 
@@ -58,4 +62,85 @@ func TestAttemptUnLockWithoutCache(t *testing.T) {
 	assert.NotPanics(t, func() {
 		assert.NoError(t, g.AttemptUnLock(bucket, object))
 	})
+}
+
+// crc32cToSend has to describe the bytes that will actually be uploaded, not
+// whatever the path happens to name by then.
+//
+// It reads the handle for that reason. Consulting the cached checksum for the
+// path would be cheaper -- the cache is keyed on path and mtime -- but it is
+// then only as good as the assumption that content and mtime move together,
+// and GCS rejects the object when they have not. The price of being wrong is a
+// whole upload spent to be told so, which for a large file dwarfs the hash.
+func TestCRC32CToSendFollowsTheOpenFileNotThePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "moving.txt")
+	original := []byte("the bytes that were opened\n")
+	assert.NoError(t, os.WriteFile(path, original, 0600))
+
+	f, err := os.Open(path)
+	assert.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	// Replace the path with different contents, as an atomic writer would.
+	replacement := filepath.Join(dir, "replacement.txt")
+	assert.NoError(t, os.WriteFile(replacement, []byte("completely different bytes\n"), 0600))
+	assert.NoError(t, os.Rename(replacement, path))
+
+	crc, err := crc32cToSend(f, path)
+	assert.NoError(t, err)
+	assert.Equal(t, crc32.Checksum(original, crc32.MakeTable(crc32.Castagnoli)), crc,
+		"the checksum must describe the opened bytes, not the ones now at that path")
+
+	// And the handle must be back at the start, or the upload sends a
+	// truncated body that then fails the very check this is for.
+	body, err := io.ReadAll(f)
+	assert.NoError(t, err)
+	assert.Equal(t, original, body)
+}
+
+// The ordinary case, where nothing has moved.
+func TestCRC32CToSendMatchesTheFileWhenNothingMoved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stable.txt")
+	content := []byte("nothing moved here\n")
+	assert.NoError(t, os.WriteFile(path, content, 0600))
+
+	f, err := os.Open(path)
+	assert.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	crc, err := crc32cToSend(f, path)
+	assert.NoError(t, err)
+	assert.Equal(t, crc32.Checksum(content, crc32.MakeTable(crc32.Castagnoli)), crc)
+
+	body, err := io.ReadAll(f)
+	assert.NoError(t, err)
+	assert.Equal(t, content, body, "the handle is left where the upload needs it")
+}
+
+// A file whose contents change while its modification time is put back is what
+// makes a path-and-mtime cache lie. Reading the handle is unaffected by it,
+// which is the whole reason for reading the handle.
+func TestCRC32CToSendIgnoresAStaleModificationTime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sneaky.txt")
+	assert.NoError(t, os.WriteFile(path, []byte("before\n"), 0600))
+
+	fi, err := os.Stat(path)
+	assert.NoError(t, err)
+	mt := fi.ModTime()
+
+	changed := []byte("afterx\n")
+	assert.NoError(t, os.WriteFile(path, changed, 0600))
+	assert.NoError(t, os.Chtimes(path, time.Now(), mt))
+
+	f, err := os.Open(path)
+	assert.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	crc, err := crc32cToSend(f, path)
+	assert.NoError(t, err)
+	assert.Equal(t, crc32.Checksum(changed, crc32.MakeTable(crc32.Castagnoli)), crc,
+		"the checksum must describe the current bytes, whatever the mtime says")
 }
