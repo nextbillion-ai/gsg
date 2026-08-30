@@ -1105,6 +1105,38 @@ GOHELPER
     assertValue $fmv/collide.txt outer remote
     assertValue $fmv/sub/collide.txt inner remote
 
+    # The guard has to stay out of the way of real moves, or it trades one
+    # kind of lost work for another. These are the near misses: a sibling
+    # whose name begins with the source's, and a longer name at the same
+    # level. Both were refused by an earlier version of the guard that
+    # compared prefixes without a slash boundary.
+    prepare_file $fmv/near.txt near
+    ../gsg cp $fmv/near.txt $remote_base/$fmv/near.txt
+    assertOk "a longer name at the same level is a real move" \
+        ../gsg mv "$remote_base/$fmv/near.txt" "$remote_base/$fmv/near.txt.bak"
+    assertValue $fmv/near.txt.bak near remote
+    assert_not $fmv/near.txt remote
+
+    ../gsg -m cp -r $fmv/sub $remote_base/$fmv/d
+    assertOk "a sibling whose name starts with the source's is allowed" \
+        ../gsg -m mv -r "$remote_base/$fmv/d" "$remote_base/$fmv/dsub"
+    assertEq "a sibling whose name starts with the source's is a real move" \
+        "$(../gsg ls -r $remote_base/$fmv/dsub 2>/dev/null | wc -l | tr -d ' ')" "2"
+    # By exact path: counting ls output would count its "No objects found"
+    # line as a result, so an empty prefix reads as one entry.
+    assert_not $fmv/d/b.txt remote
+    assert_not $fmv/d/collide.txt remote
+
+    # A single object, without -r. That is the other branch of mv entirely --
+    # it deletes src.Prefix directly rather than walking a listing -- and
+    # nothing exercised it.
+    prepare_file $fmv/single.txt lonely
+    ../gsg cp $fmv/single.txt $remote_base/$fmv/single.txt
+    assertOk "a single object moves without -r" \
+        ../gsg mv "$remote_base/$fmv/single.txt" "$remote_base/$fmv/moved_single.txt"
+    assertValue $fmv/moved_single.txt lonely remote
+    assert_not $fmv/single.txt remote
+
     finish
 
     start "regression: rm removes exactly what it is asked to"
