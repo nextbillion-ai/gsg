@@ -114,6 +114,29 @@ assertEq "and stores the new content" \
     "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$fre/sneaky.txt" --file - 2>/dev/null)" "afterx"
 
+# Everything above would also pass if the checksum were never sent: OCI would
+# compute one over whatever arrived, store it, and agree with itself forever.
+# What makes the header load-bearing is that a wrong one is refused. Built with
+# an overlay so the source tree is untouched -- a gsg whose checksum is one off
+# from its body must have the object rejected, and must leave nothing behind.
+ovdir=$(mktemp -d)
+sed 's/return h.Sum32(), n, nil/return h.Sum32() + 1, n, nil/' ../oci/transfer.go > "$ovdir/transfer.go"
+assertEq "the overlay actually changed the checksum" \
+    "$(diff ../oci/transfer.go "$ovdir/transfer.go" | grep -c '^>')" "1"
+printf '{"Replace":{"%s/oci/transfer.go":"%s/transfer.go"}}' "$repoRoot" "$ovdir" > "$ovdir/overlay.json"
+(cd .. && go build -overlay "$ovdir/overlay.json" -o "$ovdir/gsg_wrongcrc" .) >/dev/null 2>&1
+
+if "$ovdir/gsg_wrongcrc" cp $fre/edited.txt "$remote_base/$fre/wrongcrc.txt" >/dev/null 2>&1
+then
+    echo "FATAL: an upload carrying a checksum that does not match its body was accepted"
+    rm -rf "$ovdir"
+    exit 1
+else
+    echo "OK: an upload whose checksum does not match its body is refused"
+fi
+assert_not $fre/wrongcrc.txt remote
+rm -rf "$ovdir"
+
 finish
 
 start "transfer: -v verifies, and a repeated rsync is a no-op"

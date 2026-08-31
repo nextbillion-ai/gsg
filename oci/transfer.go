@@ -119,15 +119,21 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 // reads the very handle the upload will read, so nothing can be substituted
 // underneath it. Reading the cached checksum for the path would be cheaper and
 // occasionally wrong, and being wrong costs the whole upload.
-func crc32cOfReader(f *os.File) (uint32, error) {
+func crc32cOfReader(f *os.File) (crc uint32, size int64, err error) {
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-	if _, err := io.Copy(h, f); err != nil {
-		return 0, fmt.Errorf("oci: cannot read %s to checksum it: %w", f.Name(), err)
+	// The byte count comes back with the checksum because both have to
+	// describe the same bytes. Taking the length from a stat of the path
+	// instead would let ContentLength describe one file while the body and
+	// the checksum describe another, if the path is replaced in between --
+	// the mismatch this function exists to rule out.
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, 0, fmt.Errorf("oci: cannot read %s to checksum it: %w", f.Name(), err)
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("oci: cannot rewind %s after checksumming it: %w", f.Name(), err)
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return 0, 0, fmt.Errorf("oci: cannot rewind %s after checksumming it: %w", f.Name(), err)
 	}
-	return h.Sum32(), nil
+	return h.Sum32(), n, nil
 }
 
 // Upload stores srcFile as an object.
@@ -143,7 +149,6 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	}
 	defer func() { _ = f.Close() }()
 
-	size := common.GetFileSize(srcFile)
 	logger.Info(module, "uploading %s to %s/%s", srcFile, name, object)
 
 	// Record a CRC32C, and send our own so the upload is checked on arrival.
@@ -172,7 +177,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	// -- which the service notices, so the price of a stale entry is a whole
 	// upload spent to be told it was stale. On the gs side that trade was
 	// measured at 111ms of hashing against a 4s upload of the same 190MB file.
-	crc, err := crc32cOfReader(f)
+	crc, size, err := crc32cOfReader(f)
 	if err != nil {
 		return err
 	}
