@@ -38,27 +38,46 @@ type Attrs struct {
 	CRC32        uint32
 	ModTime      time.Time
 	RelativePath string
-	CalcCRC32C   func() uint32
+	// CalcCRC32C, when set, produces the checksum on demand. The second
+	// result says whether it could be determined at all -- a checksum the
+	// object never carried, or one a request failed to fetch. A bare uint32
+	// could not tell those from a genuine 0, and Same compared the 0 as if it
+	// were real, so two objects that both failed to produce a checksum
+	// matched on size alone.
+	CalcCRC32C func() (uint32, bool)
 }
 
 func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
 	if b == nil {
 		return false
 	}
-	var r bool
-	r = a.RelativePath == b.RelativePath
+	r := a.RelativePath == b.RelativePath
 	r = r && a.Size == b.Size
 	if !forceChecksum && !a.ModTime.Equal(time.Time{}) && !b.ModTime.Equal(time.Time{}) {
 		r = r && a.ModTime.Equal(b.ModTime)
 	}
+	// Nothing below can make two files that already differ match, and
+	// CalcCRC32C is the expensive half: on the linux side it reads the whole
+	// file, and on s3 it is a request per object. Two files of different sizes
+	// were being hashed and fetched only to be declared different anyway.
+	if !r {
+		return false
+	}
 	if a.CalcCRC32C != nil {
-		a.CRC32 = a.CalcCRC32C()
+		crc, ok := a.CalcCRC32C()
+		if !ok {
+			return false
+		}
+		a.CRC32 = crc
 	}
 	if b.CalcCRC32C != nil {
-		b.CRC32 = b.CalcCRC32C()
+		crc, ok := b.CalcCRC32C()
+		if !ok {
+			return false
+		}
+		b.CRC32 = crc
 	}
-	r = r && a.CRC32 == b.CRC32
-	return r
+	return a.CRC32 == b.CRC32
 }
 
 type RunContext struct {

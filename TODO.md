@@ -23,9 +23,9 @@ several are not worth fixing. The evidence is recorded under each one.
 | 6 | open | yes, but needs a newline in a filename | low |
 | 7 | open | no -- one goroutine per process | low, testing annoyance only |
 | 8 | open | synthetic only -- 511 MB per million objects | low unless such prefixes exist |
-| 9 | open | yes -- 1.8x slower, ~1005 extra calls per 1005 objects | fix eventually |
+| 9 | PR #62 | yes -- 2.1x slower, ~1006 extra calls per 1006 objects | fixed |
 | 10 | open | yes, but unreachable from the CLI | low |
-| 11 | open | yes, but needs a marker carrying bytes | low |
+| 11 | PR #62 | yes, but needs a marker carrying bytes | fixed, with 9 |
 | 12 | PR #42 | yes -- 8 data races under -m | fix |
 | 13 | PR #43 | n/a -- duplication, one copy with a flaw | fix |
 | 14 | PR #46 | yes -- 301 MovedPermanently across regions | fix, with 3 |
@@ -327,6 +327,38 @@ already carried. Real money and latency at a million keys; barely visible at a
 thousand. The stronger argument for fixing it remains the partial-failure
 surface it creates, not the speed.
 
+**Fixed in PR #62.** All three steps, in the order above. Measured over 1006
+objects: `ls -r` 0.88-1.05s -> 0.45s, `du` 1.06s -> 0.49s, output byte for byte
+identical, and the per-object requests gone rather than merely capped.
+
+Two wrinkles worth recording. Step 3 moves the checksum onto `Attrs.CalcCRC32C`,
+and the first draft fetched one checksum per call -- a serial round trip inside
+rsync's comparison loop, where the code it replaced had used a bounded parallel
+fan-out. Measured over the same 1006 objects, that made rsync 64.4s -> 93.0s,
+giving back more than the listing win. The fix is to keep the fan-out but defer
+it: the first checksum read fills the whole listing's worth at once, with the
+same cap. rsync is then 64.7s against 64.4s, and `ls`, `du`, `cat` and `rm`
+never trigger it at all.
+
+The second wrinkle was a real bug, caught in review. Deferring the checksum
+means the fetch can come back with nothing -- the object carries no comparable
+CRC32C, or the request failed -- and `CalcCRC32C` returned a bare `uint32`, so
+either became a checksum of 0 that `Attrs.Same` compared as if it were real.
+Before the change a failed fetch aborted the whole listing instead, so this was
+new. Both sides have to come back empty for it to bite, which rules out the
+local cases but not a cloud-to-cloud rsync: with `-v` the modification time is
+skipped by design, so two same-sized objects that both lack a checksum compared
+*equal*. Measured: `gsg rsync -r -v s3://.../src s3://.../dst` over 4-byte
+objects holding `AAAA` and `BBBB`, neither carrying a CRC32C, left the
+destination as `BBBB` and reported no diff.
+
+`CalcCRC32C` now returns `(uint32, bool)` and `Same` treats "could not
+determine" as a difference, so the object is copied rather than skipped on the
+strength of two failures agreeing. That is the conservative answer rather than
+the loud one -- step 2's loudness cannot be kept once the fetch happens after
+the listing has been returned -- and it is the safe direction: a needless copy,
+never a silent skip. This is a narrower version of item 18.
+
 ## 10. A non-recursive `du` reports zero for every directory
 
 With `recursive=false` the listing uses a delimiter, so subdirectories come back
@@ -400,6 +432,11 @@ through from the listing rather than refetched.
 **Reproduced, low value.** A 7 byte marker added to a prefix holding 27 bytes
 leaves `du -s` reporting 27. Directory markers are essentially always zero
 length, so the undercount needs an unusual object to appear at all.
+
+**Fixed in PR #62,** as predicted, by item 9's change: carrying `Size` through
+from the listing keeps real keys and common prefixes apart, so a marker is
+counted like the object it is. `aws s3 ls --recursive --summarize` over the
+same three objects reports 27 where gsg reported 20; both now say 27.
 
 ## 12. Both cloud backends race on their lazy client
 

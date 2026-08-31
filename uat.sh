@@ -590,16 +590,21 @@ do_test() {
     aws s3api put-object --bucket gsg-uat --key "$testid/$fdu/sub/" --body marker.bin >/dev/null
     assertEq "du lists sub/ exactly once, not twice" \
         "$(../gsg du $remote_base/$fdu 2>/dev/null | grep -c "/$fdu/sub/$")" "1"
-    # 27, not 34: batchAttrs short-circuits every key ending in "/" and
-    # synthesizes an empty GetObjectAttributesOutput for it, so the marker's
-    # size is never read and its 7 bytes go uncounted. Right for a common
-    # prefix, which has no size; wrong for a real object that happens to end in
-    # "/". Pre-existing, unchanged by #35, and recorded in TODO.md -- pinned
-    # here so that fixing it is a deliberate act rather than a surprise.
-    assertEq "a marker's bytes are currently NOT counted (known, see TODO.md)" \
-        "$(../gsg du -s $remote_base/$fdu 2>/dev/null | awk '{print $1}')" "27"
-    assertEq "and the sub/ subtotal is unchanged by it" \
-        "$(../gsg du $remote_base/$fdu 2>/dev/null | grep "/$fdu/sub/$" | awk '{print $1}')" "17"
+    # 34, not 27. This used to report 27: batchAttrs short-circuited every key
+    # ending in "/" and synthesized an empty GetObjectAttributesOutput for it,
+    # so the marker's size was never read and its 7 bytes went uncounted --
+    # right for a common prefix, which has no size, and wrong for a real object
+    # that happens to end in "/". That was TODO item 11, pinned here so that
+    # changing it would be deliberate.
+    #
+    # Carrying the size through from the listing keeps the two kinds apart, so
+    # the marker is now counted, which is what item 11 asked for and what the
+    # aws cli itself reports: "aws s3 ls --recursive --summarize" over the same
+    # three objects gives 27 where gsg gave 20, and both now say 27.
+    assertEq "a marker's bytes are counted (TODO item 11)" \
+        "$(../gsg du -s $remote_base/$fdu 2>/dev/null | awk '{print $1}')" "34"
+    assertEq "and they land in the sub/ subtotal" \
+        "$(../gsg du $remote_base/$fdu 2>/dev/null | grep "/$fdu/sub/$" | awk '{print $1}')" "24"
     aws s3api delete-object --bucket gsg-uat --key "$testid/$fdu/sub/" >/dev/null
     finish
     fi
@@ -637,9 +642,13 @@ do_test() {
     finish
 
     start "regression: a listing larger than the attribute fan-out limit"
-    # batchAttrs caps concurrent attribute requests at 64. Every other fixture
-    # here is small enough that the cap never engages, so nothing covered the
-    # path where work queues behind it.
+    # Concurrent attribute requests are capped at 64. Every other fixture here
+    # is small enough that the cap never engages, so nothing covered the path
+    # where work queues behind it.
+    #
+    # On s3 the fan-out is now the checksum batch rather than one request per
+    # listed object, and only a caller that compares checksums triggers it --
+    # so ls and du below no longer reach it, and the rsync does.
     fmany="folder_many"
     mkdir -p $fmany
     i=1
@@ -654,7 +663,118 @@ do_test() {
     assertEq "and du -s totals them" \
         "$(../gsg du -s $remote_base/$fmany 2>/dev/null | awk '{print $1}')" \
         "$(cat $fmany/* | wc -c | tr -d ' ')"
+    # It takes two rsyncs to reach the cap. The first copies into an empty
+    # directory, where there is nothing to compare against, so no checksum is
+    # ever read and the batch never fires. The second compares 70 objects,
+    # which is what queues work behind a cap of 64.
+    rm -rf ${fmany}_sync && mkdir -p ${fmany}_sync
+    ../gsg -m rsync -r $remote_base/$fmany ${fmany}_sync >/dev/null 2>&1
+    assertEq "an rsync past the cap brings back every object" \
+        "$(find ${fmany}_sync -type f | wc -l | tr -d ' ')" "70"
+    assertOk "and the tree matches" diff -r $fmany ${fmany}_sync
+    assertEq "a second rsync compares all 70 and copies nothing" \
+        "$(../gsg -m rsync -r $remote_base/$fmany ${fmany}_sync 2>&1 | grep -c 'No diff detected')" "1"
+    assertOk "and the tree still matches" diff -r $fmany ${fmany}_sync
+    rm -rf ${fmany}_sync
     finish
+
+    start "regression: a listing reports the sizes and times the service has"
+
+    # s3 used to answer a listing by taking the keys and throwing away the size
+    # and modification time that came with them, then issuing one
+    # GetObjectAttributes per key to fetch the same two values back. A million
+    # keys meant a million extra requests for data already in hand, and a
+    # million independent chances to fail -- and a failed lookup dropped that
+    # object from the result. The listing now carries them.
+    #
+    # What this case does NOT do is prove the extra requests are gone: reverting
+    # to eager per-object fetches would satisfy every assertion below, since the
+    # values would be identical. Counting requests is not something a shell can
+    # do against a live service, so that half is measured -- ls -r over 1006
+    # objects went 0.88-1.05s to 0.45s -- and stated here rather than asserted.
+    #
+    # So what has to hold is that the values did not change in the move. Sizes
+    # are asserted directly; the modification time is asserted through rsync,
+    # which is what actually depends on it: cp sets the local mtime from the
+    # object's, so a second rsync is a no-op only if the time the listing
+    # reported matches the one the download applied. A listing that reported a
+    # zero time -- what dropping the field would do -- makes that second rsync
+    # copy the whole tree again.
+    fattr="folder_listattrs"
+    mkdir -p $fattr
+    printf '1' > $fattr/one.txt
+    printf '1234567890' > $fattr/ten.txt
+    printf '%.0s1' $(seq 1 300) > $fattr/threehundred.txt
+    ../gsg -m cp -r $fattr $remote_base/$fattr >/dev/null 2>&1
+
+    lsize() { ../gsg ls -l -r "$remote_base/$fattr" 2>/dev/null | awk -v n="$1" '$3 ~ n {print $1}'; }
+    assertEq "a 1-byte object lists as 1 byte" "$(lsize 'one\.txt$')" "1"
+    assertEq "a 10-byte object lists as 10 bytes" "$(lsize 'ten\.txt$')" "10"
+    assertEq "a 300-byte object lists as 300 bytes" "$(lsize 'threehundred\.txt$')" "300"
+    assertEq "and du -s agrees with the total on disk" \
+        "$(../gsg du -s $remote_base/$fattr 2>/dev/null | awk '{print $1}')" \
+        "$(cat $fattr/* | wc -c | tr -d ' ')"
+
+    # Every listed time must be a real one. A dropped LastModified prints as
+    # the zero time, which is the failure this catches.
+    assertEq "no object lists a zero modification time" \
+        "$(../gsg ls -l -r $remote_base/$fattr 2>/dev/null | grep -c '0001-01-01')" "0"
+    assertEq "and every object lists one" \
+        "$(../gsg ls -l -r $remote_base/$fattr 2>/dev/null | grep -cE '[0-9]{4}-[0-9]{2}-[0-9]{2}T')" "3"
+
+    rm -rf ${fattr}_sync && mkdir -p ${fattr}_sync
+    ../gsg -m rsync -r $remote_base/$fattr ${fattr}_sync >/dev/null 2>&1
+    assertEq "a second rsync copies nothing" \
+        "$(../gsg -m rsync -r $remote_base/$fattr ${fattr}_sync 2>&1 | grep -c 'No diff detected')" "1"
+    assertOk "and the tree matches" diff -r $fattr ${fattr}_sync
+    rm -rf ${fattr}_sync $fattr
+    finish
+
+    start "regression: an unknown checksum is a difference, not a match"
+
+    # The checksum a listing does not carry is fetched on demand, and that
+    # fetch can come back with nothing: the object may carry no comparable
+    # CRC32C at all -- anything uploaded by "aws s3 cp" does not -- or the
+    # request may fail. A bare number cannot tell either of those from a
+    # genuine checksum of 0, and Attrs.Same compared that 0 as if it were real.
+    #
+    # Both sides have to fail for it to bite, which rules out the local cases
+    # (a local file always has a checksum to compute) but not a cloud-to-cloud
+    # rsync, where both sides are objects. With -v the modification time is
+    # skipped by design, so path and size are all that is left -- and two
+    # different objects of the same size compared equal. rsync then left the
+    # stale destination in place and reported no diff.
+    #
+    # Measured against a build carrying the old behaviour: destination stays
+    # BBBB. With the fix it becomes AAAA.
+    #
+    # s3 only: gs objects always carry a CRC32C from the service, so neither
+    # side can come back empty, and rsync between different schemes is refused.
+    if [[ "$mode" != "s3" ]]
+    then
+        echo "SKIP: gs objects always carry a checksum, so neither side can be unknown"
+        finish
+    else
+    funk="folder_unknowncrc"
+    mkdir -p $funk
+    printf 'AAAA' > $funk/a
+    printf 'BBBB' > $funk/b
+    # aws s3 cp, deliberately: it stores no comparable CRC32C, which is the
+    # condition being tested. Uploading with gsg would store one and the two
+    # objects would differ on checksum like any other pair.
+    aws s3 cp --quiet $funk/a "s3://gsg-uat/$testid/$funk/src/a.txt" >/dev/null
+    aws s3 cp --quiet $funk/b "s3://gsg-uat/$testid/$funk/dst/a.txt" >/dev/null
+    assertEq "the two objects really are the same size" \
+        "$(aws s3api head-object --bucket gsg-uat --key "$testid/$funk/src/a.txt" --query ContentLength --output text 2>/dev/null)" \
+        "$(aws s3api head-object --bucket gsg-uat --key "$testid/$funk/dst/a.txt" --query ContentLength --output text 2>/dev/null)"
+
+    ../gsg rsync -r -v "$remote_base/$funk/src" "$remote_base/$funk/dst" >/dev/null 2>&1
+    assertEq "rsync -v replaces an object it cannot compare" \
+        "$(aws s3 cp "s3://gsg-uat/$testid/$funk/dst/a.txt" - 2>/dev/null)" "AAAA"
+
+    rm -rf $funk
+    finish
+    fi
 
     start "regression: a bucket in another region"
     # One S3 client was cached for the whole process, with its region taken
