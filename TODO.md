@@ -33,7 +33,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 16 | open | yes -- one receipt file for gs and s3; oci is clear | low, needs the same bucket and key on both |
 | 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1; oci verified clear | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
-| 19 | open | yes -- s3 rejects 6 GiB outright; oci hits a fixed 60s client deadline | fix -- different cause per backend |
+| 19 | open | yes -- s3 rejects >5 GiB outright; oci works but ~50% slower and unresumable | fix -- required on s3, worthwhile on oci |
 | 20 | PR #59 | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
 | 21 | PR #58 | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | PR #61 | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fixed |
@@ -908,10 +908,76 @@ always has a comparable checksum -- the single-PUT path is what makes item 4's
 fix work. Adding multipart would mean handling COMPOSITE checksums on gsg's own
 uploads too, so the two interact.
 
-**Fix:** use `feature/s3/manager.Uploader`, which switches to multipart above a
-threshold and handles the part bookkeeping. Set `ChecksumAlgorithm` on it as
-the single-PUT path now does, and pair it with item 18 so a COMPOSITE result
-reads as "no comparable checksum" rather than as a mismatch.
+**Plan, with every claim below prototyped against the real services.**
+
+*The checksum objection is gone.* The worry recorded above -- that multipart
+would make gsg's own objects carry a COMPOSITE checksum that `crc32cOf`
+rejects, so rsync would re-copy them forever -- does not apply if the upload
+asks for a whole-object checksum explicitly.
+
+- s3: `CreateMultipartUpload` accepts `ChecksumType: FULL_OBJECT` alongside
+  `ChecksumAlgorithm: CRC32C`, and `CompleteMultipartUpload` accepts the
+  whole-file `ChecksumCRC32C` plus `MpuObjectSize`. Prototyped with a 2-part
+  upload: `GetObjectAttributes` returned `ChecksumType=FULL_OBJECT` and a
+  CRC32C byte-identical to the local whole-file value. `crc32cOf` stays exactly
+  as strict as it is; no read-side change at all.
+- oci: nothing to solve. Prototyped with 3 parts and a per-part
+  `opc-content-crc32c`: commit returned the whole-file CRC32C and a later
+  `HeadObject` still reported it, while `opc-multipart-md5` came back as the
+  composite `...-3` form. Whole-object CRC32C and composite MD5, side by side.
+
+*Do not use the SDK managers.* s3's `feature/s3/manager.Uploader` is not even a
+dependency today and is composite-oriented; oci's `transfer.UploadManager`
+buffers parts and never passes the CRC32C headers through. Exact checksum
+control is the whole point, so hand-roll `CreateMultipartUpload` / `UploadPart`
+/ `Complete`-or-`Commit` against the clients already in use.
+
+*Read parts with `io.NewSectionReader(f, offset, length)`.* Nothing is
+buffered, each part is independently seekable, and per-part retry falls out for
+free -- which also repairs the seekability problem that stopped run 1 of the
+40 GiB test from retrying at all.
+
+**Measured: speed.** 2 GiB to oci, same file, same session.
+
+| shape | throughput |
+|---|---|
+| single PutObject (today) | 36.0 MB/s |
+| multipart, 64 MiB x 4 | 54.3 MB/s |
+| multipart, 128 MiB x 8 | 48.1 MB/s |
+| multipart, 256 MiB x 8 | 54.5 MB/s |
+
+About 50% faster, and the full 3x3 matrix over 64/128/256 MiB and concurrency
+4/8/16 ran between 39s and 46s -- all within noise of each other. **The gain
+comes from having parallelism at all, not from tuning it**, so the part size
+and concurrency defaults are not worth agonising over. The link saturates near
+55 MB/s.
+
+**Measured: a mid-transfer failure really is recoverable.** A failure injected
+halfway through part 3 of 16:
+
+```
+part 3 attempt 1 failed: injected failure mid-part
+parts=16 attempts=17 bytesSent=1.06x filesize crc ok
+```
+
+One retry, 6% of the file re-sent, correct whole-file CRC32C on the result.
+Against the single PUT that failed at 454s of the 40 GiB run, which lost
+roughly 17 GiB and had to start from zero.
+
+**Ordering, and what NOT to do first.**
+
+1. `Pool`, `ChunkSize` and `GentleIO` do not currently reach the upload call
+   sites -- `cmd/cp.go` and `cmd/rsync.go` pass only `Bars`. Fix that first, or
+   part size and concurrency have nothing to read.
+2. s3 multipart above 5 GiB, which is the only case that is impossible today.
+3. oci multipart above a threshold, for the speed and the resumability.
+4. **Abort on any failure, after in-flight parts settle.** Both services bill
+   uploaded-but-uncommitted parts until the upload is completed or aborted, so
+   a crash that leaks an upload costs money silently. A bucket lifecycle rule
+   is worth recommending alongside.
+5. Retry-in-run per part only. Cross-process resume needs a durable manifest
+   keyed on bucket, object, uploadID, source path, size, mtime, part size and
+   checksums; it is a separate feature and easy to make dangerously stale.
 
 ---
 
