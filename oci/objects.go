@@ -147,12 +147,22 @@ func dedupePrefixes(in []string) []string {
 //
 // A delimiter is used for the same reason: without one, a prefix with a
 // million keys underneath would have the service walk them all.
-func (o *OCI) anyEntryUnder(bucketSpec, prefix string) (bool, error) {
+// self, when non-empty, names the entry that is the caller's own prefix rather
+// than something beneath it, and is not counted.
+func (o *OCI) anyEntryUnder(bucketSpec, prefix, self string) (bool, error) {
 	c, ns, bucket, err := o.resolve(bucketSpec)
 	if err != nil {
 		return false, err
 	}
-	limit := 1
+	// Two, not one. An object named exactly self is the zero-byte marker a
+	// console's "create folder" writes, and it is the caller's own path rather
+	// than something beneath it, so it is not counted -- gs and s3 draw the
+	// same line, and gsutil hands such an object back rather than calling it a
+	// directory. It also sorts before everything under it, so a limit of one
+	// would return only the marker and make a directory carrying one look
+	// empty. Measured: listing "phboth/" at limit 1 returns just the marker,
+	// at limit 2 the marker and its child.
+	limit := 2
 	delimiter := "/"
 	req := objectstorage.ListObjectsRequest{
 		NamespaceName: &ns,
@@ -169,5 +179,15 @@ func (o *OCI) anyEntryUnder(bucketSpec, prefix string) (bool, error) {
 		logger.Info(module, "listing oci://%s/%s failed: %s", bucket, prefix, lerr)
 		return false, lerr
 	}
-	return len(r.Objects) > 0 || len(r.Prefixes) > 0, nil
+	for _, o := range r.Objects {
+		if o.Name != nil && *o.Name != self {
+			return true, nil
+		}
+	}
+	for _, sub := range r.Prefixes {
+		if sub != self {
+			return true, nil
+		}
+	}
+	return false, nil
 }

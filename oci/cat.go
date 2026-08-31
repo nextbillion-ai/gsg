@@ -74,7 +74,10 @@ func (o *OCI) IsDirectory(bucket, prefix string) (bool, error) {
 	if asDir != "" && !strings.HasSuffix(asDir, "/") {
 		asDir += "/"
 	}
-	return o.anyEntryUnder(bucket, asDir)
+	// The caller's own prefix is what must not count as something beneath it,
+	// so it is passed through rather than asDir: that is what makes "foo" and
+	// "foo/" answer differently for a lone marker, matching gs and s3.
+	return o.anyEntryUnder(bucket, asDir, prefix)
 }
 
 // GetObjectReader streams an object's bytes.

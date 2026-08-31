@@ -1143,6 +1143,123 @@ GOHELPER
 
     finish
 
+    start "regression: what counts as a directory"
+    # FileType asks IsDirectory before nearly every command, so what it costs
+    # lands on cp, rm, du, mv and rsync alike. It used to answer by listing --
+    # recursively on s3, so a prefix holding a million keys walked all million
+    # to return a boolean. It now asks the service for the first entry or two.
+    #
+    # What this case pins is the answer, not the cost: the cost is measured
+    # (1005 objects: s3 237ms -> 30ms, gs 198ms -> 103ms, and flat rather than
+    # growing) but nothing here would fail if it regressed to listing, because
+    # a wall-clock assertion over the network is a flaky one. The size past a
+    # page is here so a regression shows up as a visibly slower run.
+    #
+    # oci has the same case in uat/oci, so it is skipped here.
+    if [[ "$mode" == "oci" ]]
+    then
+        echo "SKIP: uat/oci/30-cat.sh covers this for oci"
+        finish
+    else
+    fbig="folder_isdir"
+    mkdir -p $fbig
+    i=1
+    while [[ $i -le 1005 ]]
+    do
+        printf 'x' > "$fbig/f$(printf '%04d' $i).txt"
+        i=$((i + 1))
+    done
+    $(remote_copy true) $fbig "$remote_base/$fbig/" >/dev/null 2>&1
+
+    # cp without -r refuses a directory with a distinctive message, which is
+    # how IsDirectory's answer becomes observable.
+    isdir() {
+        local out
+        out=$(../gsg cp "$remote_base/$1" ./sink_isdir 2>&1) || true
+        echo "$out" | grep -q "Did you mean" && echo yes || echo no
+    }
+    assertEq "a directory of more than one page is a directory" "$(isdir $fbig)" "yes"
+    assertEq "one of its objects is not" "$(isdir $fbig/f0001.txt)" "no"
+    assertEq "nor is a partial name inside it" "$(isdir $fbig/f000)" "no"
+    assertEq "nor is something absent" "$(isdir $fbig/nothing-here)" "no"
+
+    # A directory whose children are all sub-directories carries no keys in a
+    # delimited listing, only common prefixes -- the shape that truncated a
+    # listing in item 2, and the one a single-entry request could easily miss.
+    fsubs="${fbig}_subs"
+    mkdir -p $fsubs/only/deeper
+    prepare_file $fsubs/only/deeper/x.txt
+    $(remote_copy true) $fsubs "$remote_base/$fsubs/" >/dev/null 2>&1
+    assertEq "a directory holding only sub-directories is a directory" \
+        "$(isdir $fsubs)" "yes"
+
+    # An object whose name is exactly the prefix -- the zero-byte marker the
+    # console's "create folder" writes -- is the prefix, not something beneath
+    # it. gsutil hands it back as an object, so gsg does too. It sorts before
+    # everything under it, which is the trap: asking for a single entry would
+    # return only the marker and make a directory carrying one look empty.
+    fmk="folder_marker"
+    case $mode in
+    s3)
+        : > empty_marker
+        aws s3api put-object --bucket gsg-uat --key "$testid/$fmk/lone/" \
+            --body empty_marker >/dev/null
+        aws s3api put-object --bucket gsg-uat --key "$testid/$fmk/both/" \
+            --body empty_marker >/dev/null
+        rm -f empty_marker
+        prepare_file marker_child.txt
+        $(remote_copy false) marker_child.txt "$remote_base/$fmk/both/child.txt" >/dev/null 2>&1
+        rm -f marker_child.txt
+        ;;
+    gs)
+        # gsutil cannot write a name ending in a slash -- it appends the local
+        # basename -- so this goes through the storage client directly.
+        cat > marker_helper.go <<'GOHELPER'
+package main
+
+import (
+	"context"
+	"os"
+
+	"cloud.google.com/go/storage"
+)
+
+func main() {
+	ctx := context.Background()
+	c, err := storage.NewClient(ctx)
+	if err != nil {
+		os.Exit(1)
+	}
+	for _, name := range os.Args[2:] {
+		w := c.Bucket(os.Args[1]).Object(name).NewWriter(ctx)
+		if name[len(name)-1] != '/' {
+			_, _ = w.Write([]byte("child\n"))
+		}
+		if err = w.Close(); err != nil {
+			os.Exit(1)
+		}
+	}
+}
+GOHELPER
+        (cd .. && go run "$OLDPWD/marker_helper.go" gsg-uat \
+            "$testid/$fmk/lone/" "$testid/$fmk/both/" "$testid/$fmk/both/child.txt")
+        rm -f marker_helper.go
+        ;;
+    esac
+    assertEq "a marker with nothing beneath it is an object, not a directory" \
+        "$(isdir $fmk/lone/)" "no"
+    assertEq "a marker with something beneath it is still a directory" \
+        "$(isdir $fmk/both/)" "yes"
+    # Without the trailing slash the marker is something *beneath* the path
+    # asked about, so the answer flips. gsutil draws the line the same way,
+    # and so did the listing this replaced.
+    assertEq "the same marker named without a trailing slash is a directory" \
+        "$(isdir $fmk/lone)" "yes"
+
+    rm -rf $fbig $fsubs sink_isdir
+    finish
+    fi
+
     start "regression: rm removes exactly what it is asked to"
     before=$(../gsg ls -r $remote_base/$fdu 2>/dev/null | wc -l | tr -d ' ')
     ../gsg rm $remote_base/$fdu/direct.txt
