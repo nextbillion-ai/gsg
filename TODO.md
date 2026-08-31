@@ -33,7 +33,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 16 | open | yes -- one receipt file for gs and s3; oci is clear | low, needs the same bucket and key on both |
 | 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1; oci verified clear | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
-| 19 | open | yes -- s3 rejects 6 GiB; oci times out at ~1-2 GiB, link-dependent | fix -- worse on oci |
+| 19 | open | yes -- s3 rejects 6 GiB outright; oci hits a fixed 60s client deadline | fix -- different cause per backend |
 | 20 | PR #59 | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
 | 21 | PR #58 | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | PR #61 | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fixed |
@@ -860,10 +860,28 @@ the SDK client's 60-second timeout:
 | 3 GiB | **exit 1 at 61s** -- `Client.Timeout exceeded while awaiting headers` |
 | 6 GiB | **exit 1 at 63s** -- same |
 
-So the largest object gsg can put to OCI depends on the link, not on the file:
-on this connection about 1-2 GiB, and on a slower one a few hundred MB would
-fail. The error says "timeout", which reads like a transient network problem,
-so the natural response is to retry -- and it fails again, every time, forever.
+**The cause is a fixed wall-clock deadline, not the size and not a flaky link.**
+The OCI SDK builds its `http.Client` with `Timeout: 60s`
+(`common/client.go:81`), and Go applies that to the *whole* request -- the body
+upload included -- so any PUT that takes longer than a minute is cancelled
+mid-stream regardless of how healthy the connection is.
+
+Proved by moving the deadline and changing nothing else. The SDK reads
+`OCI_CUSTOM_CLIENT_TIMEOUT` (seconds):
+
+| file | default 60s | raised |
+|---|---|---|
+| 3 GiB | fails at 61s | **stored**, 76s @ 40.2 MB/s |
+| 6 GiB | fails at 63s | **stored**, 201s @ 30.5 MB/s |
+
+Both stored with the right size and CRC32C. So OCI has no size ceiling anywhere
+near s3's -- it accepted the very 6 GiB object s3 rejects outright. The limit is
+purely `60s x throughput`: about 2 GiB on this link, and proportionally less on
+a slower one. The largest object gsg can put therefore depends on the link
+rather than on the file, which is why there is no number to document.
+
+The error says "timeout", which reads like a transient network problem, so the
+natural response is to retry -- and it fails again, every time, forever.
 
 Both fail cleanly at least: exit 1, nothing stored, no partial object.
 
