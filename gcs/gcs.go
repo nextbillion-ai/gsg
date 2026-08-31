@@ -697,11 +697,12 @@ func (g *GCS) IsObject(bucket, prefix string) (bool, error) {
 
 // IsDirectory reports whether prefix has anything beneath it.
 //
-// It stops at the first entry. The question is existence, not contents, and
-// answering it by walking the whole listing cost time proportional to the
-// number of children -- measured against 1005 objects, 198ms against 75ms for
-// a directory holding one. FileType calls this before nearly every command,
-// so that landed on cp, rm, du, mv and rsync alike.
+// It stops after the first entry or two. The question is existence, not
+// contents, and answering it by walking the whole listing cost time
+// proportional to the number of children -- measured against 1005 objects,
+// 198ms before and 103ms after, and flat rather than growing. FileType calls
+// this before nearly every command, so that landed on cp, rm, du, mv and
+// rsync alike.
 //
 // The trailing slash is what makes the question mean "beneath". Without it the
 // service matches on the raw prefix, so "edge/ab" would look like a directory

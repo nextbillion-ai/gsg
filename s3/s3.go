@@ -847,13 +847,14 @@ func (s *S3) IsObject(bucket, prefix string) (bool, error) {
 
 // IsDirectory reports whether prefix has anything beneath it.
 //
-// It asks for one entry. The question is existence, not contents, and
-// answering it by listing everything cost a page of results per thousand
+// It asks for the first two entries. The question is existence, not contents,
+// and answering it by listing everything cost a page of results per thousand
 // objects -- recursively, so a prefix holding a million keys walked all
 // million to return a boolean. FileType calls this before nearly every
 // command, so that landed on cp, rm, du, mv and rsync alike, and a recursive
 // copy paid it twice: once to decide the path was a directory, then again to
-// list it. Measured against 1005 objects: 237ms, against 17ms for one entry.
+// list it. Measured against 1005 objects: 237ms before, 30ms after, and flat
+// rather than growing with the object count.
 //
 // The trailing slash is what makes the question mean "beneath". Without it the
 // service matches on the raw prefix, so "edge/ab" would look like a directory
