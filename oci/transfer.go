@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 
@@ -112,6 +113,23 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	return o.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix)
 }
 
+// crc32cOfReader hashes everything f holds and rewinds it.
+//
+// The point is that the checksum and the body describe the same bytes: this
+// reads the very handle the upload will read, so nothing can be substituted
+// underneath it. Reading the cached checksum for the path would be cheaper and
+// occasionally wrong, and being wrong costs the whole upload.
+func crc32cOfReader(f *os.File) (uint32, error) {
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, fmt.Errorf("oci: cannot read %s to checksum it: %w", f.Name(), err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("oci: cannot rewind %s after checksumming it: %w", f.Name(), err)
+	}
+	return h.Sum32(), nil
+}
+
 // Upload stores srcFile as an object.
 func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) error {
 	c, ns, name, err := o.resolve(bucket)
@@ -127,12 +145,6 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 
 	size := common.GetFileSize(srcFile)
 	logger.Info(module, "uploading %s to %s/%s", srcFile, name, object)
-
-	var body io.Reader = f
-	if ctx.Bars != nil {
-		pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
-		body = io.TeeReader(f, pb)
-	}
 
 	// Record a CRC32C, and send our own so the upload is checked on arrival.
 	//
@@ -152,7 +164,27 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	// and pass. Sending opc-content-crc32c makes the service compare against
 	// what we measured locally and reject the object with HTTP 400 if they
 	// differ, so corruption fails the upload instead of being preserved.
-	localCRC := crc32cToBase64(common.GetFileCRC32C(srcFile))
+	//
+	// The checksum comes from the handle the body will be read from, not from
+	// the cache keyed on path and mtime. The cache is only as good as the
+	// assumption that content and modification time move together, and where
+	// that is wrong the checksum describes different bytes than the body does
+	// -- which the service notices, so the price of a stale entry is a whole
+	// upload spent to be told it was stale. On the gs side that trade was
+	// measured at 111ms of hashing against a 4s upload of the same 190MB file.
+	crc, err := crc32cOfReader(f)
+	if err != nil {
+		return err
+	}
+	localCRC := crc32cToBase64(crc)
+
+	// The progress bar wraps the handle only now, after the checksum pass has
+	// rewound it: attaching it earlier would have counted the file twice.
+	var body io.Reader = f
+	if ctx.Bars != nil {
+		pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
+		body = io.TeeReader(f, pb)
+	}
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,

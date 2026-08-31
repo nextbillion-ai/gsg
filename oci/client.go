@@ -121,7 +121,11 @@ func (o *OCI) verifyBucketWith(ns, bucket string, check func() error) error {
 
 	var err error
 	if cerr := check(); cerr != nil {
-		logger.Info(module, "cannot reach bucket oci://%s: %s", bucket, cerr)
+		// Logged at debug and returned, not logged at info: the command layer
+		// prints whatever error it is handed, and an info line worded
+		// differently from the error would be printed alongside it rather
+		// than instead of it.
+		logger.Debug(module, "cannot reach bucket oci://%s: %s", bucket, cerr)
 		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q: %w", bucket, ns, cerr)
 		// Only a definite answer is worth remembering. A throttle, a 5xx or a
 		// dropped connection says nothing about whether the bucket exists, and
