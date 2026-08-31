@@ -65,6 +65,37 @@ assertEq "a partial directory name is not a directory" "$(isdir edge/d)" "no"
 assertEq "an object is not a directory" "$(isdir edge/abc.txt)" "no"
 assertEq "something absent is not a directory" "$(isdir edge/nothing-here)" "no"
 
+# An object whose name is exactly the prefix -- the zero-byte marker a "create
+# folder" writes -- is the prefix, not something beneath it. gsutil hands it
+# back as an object, and gs and s3 agree, so oci does too. It sorts before
+# everything under it, which is the trap: asking for a single entry returns
+# only the marker, so a directory carrying one would look empty. Measured
+# against this fixture: listing "both/" at limit 1 returns just the marker, at
+# limit 2 the marker and its child.
+: > empty_marker
+oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file empty_marker --name "$testid/marker/lone/" --force >/dev/null 2>&1
+oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file empty_marker --name "$testid/marker/both/" --force >/dev/null 2>&1
+rm -f empty_marker
+oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file $fcat/text.txt --name "$testid/marker/both/child.txt" --force >/dev/null 2>&1
+
+assertEq "a marker with nothing beneath it is an object, not a directory" \
+    "$(isdir marker/lone/)" "no"
+assertEq "a marker with something beneath it is still a directory" \
+    "$(isdir marker/both/)" "yes"
+assertEq "the same marker named without a trailing slash is a directory" \
+    "$(isdir marker/lone)" "yes"
+
+# A directory whose children are all sub-directories carries no objects in a
+# delimited listing, only prefixes -- so the Prefixes arm has to be read, and
+# nothing above would notice if it were dropped.
+oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file $fcat/text.txt --name "$testid/subsonly/only/deeper/x.txt" --force >/dev/null 2>&1
+assertEq "a directory holding only sub-directories is a directory" \
+    "$(isdir subsonly)" "yes"
+
 finish
 
 start "isdirectory: a directory bigger than one page is still just one question"
