@@ -94,7 +94,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 		pool.Add(func() {
 			if e := common.DoWithRetrySimple(func() error {
-				return dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars})
+				return dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO})
 			}); e != nil {
 				common.ExitWith(e)
 			}

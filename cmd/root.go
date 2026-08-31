@@ -47,7 +47,7 @@ func init() {
 	)
 	rootCmd.PersistentFlags().Int64Var(
 		&chunkSize, "chunk-size", -1,
-		"set download chunk size in bytes (default 16MB, 0 to disable chunking)",
+		"set transfer chunk size in bytes: download chunks (default 16MB, 0 to disable) and multipart upload part size (default 128MB, clamped to what the provider accepts)",
 	)
 	rootCmd.PersistentFlags().BoolVar(
 		&gentleIO, "gentle-io", false,

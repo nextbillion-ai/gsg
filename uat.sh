@@ -284,6 +284,36 @@ remote_count() {
     esac
 }
 
+# remote_size asks the provider how many bytes an object holds.
+remote_size() {
+    case $mode in
+    gs)  gsutil stat "$remote_base/$1" 2>/dev/null | awk '/Content-Length:/{print $2}' ;;
+    s3)  aws s3api head-object --bucket gsg-uat --key "$testid/$1" --query ContentLength --output text 2>/dev/null ;;
+    oci) oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" --name "$testid/$1" 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["content-length"])' 2>/dev/null ;;
+    esac
+}
+
+# is_multipart reports whether the provider assembled the object from parts.
+#
+# Each service admits it differently: s3 suffixes a multipart ETag with "-N",
+# and oci reports an opc-multipart-md5 header that a single PutObject does not.
+# Without this a multipart case would pass even if multipart never triggered.
+is_multipart() {
+    case $mode in
+    s3)
+        if aws s3api head-object --bucket gsg-uat --key "$testid/$1" --query ETag --output text 2>/dev/null | grep -qE '\-[0-9]+"?$'
+        then echo yes; else echo no; fi
+        ;;
+    oci)
+        if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" --name "$testid/$1" 2>/dev/null \
+             | grep -q 'opc-multipart-md5'
+        then echo yes; else echo no; fi
+        ;;
+    *) echo unknown ;;
+    esac
+}
+
 # assertEq compares a value against an expectation and reports which check failed.
 assertEq() {
     local what="$1" got="$2" want="$3"
@@ -1063,6 +1093,72 @@ do_test() {
     ../gsg -m cp -r $remote_base/$fodd ${fodd}_down
     assertOk "odd names round-trip identically" diff -r $fodd ${fodd}_down
     finish
+
+    start "a large upload goes up in parts, and stays comparable"
+
+    # Above 128 MiB an upload is assembled from parts rather than sent as one
+    # request. On s3 that is the only way to store an object over 5 GiB at all
+    # -- a single PutObject is refused with EntityTooLarge before any bytes
+    # move. On oci nothing forces it, but measured on 2 GiB it took 36 MB/s to
+    # 47-55 MB/s, and a part that fails costs one part rather than the whole
+    # transfer.
+    #
+    # The thing that has to hold is that the object is still COMPARABLE. A
+    # multipart upload stores a composite checksum by default -- a checksum of
+    # the parts' checksums -- which cannot be matched against a whole-file
+    # CRC32C, so every object gsg wrote that way would read back as "no
+    # comparable checksum" and rsync would copy it again on every run. s3 is
+    # asked for ChecksumType FULL_OBJECT to avoid that; oci reports the
+    # whole-object CRC32C anyway.
+    #
+    # Only gs and s3 reach here at all -- an oci run executes the uat/oci case
+    # files instead of this body, so the oci equivalent lives in
+    # uat/oci/40-transfer.sh. And gs is skipped: its library already chunks a
+    # large upload internally and this change does not touch that path. So in
+    # practice this case is the s3 one.
+    if [[ "$mode" == "gs" ]]
+    then
+        echo "SKIP: the gs writer already chunks internally; unchanged here"
+        finish
+    else
+    fmp="folder_multipart"
+    mkdir -p $fmp
+    # 130 MiB: over the threshold, and small enough that the case stays quick.
+    #
+    # Random, NOT zeroes, and that is the whole point. With uniform content a
+    # part sent from the wrong offset, or two parts assembled in the wrong
+    # order, produces a byte-identical object -- so size, rsync, cp -v and cmp
+    # all pass against thoroughly broken code. Measured: an order-swapping
+    # build uploaded an all-zeroes fixture with rc=0 and the download compared
+    # equal, while the same build on random content was rejected outright with
+    # "assembled to checksum ..., but ... was sent".
+    dd if=/dev/urandom of=$fmp/big.bin bs=1m count=130 2>/dev/null
+    assertEq "the fixture really is over the 128 MiB threshold" \
+        "$(( $(stat -f%z $fmp/big.bin) > 134217728 ))" "1"
+
+    ../gsg cp $fmp/big.bin "$remote_base/$fmp/big.bin" >/dev/null 2>&1
+    assertEq "the object stored the whole file" \
+        "$(remote_size $fmp/big.bin)" "$(stat -f%z $fmp/big.bin)"
+
+    # Proof it actually went up in parts rather than as one request. Without
+    # this the case would pass even if multipart never triggered.
+    assertEq "and it really was assembled from parts" "$(is_multipart $fmp/big.bin)" "yes"
+
+    # Comparable: a second rsync must copy nothing. This is what fails if the
+    # stored checksum is composite rather than whole-object.
+    rm -rf ${fmp}_sync && mkdir -p ${fmp}_sync
+    ../gsg -m rsync -r "$remote_base/$fmp" ${fmp}_sync >/dev/null 2>&1
+    assertEq "a second rsync copies nothing, so the checksum is comparable" \
+        "$(../gsg -m rsync -r "$remote_base/$fmp" ${fmp}_sync 2>&1 | grep -c 'No diff detected')" "1"
+
+    # And the bytes really round-trip, with the checksum verified on arrival.
+    assertEq "cp -v verifies the download" \
+        "$(../gsg cp -v "$remote_base/$fmp/big.bin" ./mp_down.bin 2>&1 | grep -c 'CRC32C checking success')" "1"
+    assertOk "and the downloaded file matches byte for byte" cmp $fmp/big.bin ./mp_down.bin
+
+    rm -rf $fmp ${fmp}_sync mp_down.bin
+    finish
+    fi
 
     start "regression: an upload is checked on arrival, not after it"
     # gs stores a CRC32C for every object whether asked or not -- but it

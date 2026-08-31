@@ -139,6 +139,65 @@ rm -rf "$ovdir"
 
 finish
 
+start "transfer: a large upload goes up in parts, and stays comparable"
+
+# Above 128 MiB an upload is assembled from parts rather than sent as one
+# request. Nothing on oci forces this -- a single PutObject stored a 40 GiB
+# object fine, and so did Oracle's own CLI with --no-multipart -- but measured
+# on a 2 GiB object it took 36 MB/s to 47-55 MB/s, and a part that fails costs
+# one part rather than the whole transfer.
+#
+# What has to hold is that the object stays COMPARABLE: oci reports the
+# whole-object CRC32C for a multipart object and keeps the composite form in a
+# separate header, so rsync can still tell the object apart from its source. If
+# that ever became the composite value, every large object gsg wrote would be
+# re-copied on every run.
+fmp="folder_multipart"
+mkdir -p $fmp
+# Random, NOT zeroes, and that is the point. With uniform content a part sent
+# from the wrong offset, or two parts assembled in the wrong order, produces a
+# byte-identical object -- so size, rsync, cp -v and cmp all pass against
+# thoroughly broken code. Measured: an order-swapping build uploaded an
+# all-zeroes fixture with rc=0 and the download compared equal, while the same
+# build on random content was rejected with "assembled to checksum ..., but
+# ... was sent".
+dd if=/dev/urandom of=$fmp/big.bin bs=1m count=130 2>/dev/null
+
+../gsg cp $fmp/big.bin "$remote_base/$fmp/big.bin" >/dev/null 2>&1
+head=$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --name "$testid/$fmp/big.bin" 2>/dev/null)
+assertEq "the object stored the whole file" \
+    "$(echo "$head" | python3 -c 'import sys,json; print(json.load(sys.stdin)["content-length"])' 2>/dev/null)" \
+    "$(stat -f%z $fmp/big.bin)"
+
+# Proof it really was assembled from parts: a single PutObject reports no
+# opc-multipart-md5 at all, and a multipart one reports it with a "-N" part
+# count. Without this the case would pass even if multipart never triggered.
+#
+# Read as JSON rather than grepped. The response also carries an
+# access-control-expose-headers line that LISTS every header name, including
+# both of the ones checked here, so grep -c finds them whether or not they are
+# actually set.
+hdr() { echo "$head" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+assertEq "and it really was assembled from parts" \
+    "$(hdr opc-multipart-md5 | grep -cE -- '-[0-9]+$')" "1"
+assertEq "while the crc32c stayed whole-object, not composite" \
+    "$(hdr opc-content-crc32c | grep -cE '^[A-Za-z0-9+/]+=*$')" "1"
+
+# Comparable: a second rsync must copy nothing. This is what fails if the
+# stored checksum stops matching a whole-file one.
+rm -rf ${fmp}_sync && mkdir -p ${fmp}_sync
+../gsg -m rsync -r "$remote_base/$fmp" ${fmp}_sync >/dev/null 2>&1
+assertEq "a second rsync copies nothing, so the checksum is comparable" \
+    "$(../gsg -m rsync -r "$remote_base/$fmp" ${fmp}_sync 2>&1 | grep -c 'No diff detected')" "1"
+
+assertEq "cp -v verifies the download" \
+    "$(../gsg cp -v "$remote_base/$fmp/big.bin" ./mp_down.bin 2>&1 | grep -c 'CRC32C checking success')" "1"
+assertOk "and the downloaded file matches byte for byte" cmp $fmp/big.bin ./mp_down.bin
+
+rm -rf $fmp ${fmp}_sync mp_down.bin
+finish
+
 start "transfer: -v verifies, and a repeated rsync is a no-op"
 
 assertEq "cp -v checks every downloaded file" \
