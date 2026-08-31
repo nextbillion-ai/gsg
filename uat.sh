@@ -689,7 +689,10 @@ do_test() {
     #
     # What this case does NOT do is prove the extra requests are gone: reverting
     # to eager per-object fetches would satisfy every assertion below, since the
-    # values would be identical. Counting requests is not something a shell can
+    # values would be identical. Nor does anything here catch undoing the
+    # checksum batching or Attrs.Same's short-circuit -- both are purely a
+    # question of how many requests are made and when, verified by sabotage
+    # builds off-line rather than here. Counting requests is not something a shell can
     # do against a live service, so that half is measured -- ls -r over 1006
     # objects went 0.88-1.05s to 0.45s -- and stated here rather than asserted.
     #
