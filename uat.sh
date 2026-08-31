@@ -264,6 +264,26 @@ prepare_file() {
     echo "$value" > "$1"
 }
 
+# remote_count reports how many objects the provider itself has under a path.
+#
+# Deliberately the provider CLI rather than gsg: it is what lets a case prove
+# its own fixture landed where it thinks, so an assertion cannot pass because
+# the path it names does not exist.
+remote_count() {
+    case $mode in
+    gs)
+        gsutil ls -r "$remote_base/$1" 2>/dev/null | grep -v ':$' | grep -c . || true
+        ;;
+    s3)
+        aws s3 ls "s3://gsg-uat/$testid/$1" --recursive 2>/dev/null | wc -l | tr -d ' '
+        ;;
+    oci)
+        oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+            --prefix "$testid/$1" --all --query 'length(data)' 2>/dev/null || echo 0
+        ;;
+    esac
+}
+
 # assertEq compares a value against an expectation and reports which check failed.
 assertEq() {
     local what="$1" got="$2" want="$3"
@@ -1169,7 +1189,18 @@ GOHELPER
         printf 'x' > "$fbig/f$(printf '%04d' $i).txt"
         i=$((i + 1))
     done
-    $(remote_copy true) $fbig "$remote_base/$fbig/" >/dev/null 2>&1
+    # Uploaded with gsg, not the provider CLI: "aws s3 cp --recursive src dst/"
+    # copies the *contents* of src while "gsutil cp -r src dst/" copies the
+    # *directory*, so the two clouds ended up with layouts one level apart.
+    # Every assertion below that expects "no" then passed on gs for the wrong
+    # reason -- the path did not exist at all. Verified against the provider
+    # CLI just below, so a fixture that lands in the wrong place fails here
+    # rather than quietly weakening the case.
+    ../gsg -m cp -r $fbig $remote_base/$fbig >/dev/null 2>&1
+    assertEq "the fixture really has 1005 objects directly under it" \
+        "$(remote_count $fbig)" "1005"
+    assertEq "and f0001.txt really is one of them" \
+        "$(remote_count $fbig/f0001.txt)" "1"
 
     # cp without -r refuses a directory with a distinctive message, which is
     # how IsDirectory's answer becomes observable.
@@ -1179,6 +1210,7 @@ GOHELPER
         echo "$out" | grep -q "Did you mean" && echo yes || echo no
     }
     assertEq "a directory of more than one page is a directory" "$(isdir $fbig)" "yes"
+    assertEq "the same directory named with a trailing slash too" "$(isdir $fbig/)" "yes"
     assertEq "one of its objects is not" "$(isdir $fbig/f0001.txt)" "no"
     assertEq "nor is a partial name inside it" "$(isdir $fbig/f000)" "no"
     assertEq "nor is something absent" "$(isdir $fbig/nothing-here)" "no"
@@ -1189,9 +1221,18 @@ GOHELPER
     fsubs="${fbig}_subs"
     mkdir -p $fsubs/only/deeper
     prepare_file $fsubs/only/deeper/x.txt
-    $(remote_copy true) $fsubs "$remote_base/$fsubs/" >/dev/null 2>&1
+    ../gsg -m cp -r $fsubs $remote_base/$fsubs >/dev/null 2>&1
+    assertEq "the sub-directory fixture landed where expected" \
+        "$(remote_count $fsubs/only/deeper/x.txt)" "1"
+    assertEq "and nothing sits directly under it" \
+        "$(remote_count $fsubs/only/deeper/x.txt)" "$(remote_count $fsubs)"
     assertEq "a directory holding only sub-directories is a directory" \
         "$(isdir $fsubs)" "yes"
+    assertEq "a nested directory is a directory" "$(isdir $fsubs/only)" "yes"
+    # The partial-name trap on the CommonPrefixes side rather than the
+    # Contents side: "on" is a string prefix of the sub-directory "only/", so
+    # without the trailing slash the service would match it.
+    assertEq "a partial directory name is not a directory" "$(isdir $fsubs/on)" "no"
 
     # An object whose name is exactly the prefix -- the zero-byte marker the
     # console's "create folder" writes -- is the prefix, not something beneath
