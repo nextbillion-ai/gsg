@@ -38,7 +38,7 @@ type FileAttrs struct {
 	Name         string
 	Size         int64
 	ModTime      time.Time
-	CalcCRC32C   func() uint32
+	CalcCRC32C   func() (uint32, bool)
 }
 
 // GetRealPath gets real path of a directory
@@ -95,8 +95,11 @@ func (l *Linux) attrs(_, prefix string) *FileAttrs {
 		RelativePath: prefix,
 		Name:         name,
 		Size:         common.GetFileSize(prefix),
-		CalcCRC32C:   func() uint32 { return common.GetFileCRC32C(prefix) },
-		ModTime:      common.GetFileModificationTime(prefix),
+		// A local file always has a checksum to compute, so this is only
+		// ever "ok". GetFileCRC32C returns 0 on a read failure with no way to
+		// say so, which is TODO item 18's other half.
+		CalcCRC32C: func() (uint32, bool) { return common.GetFileCRC32C(prefix), true },
+		ModTime:    common.GetFileModificationTime(prefix),
 	}
 	return res
 }

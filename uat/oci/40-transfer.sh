@@ -171,6 +171,53 @@ assertEq "and the tree is quiet once more" \
 
 finish
 
+start "transfer: an unknown checksum is a difference, not a match"
+
+# The checksum a listing does not carry is fetched on demand, and that fetch
+# can come back with nothing: OCI stores a CRC32C only when the uploader asks
+# for one, so anything the oci CLI wrote has none. A bare number could not tell
+# that from a genuine checksum of 0, and Attrs.Same compared the 0 as if it
+# were real.
+#
+# Both sides have to come back empty for it to bite, which rules out the local
+# cases -- a local file always has a checksum to compute -- but not an
+# oci-to-oci rsync, where both sides are objects. With -v the modification time
+# is skipped by design, so path and size are all that is left, and two
+# different objects of the same size compared equal: rsync left the stale
+# destination in place and reported no diff.
+#
+# The same case exists for s3 in uat.sh. It is repeated here because the guard
+# lives separately in each backend, and measured against a build carrying the
+# old behaviour this destination stays BBBB on oci exactly as it does on s3.
+funk="folder_unknowncrc"
+mkdir -p $funk
+printf 'AAAA' > $funk/a
+printf 'BBBB' > $funk/b
+
+# Uploaded with the oci CLI on purpose: it stores no CRC32C, which is the
+# condition being tested. Uploading with gsg would store one and the two
+# objects would differ on checksum like any other pair.
+oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file $funk/a --name "$testid/$funk/src/a.txt" --force >/dev/null 2>&1
+oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file $funk/b --name "$testid/$funk/dst/a.txt" --force >/dev/null 2>&1
+
+assertEq "neither object carries a comparable checksum" \
+    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --name "$testid/$funk/src/a.txt" 2>/dev/null | grep -c 'opc-content-crc32c')" "0"
+assertEq "and they really are the same size" \
+    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --name "$testid/$funk/dst/a.txt" 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)["content-length"])' 2>/dev/null)" "4"
+
+../gsg rsync -r -v "$remote_base/$funk/src" "$remote_base/$funk/dst" >/dev/null 2>&1
+assertEq "rsync -v replaces an object it cannot compare" \
+    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --name "$testid/$funk/dst/a.txt" --file - 2>/dev/null)" "AAAA"
+
+rm -rf $funk
+finish
+
 start "transfer: mtime survives the round trip"
 
 # The two are compared at second precision on purpose: a listing carries

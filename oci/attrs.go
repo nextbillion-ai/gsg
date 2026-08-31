@@ -201,27 +201,26 @@ func (o *OCI) summaryToAttrs(bucketSpec string, s objectstorage.ObjectSummary) *
 	}
 	if s.Name != nil {
 		name := *s.Name
-		a.CalcCRC32C = func() uint32 {
-			// The hook can only return a number, so every failure here has to
-			// come back as 0 -- and Attrs.Same reads 0 as a real checksum.
-			// Two objects that both fail this way compare equal on size
-			// alone. That is TODO item 18's missing distinction, and nothing
-			// in this backend can repair it, so the least it can do is say so
-			// rather than let a silent 0 stand for three different facts.
+		a.CalcCRC32C = func() (uint32, bool) {
+			// The second result is what keeps a failure from passing for a
+			// checksum of 0: Same treats "could not determine" as a
+			// difference, so the object is copied again rather than skipped
+			// on the strength of two failures agreeing.
 			r, err := o.headObject(bucketSpec, name)
 			if err != nil {
-				logger.Info(module, "cannot read the checksum of oci://%s/%s, treating it as absent: %s", bucketSpec, name, err)
-				return 0
+				logger.Info(module, "cannot read the checksum of oci://%s/%s, treating it as unknown: %s", bucketSpec, name, err)
+				return 0, false
 			}
 			if r == nil {
-				logger.Info(module, "oci://%s/%s vanished while reading its checksum, treating it as absent", bucketSpec, name)
-				return 0
+				logger.Info(module, "oci://%s/%s vanished while reading its checksum, treating it as unknown", bucketSpec, name)
+				return 0, false
 			}
 			crc, stored := crc32cOf(r.OpcContentCrc32c)
 			if !stored {
 				logger.Debug(module, "oci://%s/%s has no stored CRC32C", bucketSpec, name)
+				return 0, false
 			}
-			return crc
+			return crc, true
 		}
 	}
 	return a
