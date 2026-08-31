@@ -2,31 +2,52 @@ package logger
 
 import (
 	"fmt"
-	"sync/atomic"
+	"strings"
+	"sync"
 	"time"
 )
 
 // Debugging switches debugging mode
 var Debugging = false
 
-// reported records whether anything has been said to the user at info level or
-// above.
+// lastSaid is the most recent line printed at info level or above.
 //
-// common.ExitWith consults it so that a command which fails prints the reason
-// exactly once. Without something like this the choice is between staying
-// silent when nothing else spoke -- the bug in TODO item 20 -- and printing
-// the same failure twice, because the backends log before returning an error
-// that the command layer then reports as well.
+// common.ExitWith consults it so that a command which fails says why exactly
+// once. Tracking merely *whether* something was printed is not enough: rsync
+// announces "Building synchronization state..." before it does any work, so
+// any flag set by that would silence the error that follows -- which is the
+// bug in TODO item 20, surviving in the most common path. What matters is
+// whether the failure itself has already been described.
 //
-// Atomic because the worker pool logs from many goroutines.
-var reported atomic.Bool
+// Guarded because the worker pool logs from many goroutines. If another
+// goroutine logs in between, the error is printed again rather than dropped:
+// saying it twice is a nuisance, saying nothing is the defect.
+var (
+	lastMu   sync.Mutex
+	lastSaid string
+)
 
-// Reported reports whether anything has been printed at info level or above.
-func Reported() bool { return reported.Load() }
+func remember(s string) {
+	lastMu.Lock()
+	lastSaid = s
+	lastMu.Unlock()
+}
+
+// AlreadySaid reports whether the most recent line printed already carries
+// this text, so a caller can avoid repeating it.
+func AlreadySaid(text string) bool {
+	if text == "" {
+		return false
+	}
+	lastMu.Lock()
+	defer lastMu.Unlock()
+	return strings.Contains(lastSaid, text)
+}
 
 // Output directly output content to stdout
 func Output(s string) {
-	reported.Store(true)
+	// Deliberately not remembered: Output is the command's result, not a
+	// report of what happened, so it must not stand in for an explanation.
 	fmt.Print(s)
 }
 
@@ -41,8 +62,8 @@ func Debug(module, s string, vs ...any) {
 
 // Info info level log
 func Info(module, s string, vs ...any) {
-	reported.Store(true)
 	s = fmt.Sprintf(s, vs...)
+	remember(s)
 	if len(module) != 0 {
 		fmt.Printf("[%s] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 	} else {
@@ -52,14 +73,14 @@ func Info(module, s string, vs ...any) {
 
 // Warn warn level log
 func Warn(module, s string, vs ...any) {
-	reported.Store(true)
 	s = fmt.Sprintf(s, vs...)
+	remember(s)
 	fmt.Printf("[%s] [WARN] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 }
 
 // Error error level log
 func Error(module, s string, vs ...any) {
-	reported.Store(true)
 	s = fmt.Sprintf(s, vs...)
+	remember(s)
 	fmt.Printf("[%s] [ERROR] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 }

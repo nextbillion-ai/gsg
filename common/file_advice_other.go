@@ -1,3 +1,4 @@
+//go:build !linux
 // +build !linux
 
 package common
@@ -23,4 +24,3 @@ func FadviseWriteSequential(file *os.File) {
 func FadviseWriteDontNeed(file *os.File, offset, length int64) {
 	// Not supported on this platform
 }
-

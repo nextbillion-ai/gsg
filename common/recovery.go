@@ -43,16 +43,18 @@ func Exit() {
 // subdirectory>` and `gsg cp -r` of the same both exited 1 saying nothing at
 // all.
 //
-// It reports only when nothing else has. The backends log before returning an
-// error that the command layer then hands here, so logging unconditionally
-// would print the same failure twice -- and the point of this is the case
-// where nobody said anything at all, not to say it again louder.
+// It reports unless the failure has already been described. The backends log
+// before returning an error that the command layer then hands here, so
+// printing unconditionally would say the same thing twice; but a flag for
+// "something was printed" is too blunt, because rsync announces itself before
+// it does any work and would then silence every error after it. What is
+// compared is the text of this error against the last line printed.
 //
 // A nil error still exits. Some callers have already said what went wrong and
 // only want the status code, and refusing to exit for them would be worse than
 // a missing line.
 func ExitWith(err error) {
-	if err != nil && !logger.Reported() {
+	if err != nil && !logger.AlreadySaid(err.Error()) {
 		logger.Error(module, "%s", err)
 	}
 	Exit()

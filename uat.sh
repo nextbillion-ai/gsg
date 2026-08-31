@@ -1243,6 +1243,13 @@ GOHELPER
     # `x=$(cmd)` takes cmd's exit status, and the suite runs under `set -e`, so
     # capturing a command that is meant to fail kills the run with no message
     # at all. `&& rc=0 || rc=$?` keeps both the output and the status.
+    # rsync announces itself before doing any work, so this is the case that
+    # catches a fix which merely tracks "was anything printed": the banner
+    # would suppress the error that follows, which is the original bug in the
+    # most common path.
+    rsout=$(../gsg -m rsync -r $flocal ${flocal}_silentsync 2>&1) && rsrc=0 || rsrc=$?
+    rm -rf ${flocal}_silentsync
+
     duout=$(../gsg du $flocal 2>&1) && durc=0 || durc=$?
     cpout=$(../gsg cp -r $flocal ${flocal}_silent 2>&1) && cprc=0 || cprc=$?
     lsout=$(../gsg ls -r $flocal 2>&1) && lsrc=0 || lsrc=$?
@@ -1259,6 +1266,10 @@ GOHELPER
     # And each has to name the reason the tool gave, not a bare status. "exit
     # status 1" is what exec hands back; find, du and cp each wrote the real
     # cause to stderr.
+    assertEq "rsync of an unreadable tree fails" "$rsrc" "1"
+    assertEq "and explains itself despite having printed a banner first" \
+        "$([ "$(echo "$rsout" | grep -c 'Permission denied')" -ge 1 ] && echo yes || echo no)" "yes"
+
     for pair in "du|$duout" "cp|$cpout" "ls|$lsout"
     do
         what="${pair%%|*}"; text="${pair#*|}"
@@ -1270,6 +1281,18 @@ GOHELPER
         assertEq "$what does not merely report an exit status" \
             "$(echo "$text" | grep -c 'exit status')" "0"
     done
+
+    # And not twice. The cloud backends describe the failure before returning
+    # it, so the command layer must not repeat what has already been said. A
+    # missing bucket is the reliable way to provoke that: gs logs "get objects
+    # attributes failed with ..." and then returns the same error.
+    # gs only, because the wording is the backend's own.
+    if [[ "$mode" == "gs" ]]
+    then
+        dupout=$(../gsg ls "gs://no-such-bucket-$testid/" 2>&1) || true
+        assertEq "a failure the backend already explained is not repeated" \
+            "$(echo "$dupout" | grep -c "doesn't exist")" "1"
+    fi
 
     rm -f .lsout .rsout
     finish
