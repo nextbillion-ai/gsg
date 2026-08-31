@@ -34,7 +34,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1 | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
-| 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
+| 20 | fixed | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
 | 21 | fixed | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
 | 23 | fixed | yes -- a gs upload is stored with a checksum of whatever arrived | fixed: the upload now sends its checksum |
@@ -831,6 +831,25 @@ was not logged deeper produces exit 1 and an empty screen.
 making any lower-level call that could log it. `gsg ls oci://bucket/` exited 1
 and printed nothing at all. The skeleton works around it by logging inside
 `errNotImplemented`, which is why that helper logs as well as returning.
+
+**Fixed.** `common.ExitWith(err)` reports and then exits, and the command sites
+that had an error in hand were converted to it.
+
+It reports only when nothing else has, which the logger now tracks. The
+backends log before returning, so reporting unconditionally would print every
+ordinary failure twice -- the point is the case where nobody said anything at
+all, not to say it again louder.
+
+Two other things had to change for the message to be worth printing. The linux
+backend wraps its shell commands, and exec reports only "exit status 1" -- the
+tools write the real cause to stderr, which is now what gets returned. And the
+inter-cloud copy paths named the source and destination but not the error.
+
+Measured before: `gsg du` and `gsg cp -r` over a directory with an unreadable
+subdirectory both exited 1 printing nothing. After: `cannot measure /tmp/p20:
+du: /tmp/p20/noread: Permission denied`.
+
+The original note follows.
 
 **Fix:** log the error at the point it is discarded, or -- better, since it is
 21 sites -- give `common.Exit` an error-taking form (`common.ExitWith(err)`)

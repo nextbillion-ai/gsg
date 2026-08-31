@@ -32,7 +32,7 @@ var unlockCmd = &cobra.Command{
 		if fo.System.Scheme() == "gs" {
 			gcs := fo.System.(*gcs.GCS)
 			if e := gcs.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}
@@ -40,7 +40,7 @@ var unlockCmd = &cobra.Command{
 		if fo.System.Scheme() == "s3" {
 			gcs := fo.System.(*s3.S3)
 			if e := gcs.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}
@@ -48,7 +48,7 @@ var unlockCmd = &cobra.Command{
 		if fo.System.Scheme() == "oci" {
 			o := fo.System.(*oci.OCI)
 			if e := o.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}
@@ -56,7 +56,7 @@ var unlockCmd = &cobra.Command{
 		if fo.System.Scheme() == "" {
 			lnx := fo.System.(*linux.Linux)
 			if e := lnx.AttemptUnLock(fo.Bucket, fo.Prefix); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 
 			common.Finish()

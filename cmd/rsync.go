@@ -21,7 +21,7 @@ func deleteDst(src, dst *system.FileObject, _, isDel, _ bool) bool {
 			var err error
 			var fos []*system.FileObject
 			if fos, err = dst.System.List(dst.Bucket, dst.Prefix, true); err != nil {
-				common.Exit()
+				common.ExitWith(err)
 			}
 			for _, fo := range fos {
 				bucket := fo.Bucket
@@ -29,7 +29,7 @@ func deleteDst(src, dst *system.FileObject, _, isDel, _ bool) bool {
 				system := fo.System
 				pool.Add(func() {
 					if e := system.Delete(bucket, prefix); e != nil {
-						common.Exit()
+						common.ExitWith(e)
 					}
 				})
 			}
@@ -57,7 +57,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		if e := common.DoWithRetrySimple(func() error {
 			return fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
 		}); e != nil {
-			common.Exit()
+			common.ExitWith(e)
 		}
 	}
 	if isDel {
@@ -69,7 +69,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 				if e := common.DoWithRetrySimple(func() error {
 					return system.Delete(bucket, prefix)
 				}); e != nil {
-					common.Exit()
+					common.ExitWith(e)
 				}
 			})
 		}
@@ -96,7 +96,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			if e := common.DoWithRetrySimple(func() error {
 				return dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars})
 			}); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 		})
 	}
@@ -108,7 +108,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 				if e := common.DoWithRetrySimple(func() error {
 					return system.Delete(dst.Bucket, dstPath)
 				}); e != nil {
-					common.Exit()
+					common.ExitWith(e)
 				}
 			})
 		}
@@ -143,7 +143,7 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			if e := common.DoWithRetrySimple(func() error {
 				return system.Copy(bucket, prefix, dst.Bucket, dstPath)
 			}); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 		})
 	}
@@ -155,7 +155,7 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 				if e := common.DoWithRetrySimple(func() error {
 					return system.Delete(dst.Bucket, dstPath)
 				}); e != nil {
-					common.Exit()
+					common.ExitWith(e)
 				}
 			})
 		}
@@ -184,7 +184,7 @@ func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			if e := common.DoWithRetrySimple(func() error {
 				return system.Copy(bucket, prefix, dst.Bucket, dstPath)
 			}); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 		})
 	}
@@ -196,7 +196,7 @@ func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 				if e := common.DoWithRetrySimple(func() error {
 					return system.Delete(dst.Bucket, dstPath)
 				}); e != nil {
-					common.Exit()
+					common.ExitWith(e)
 				}
 			})
 		}
@@ -264,7 +264,7 @@ func listRelatively(base *system.FileObject, isRec bool) map[string]*system.File
 	var err error
 	var fos []*system.FileObject
 	if fos, err = base.System.List(base.Bucket, base.Prefix, isRec); err != nil {
-		common.Exit()
+		common.ExitWith(err)
 	}
 	r := map[string]*system.FileObject{}
 	for _, fo := range fos {
@@ -323,7 +323,7 @@ func deleteTempFiles(dir string, isRec bool) {
 	l := system.Lookup("")
 	for _, obj := range linux.ListTempFiles(dir, isRec) {
 		if e := l.Delete("", obj); e != nil {
-			common.Exit()
+			common.ExitWith(e)
 		}
 	}
 }

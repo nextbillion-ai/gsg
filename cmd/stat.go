@@ -35,7 +35,7 @@ var statCmd = &cobra.Command{
 		var err error
 		var attrs *storage.ObjectAttrs
 		if attrs, err = g.GCSAttrs(fo.Bucket, fo.Prefix); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		logger.Info(module, "%s://%s/%s:", fo.System.Scheme(), fo.Bucket, fo.Prefix)
 		logger.Info(module, "\t%-s:\t%s", "Creation time", attrs.Created)

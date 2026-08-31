@@ -24,7 +24,7 @@ var hashCmd = &cobra.Command{
 		var err error
 		var attrs *system.Attrs
 		if attrs, err = fo.System.Attributes(fo.Bucket, fo.Prefix); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		if attrs == nil {
 			logger.Info(module, "Invalid bucket[%s] with prefix[%s]", fo.Bucket, fo.Prefix)

@@ -34,28 +34,28 @@ var rmCmd = &cobra.Command{
 					var err error
 					var objs []*system.FileObject
 					if objs, err = fo.System.List(fo.Bucket, fo.Prefix, isRec); err != nil {
-						common.Exit()
+						common.ExitWith(err)
 					}
 					for _, obj := range objs {
 						bucket := obj.Bucket
 						prefix := obj.Prefix
 						pool.Add(func() {
 							if e := fo.System.Delete(bucket, prefix); e != nil {
-								common.Exit()
+								common.ExitWith(e)
 							}
 						})
 					}
 				case system.FileType_Object:
 					pool.Add(func() {
 						if e := fo.System.Delete(fo.Bucket, fo.Prefix); e != nil {
-							common.Exit()
+							common.ExitWith(e)
 						}
 					})
 				}
 			case false:
 				pool.Add(func() {
 					if e := fo.System.Delete(fo.Bucket, fo.Prefix); e != nil {
-						common.Exit()
+						common.ExitWith(e)
 					}
 				})
 			}

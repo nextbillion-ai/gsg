@@ -40,7 +40,7 @@ var upgradeCmd = &cobra.Command{
 		var err error
 		var srcObj *system.Attrs
 		if srcObj, err = g.Attributes(upgradeBucket, srcPath); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		if srcObj == nil {
 			logger.Info(module, "gsg release not found: %s", srcPath)
@@ -55,7 +55,7 @@ var upgradeCmd = &cobra.Command{
 		l := system.Lookup("")
 		var dstObj *system.Attrs
 		if dstObj, err = l.Attributes("", dstPath); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 			return
 		}
 		if dstObj == nil {
@@ -70,10 +70,10 @@ var upgradeCmd = &cobra.Command{
 			return
 		}
 
-	// upgrade local version
-	if err = g.Download(upgradeBucket, srcPath, srcPath, true, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
-		common.Exit()
-	}
+		// upgrade local version
+		if err = g.Download(upgradeBucket, srcPath, srcPath, true, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+			common.ExitWith(err)
+		}
 		common.Chmod(dstPath, 0766)
 	},
 }

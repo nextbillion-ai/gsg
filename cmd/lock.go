@@ -45,7 +45,7 @@ var lockCmd = &cobra.Command{
 		if fo.System.Scheme() == "gs" {
 			gcs := fo.System.(*gcs.GCS)
 			if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}
@@ -53,7 +53,7 @@ var lockCmd = &cobra.Command{
 		if fo.System.Scheme() == "s3" {
 			gcs := fo.System.(*s3.S3)
 			if e := gcs.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}
@@ -61,7 +61,7 @@ var lockCmd = &cobra.Command{
 		if fo.System.Scheme() == "oci" {
 			o := fo.System.(*oci.OCI)
 			if e := o.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}
@@ -69,7 +69,7 @@ var lockCmd = &cobra.Command{
 		if fo.System.Scheme() == "" {
 			lnx := fo.System.(*linux.Linux)
 			if e := lnx.AttemptLock(fo.Bucket, fo.Prefix, time.Duration(int64(time.Second)*int64(ttlInSec))); e != nil {
-				common.Exit()
+				common.ExitWith(e)
 			}
 			common.Finish()
 		}

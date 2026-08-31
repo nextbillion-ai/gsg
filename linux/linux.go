@@ -163,8 +163,11 @@ func (l *Linux) List(bucket, prefix string, isRec bool) ([]*system.FileObject, e
 		// non-zero for a single unreadable subdirectory too, and rsync -d
 		// deletes everything at the destination the source listing omits, so
 		// swallowing this could wipe the destination.
-		logger.Info(module, "listing [%s] failed with %s", dir, err)
-		return nil, err
+		//
+		// commandFailure rather than the raw error: exec gives back only "exit
+		// status 1", and find has already written the reason -- which
+		// directory, and why -- to stderr.
+		return nil, commandFailure("list", dir, err)
 	}
 	res := splitPaths(stdout)
 	objs := []*system.FileObject{}
@@ -224,8 +227,9 @@ func ListTempFiles(dir string, isRec bool) []string {
 	}
 	if err != nil {
 		// Only leaves stale temp files behind, so this is not fatal -- but it
-		// should not be invisible either.
-		logger.Info(module, "listing temp files under [%s] failed with %s", dir, err)
+		// should not be invisible either. Reported here rather than returned,
+		// since the signature has no error to carry it.
+		logger.Info(module, "%s", commandFailure("list temp files under", dir, err))
 		return nil
 	}
 	objs := []string{}
@@ -238,13 +242,40 @@ func ListTempFiles(dir string, isRec bool) []string {
 }
 
 // GetDiskUsageObjects gets disk usage of objects under a prefix
+// commandFailure turns a failed shell command into something a user can act
+// on.
+//
+// exec reports only "exit status 1", which names neither the command nor the
+// reason. The tools these calls wrap write the reason to stderr -- an
+// unreadable directory, a path that is not there -- and ExitError carries it,
+// so that is what gets reported. Since #20 the command layer prints whatever
+// error it is handed, which makes the difference visible rather than academic.
+func commandFailure(what, path string, err error) error {
+	reason := err.Error()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+		reason = strings.TrimSpace(string(ee.Stderr))
+	}
+	// Returned, not logged. The command layer prints whatever error it is
+	// handed, so logging here too would say the same thing twice; and a
+	// caller that handles the error itself should not have a line printed on
+	// its behalf.
+	logger.Debug(module, "%s of [%s] failed: %s", what, path, reason)
+	return fmt.Errorf("cannot %s %s: %s", what, path, reason)
+}
+
 func (l *Linux) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsage, error) {
 	dir := GetRealPath(prefix)
 	objs := []system.DiskUsage{}
-	stdout, err := exec.Command("du", "-aB1", dir).Output()
+	cmd := exec.Command("du", "-aB1", dir)
+	stdout, err := cmd.Output()
 	if err != nil {
-		logger.Debug(module, "failed with %s", err)
-		return nil, err
+		// "exit status 1" on its own says nothing a caller can act on. du
+		// writes the reason to stderr -- an unreadable subdirectory, a path
+		// that is not there -- and ExitCommand captures it, so say that
+		// instead. Reported as an error rather than at debug: this is the
+		// message the command layer will show.
+		return nil, commandFailure("measure", dir, err)
 	}
 	res := strings.Split(string(stdout), "\n")
 	for _, v := range res {
@@ -286,8 +317,7 @@ func (l *Linux) Upload(srcFile, bucket, object string, ctx system.RunContext) er
 func (l *Linux) Delete(bucket, prefix string) error {
 	var err error
 	if _, err = exec.Command("rm", "-rf", prefix).Output(); err != nil {
-		logger.Debug(module, "failed with %s", err)
-		return err
+		return commandFailure("remove", prefix, err)
 	}
 	logger.Info(module, "Removing path[%s]", prefix)
 	return nil
@@ -301,8 +331,7 @@ func (l *Linux) Copy(srcBucket, srcPath, dstBucket, dstPath string) error {
 	}
 	var err error
 	if _, err = exec.Command("cp", "-rf", srcPath, dstPath).Output(); err != nil {
-		logger.Debug(module, "failed with %s", err)
-		return err
+		return commandFailure("copy", srcPath, err)
 	}
 	logger.Info(module, "Copying from path[%s] to path[%s]", srcPath, dstPath)
 	return nil
@@ -312,8 +341,7 @@ func (l *Linux) Copy(srcBucket, srcPath, dstBucket, dstPath string) error {
 func (l *Linux) Move(srcBucket, srcPath, dstBucket, dstPath string) error {
 	var err error
 	if _, err = exec.Command("mv", srcPath, dstPath).Output(); err != nil {
-		logger.Debug(module, "failed with %s", err)
-		return err
+		return commandFailure("move", srcPath, err)
 	}
 	logger.Info(module, "Moving from path[%s] to path[%s]", srcPath, dstPath)
 	return nil
@@ -324,8 +352,7 @@ func (l *Linux) Cat(bucket, path string) ([]byte, error) {
 	var err error
 	var bs []byte
 	if bs, err = exec.Command("cat", path).Output(); err != nil {
-		logger.Info(module, "failed with %s", err)
-		return nil, err
+		return nil, commandFailure("read", path, err)
 	}
 	return bs, nil
 }

@@ -32,7 +32,7 @@ var duCmd = &cobra.Command{
 		var objs []system.DiskUsage
 		var err error
 		if objs, err = fo.System.DiskUsage(fo.Bucket, fo.Prefix, true); err != nil {
-			common.Exit()
+			common.ExitWith(err)
 		}
 		scheme := ""
 		if len(fo.System.Scheme()) > 0 {
