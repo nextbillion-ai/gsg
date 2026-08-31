@@ -30,10 +30,10 @@ several are not worth fixing. The evidence is recorded under each one.
 | 13 | PR #43 | n/a -- duplication, one copy with a flaw | fix |
 | 14 | PR #46 | yes -- 301 MovedPermanently across regions | fix, with 3 |
 | 15 | PR #44 | yes -- 8 of 8 processes acquire the same lock | fix, folded into #44 |
-| 16 | open | yes -- one receipt file for both schemes | low, needs the same bucket and key on both |
-| 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1 | small fix, deferred -- s3 is not the current focus |
+| 16 | open | yes -- one receipt file for gs and s3; oci is clear | low, needs the same bucket and key on both |
+| 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1; oci verified clear | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
-| 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
+| 19 | open | yes -- s3 rejects 6 GiB; oci times out at ~1-2 GiB, link-dependent | fix -- worse on oci |
 | 20 | PR #59 | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
 | 21 | PR #58 | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | PR #61 | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fixed |
@@ -603,6 +603,10 @@ Taking the second lock overwrites the first's receipt, and the first can then no
 longer be released -- it will be refused, since the receipt now holds the other
 backend's identifier, and the lock stands until its TTL.
 
+**gs and s3 only.** `oci/lock.go` names its receipt
+`GenTempFileName("oci", "://", bucket, "/", object)`, so it cannot collide with
+either of the others. The fix for gs and s3 is to do the same.
+
 **Reproduced** while testing item 15, by racing locks on both schemes at the
 same bucket and key. It needs a bucket of the same name to exist on both
 providers and the same key used for a lock on each, which is why it is filed
@@ -642,6 +646,11 @@ wrote and truthfully reports it missing.
 Scope: s3 -> s3 only, including within one bucket. Cross-cloud copies go through
 `interCloudCopy`, which downloads and re-uploads and never builds this header.
 `GCS.Copy` uses typed object handles, so it cannot have the bug.
+
+**oci verified clear.** `CopyObject` takes the source name as a typed field
+rather than a concatenated header, and an oci -> oci `cp -r` over the same six
+awkward names copied 6 of 6, including `café.txt`, `plus+sign.txt` and
+`run=2026-08-23T02:00:00+05:30.txt`.
 
 **What it costs, on a realistic tree.** Promoting a staging export to prod,
 where a Hive partition is named by an ISO timestamp -- IST puts `+05:30` in the
@@ -829,9 +838,52 @@ be uploaded at all -- the API rejects it. And because the transfer is one
 request with no part boundaries, a network failure partway through a large
 upload restarts from zero rather than resuming.
 
-Not reproduced: confirming the first would mean pushing a >5 GB object, which
-costs real transfer and storage. It is a documented S3 limit rather than an
-inference, but it has not been observed here.
+**Now reproduced, on both s3 and oci -- and they fail differently.**
+
+s3, 6 GiB, single PutObject:
+
+```
+exit 1 in 0s, nothing stored
+EntityTooLarge: Your proposed upload exceeds the maximum allowed size
+```
+
+Immediate, unambiguous, and clean: the service rejects it on the headers before
+any bytes move.
+
+oci is worse, because the ceiling is not a size at all. gsg does no multipart
+there either, and OCI does not reject on size -- the request simply runs into
+the SDK client's 60-second timeout:
+
+| size | result |
+|---|---|
+| 1 GiB | stored, 38s, correct size and CRC32C |
+| 3 GiB | **exit 1 at 61s** -- `Client.Timeout exceeded while awaiting headers` |
+| 6 GiB | **exit 1 at 63s** -- same |
+
+So the largest object gsg can put to OCI depends on the link, not on the file:
+on this connection about 1-2 GiB, and on a slower one a few hundred MB would
+fail. The error says "timeout", which reads like a transient network problem,
+so the natural response is to retry -- and it fails again, every time, forever.
+
+Both fail cleanly at least: exit 1, nothing stored, no partial object.
+
+**And on oci the SDK's own retry is disabled by how gsg passes the body:**
+
+```
+Unable to perform Retry on this request body type,
+which did not implement seek() interface
+```
+
+`Upload` passes `io.NopCloser(io.TeeReader(f, pb))` when a progress bar is
+attached. The SDK reflects into `io.NopCloser` to find an `io.Seeker` so it can
+rewind and retry, and a `TeeReader` is not one. Without a progress bar the body
+is the `*os.File` and retries work, so this is only broken on the path the CLI
+actually uses. Fixing it means passing something that reads, reports progress,
+and still seeks -- a small wrapper over `*os.File` -- rather than a `TeeReader`.
+
+Setting `ContentLength` explicitly, which #60 made come from the checksum pass,
+does at least keep the SDK off its other path: without it the client measures
+an unseekable body by reading the whole thing into memory first.
 
 Note this is also why every gsg-written object is FULL_OBJECT and therefore
 always has a comparable checksum -- the single-PUT path is what makes item 4's
