@@ -50,6 +50,95 @@ assertEq "no temporary files were left behind" \
 
 finish
 
+start "transfer: a changed file uploads on the first attempt"
+
+# The checksum sent with an upload is taken from the handle the body is read
+# from, not from the crc32c cache keyed on path and mtime. The cache is only as
+# good as the assumption that content and modification time move together, and
+# the service rejects an object whose checksum does not describe its body -- so
+# a stale entry costs a whole upload spent to be told so.
+#
+# Its own prefix, so the counts the later cases make are unaffected.
+fre="folder_reupload"
+mkdir -p $fre
+
+# Ordinary edit first: content and mtime both move.
+prepare_file $fre/edited.txt first
+../gsg cp $fre/edited.txt "$remote_base/$fre/edited.txt"
+prepare_file $fre/edited.txt second
+editout=$(../gsg cp $fre/edited.txt "$remote_base/$fre/edited.txt" 2>&1) && editrc=0 || editrc=$?
+assertEq "re-uploading a changed file succeeds" "$editrc" "0"
+assertEq "and was not refused and retried" \
+    "$(echo "$editout" | grep -c 'does not match the expected')" "0"
+assertEq "the stored object is the new content" \
+    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --name "$testid/$fre/edited.txt" --file - 2>/dev/null)" "second"
+
+# Then the case the cache cannot see: the modification time put back exactly.
+# A helper rather than touch, because touch works to the second while the cache
+# key carries nanoseconds -- a touched file lands on a different key and would
+# be recomputed whatever the code did.
+prepare_file $fre/sneaky.txt before
+../gsg cp $fre/sneaky.txt "$remote_base/$fre/sneaky.txt"
+cat > sneaky_oci.go <<'GOHELPER'
+package main
+
+import (
+	"os"
+	"time"
+)
+
+func main() {
+	p, content := os.Args[1], os.Args[2]
+	fi, err := os.Stat(p)
+	if err != nil {
+		os.Exit(1)
+	}
+	mt := fi.ModTime()
+	if err = os.WriteFile(p, []byte(content+"\n"), 0600); err != nil {
+		os.Exit(1)
+	}
+	if err = os.Chtimes(p, time.Now(), mt); err != nil {
+		os.Exit(1)
+	}
+}
+GOHELPER
+(cd .. && go run "$OLDPWD/sneaky_oci.go" "$OLDPWD/$fre/sneaky.txt" afterx)
+rm -f sneaky_oci.go
+
+sneakout=$(../gsg cp $fre/sneaky.txt "$remote_base/$fre/sneaky.txt" 2>&1) && sneakrc=0 || sneakrc=$?
+assertEq "a change that keeps the modification time still uploads" "$sneakrc" "0"
+assertEq "and is not refused either" \
+    "$(echo "$sneakout" | grep -c 'does not match the expected')" "0"
+assertEq "and stores the new content" \
+    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        --name "$testid/$fre/sneaky.txt" --file - 2>/dev/null)" "afterx"
+
+# Everything above would also pass if the checksum were never sent: OCI would
+# compute one over whatever arrived, store it, and agree with itself forever.
+# What makes the header load-bearing is that a wrong one is refused. Built with
+# an overlay so the source tree is untouched -- a gsg whose checksum is one off
+# from its body must have the object rejected, and must leave nothing behind.
+ovdir=$(mktemp -d)
+sed 's/return h.Sum32(), n, nil/return h.Sum32() + 1, n, nil/' ../oci/transfer.go > "$ovdir/transfer.go"
+assertEq "the overlay actually changed the checksum" \
+    "$(diff ../oci/transfer.go "$ovdir/transfer.go" | grep -c '^>')" "1"
+printf '{"Replace":{"%s/oci/transfer.go":"%s/transfer.go"}}' "$repoRoot" "$ovdir" > "$ovdir/overlay.json"
+(cd .. && go build -overlay "$ovdir/overlay.json" -o "$ovdir/gsg_wrongcrc" .) >/dev/null 2>&1
+
+if "$ovdir/gsg_wrongcrc" cp $fre/edited.txt "$remote_base/$fre/wrongcrc.txt" >/dev/null 2>&1
+then
+    echo "FATAL: an upload carrying a checksum that does not match its body was accepted"
+    rm -rf "$ovdir"
+    exit 1
+else
+    echo "OK: an upload whose checksum does not match its body is refused"
+fi
+assert_not $fre/wrongcrc.txt remote
+rm -rf "$ovdir"
+
+finish
+
 start "transfer: -v verifies, and a repeated rsync is a no-op"
 
 assertEq "cp -v checks every downloaded file" \
