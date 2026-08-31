@@ -3,12 +3,55 @@ package oci
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"time"
 
 	"github.com/nextbillion-ai/gsg/logger"
 
 	ocicommon "github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 )
+
+// newHTTPClient builds the client the SDK dispatches through.
+//
+// The SDK's own default puts a 60-second deadline on the whole request, body
+// included, and gsg stores an object in one PutObject. Anything taking longer
+// than a minute to send was therefore cancelled mid-stream however healthy the
+// connection was, so the largest object gsg could store was set by link speed
+// rather than by any limit of the service: measured, 3 GiB and 6 GiB both
+// failed at ~61s, and both stored fine once the deadline was moved.
+//
+// A whole-request deadline cannot work when the request carries the body --
+// its duration legitimately scales with the file. Zero is Go's "no deadline",
+// and is what both the aws and google SDKs ship, for exactly this reason. What
+// actually has to be caught is a peer that stops responding, and the limits
+// below do that at the transport level, where they hold however long the
+// transfer runs. ResponseHeaderTimeout is the one that would be unsafe if it
+// were measured from the start of the request; Go starts it only once the body
+// has been fully written, so a twenty-minute upload cannot trip it while a
+// server that goes silent afterwards still fails in a minute.
+//
+// The values match the aws and google defaults so the three backends behave
+// alike.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+		},
+	}
+}
 
 // clientAndNamespace returns the shared client and the namespace to address.
 //
@@ -33,6 +76,7 @@ func (o *OCI) clientAndNamespace(bucketSpec string) (*objectstorage.ObjectStorag
 			logger.Debug(module, "cannot build client: %s", err)
 			return nil, "", fmt.Errorf("oci: cannot build client: %w", err)
 		}
+		c.HTTPClient = newHTTPClient()
 		o.client = &c
 		// Region comes from the same provider as the credentials. A copy needs
 		// it on every request, so reading it once here avoids re-parsing the

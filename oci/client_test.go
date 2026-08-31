@@ -2,8 +2,10 @@ package oci
 
 import (
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -90,4 +92,60 @@ func TestVerifyBucketUnderConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 	assert.Equal(t, 1, calls, "50 workers should produce one bucket check, not 50")
+}
+
+// TestHTTPClientHasNoWholeRequestDeadline pins the fix for the upload ceiling.
+//
+// The SDK's default client carries Timeout: 60s, which Go applies to the whole
+// request including the body. Because gsg stores an object in a single
+// PutObject, that made the largest uploadable object a function of link speed:
+// measured, 3 GiB and 6 GiB both failed at ~61s, and both stored fine once the
+// deadline was moved. Restoring any non-zero value here brings that back, and
+// it would not show up in the UAT -- reproducing it needs a transfer longer
+// than a minute, which is bandwidth-dependent and so a flaky thing to assert
+// against a live service. Hence a unit test.
+func TestHTTPClientHasNoWholeRequestDeadline(t *testing.T) {
+	c := newHTTPClient()
+	if c.Timeout != 0 {
+		t.Fatalf("http client has a whole-request deadline of %s; a request that "+
+			"carries the body takes as long as the body needs, so this caps "+
+			"uploads at roughly timeout x bandwidth", c.Timeout)
+	}
+}
+
+// TestHTTPClientStillBoundsADeadPeer is the other half: dropping the
+// whole-request deadline is only safe because the transport still notices a
+// peer that stops responding. Without these, a stalled connection would hang
+// for ever.
+//
+// That these values actually bite was measured rather than assumed. Against a
+// local listener that accepts a PUT, drains the body and then never answers,
+// this client gave up after exactly 1m0s with "net/http: timeout awaiting
+// response headers". The test that showed it is not kept here because it
+// costs a minute to run and the rest of this package finishes in under a
+// second; what is kept is the structural check that the values are still set.
+func TestHTTPClientStillBoundsADeadPeer(t *testing.T) {
+	tr, ok := newHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, not *http.Transport, so its timeouts cannot be checked", newHTTPClient().Transport)
+	}
+	for _, c := range []struct {
+		what string
+		got  time.Duration
+	}{
+		{"TLSHandshakeTimeout", tr.TLSHandshakeTimeout},
+		{"IdleConnTimeout", tr.IdleConnTimeout},
+		{"ExpectContinueTimeout", tr.ExpectContinueTimeout},
+		// Safe despite the long uploads: Go starts this clock only after the
+		// request body has been fully written.
+		{"ResponseHeaderTimeout", tr.ResponseHeaderTimeout},
+	} {
+		if c.got <= 0 {
+			t.Errorf("%s is %s; with no whole-request deadline this is what "+
+				"bounds a peer that stops responding", c.what, c.got)
+		}
+	}
+	if tr.DialContext == nil {
+		t.Error("DialContext is nil, so connecting to an unreachable host is unbounded")
+	}
 }
