@@ -34,10 +34,10 @@ several are not worth fixing. The evidence is recorded under each one.
 | 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1 | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
-| 20 | fixed | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
-| 21 | fixed | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
-| 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
-| 23 | fixed | yes -- a gs upload is stored with a checksum of whatever arrived | fixed: the upload now sends its checksum |
+| 20 | PR #59 | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
+| 21 | PR #58 | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
+| 22 | PR #61 | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fixed |
+| 23 | PR #57, #60 | yes -- a gs upload is stored with a checksum of whatever arrived | fixed on gs and oci |
 | 24 | open | yes -- A releases B's lock after its own expired, on one machine | fix, design change |
 
 Suggested order for what remains: 15, then 2, then 14 and 3 together, since
@@ -1067,6 +1067,15 @@ data, but it is worth fixing item 4 alongside, or computing the checksum here
 in a form that can report failure.
 
 Found while reviewing the OCI backend, which had the same gap.
+
+**Fixed on gs in PR #57 and on oci in PR #60.** Both hash the open file handle
+the body will be read from rather than reading the mtime-keyed cache, which
+also settles the concern above about a failed read sending a zero: the checksum
+comes from the same bytes that are sent, and a read error fails the upload
+rather than being sent as 0. Measured at 111ms of hashing against a 4s upload
+of the same 190MB file, so the cache was not buying much. PR #60 additionally
+takes `ContentLength` from that same pass, so the declared length cannot
+describe a different file than the body does.
 
 ## 24. A lock receipt identifies an object, not a holder
 
