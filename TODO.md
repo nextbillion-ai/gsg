@@ -35,7 +35,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
 | 19 | open | no -- would need a >5 GB upload to confirm | fix eventually |
 | 20 | open | yes -- `gsg ls` on a backend error exits 1 printing nothing | fix, small |
-| 21 | open | yes -- `gsg mv gs://b/k gs://b/k` deletes the object | fix, small, data loss |
+| 21 | fixed | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | open | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fix, small |
 | 23 | fixed | yes -- a gs upload is stored with a checksum of whatever arrived | fixed: the upload now sends its checksum |
 | 24 | open | yes -- A releases B's lock after its own expired, on one machine | fix, design change |
@@ -870,6 +870,34 @@ Found while building the OCI backend, where the same shape was reachable a
 second way: `oci://b/k` and `oci://b@namespace/k` are one object with two
 spellings, so a raw string comparison of source and destination misses it. That
 one is fixed in the OCI backend.
+
+**Fixed**, and it turned out to be two bugs rather than one.
+
+Checking gsutil settled what the behaviour should be:
+
+| | gsutil |
+|---|---|
+| `mv obj obj` | exit 1, "are the same file - abort" |
+| `mv -r d d/sub` | performed; ends at `d/sub/d/...`, originals gone |
+
+That pointed at the larger bug: mv listed the source *after* the copy, so for a
+destination inside the source the listing returned the fresh copies too and
+deleting them threw the data away. Measured on gs, `mv -r d d/sub` took two
+objects to none. The delete list is now decided before the copy.
+
+A self-descendant move is nonetheless refused, which is where gsg has to
+diverge from gsutil. gsutil can perform it because its copy nests the source
+directory -- it ends at `d/sub/d/...`, where nothing collides. gsg's `cp -r`
+copies a directory's *contents*, so source and destination keys run into each
+other: with `d/a.txt` holding "root" and `d/sub/a.txt` holding "nested",
+`mv -r d d/sub` writes the first over the second and then deletes the second as
+a source. Measured with the delete list already fixed, that still left one
+object holding the wrong contents. Ordering the copies would not settle it
+either, since they run in a pool.
+
+`mv -r d d/` is refused for the same reason, one keystroke away.
+
+The original note follows.
 
 **Fix:** `cmd/mv.go` should not delete when the source and destination resolve
 to the same object -- once, in the command, rather than relying on each
