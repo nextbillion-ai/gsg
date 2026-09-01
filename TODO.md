@@ -33,7 +33,7 @@ several are not worth fixing. The evidence is recorded under each one.
 | 16 | open | yes -- one receipt file for gs and s3; oci is clear | low, needs the same bucket and key on both |
 | 17 | deferred | yes -- a 6-object promotion landed 1 object, exit 1; oci verified clear | small fix, deferred -- s3 is not the current focus |
 | 18 | open | yes -- measured: non-gsg objects re-download on every rsync | low, owner's call -- costs work, not correctness |
-| 19 | open | yes -- s3 rejects >5 GiB outright; oci works but ~50% slower and unresumable | fix -- required on s3, worthwhile on oci |
+| 19 | PR #63, #64 | yes -- s3 rejected >5 GiB outright; oci was capped by link speed | fixed |
 | 20 | PR #59 | yes -- `du` and `cp -r` exited 1 printing nothing at all | fixed: common.ExitWith |
 | 21 | PR #58 | yes -- and `mv -r d d/sub` took two objects to none | fixed in cmd/mv.go |
 | 22 | PR #61 | yes -- 237ms on s3, 198ms on gs, to answer one boolean | fixed |
@@ -963,6 +963,35 @@ parts=16 attempts=17 bytesSent=1.06x filesize crc ok
 One retry, 6% of the file re-sent, correct whole-file CRC32C on the result.
 Against the single PUT that failed at 454s of the 40 GiB run, which lost
 roughly 17 GiB and had to start from zero.
+
+**Fixed in PR #63 and #64.**
+
+#63 removed the oci client's 60-second whole-request deadline, which had capped
+an upload at roughly link speed x 60s rather than at any limit of the service.
+#64 added multipart to both backends.
+
+Measured after: 6 GiB to s3 in 48 parts at 46.2 MB/s, which returned
+EntityTooLarge in 0s before; 300 MiB at 48.2 MB/s on s3 and 39.9 MB/s on oci;
+and on oci a 2 GiB object went from 36.0 MB/s to 47-55 MB/s.
+
+The checksum worry recorded above did not survive contact, and the fix is
+verified end to end rather than by prototype: a build with ChecksumType
+FULL_OBJECT removed stores a COMPOSITE checksum that crc32cOf rejects, and the
+UAT assertion "a second rsync copies nothing, so the checksum is comparable"
+then fails. With it, the assertion passes. oci never had the problem.
+
+What was NOT done, deliberately: cross-process resume. Retry-in-run per part is
+what landed, which costs one part rather than the whole transfer -- measured at
+1.06x the file in bytes sent for one injected mid-part failure. A durable
+manifest keyed on bucket, object, uploadID, path, size, mtime and part size is
+a separate feature and easy to make dangerously stale.
+
+Two judgement calls worth revisiting if they ever bite: the multipart threshold
+is 128 MiB on both backends, and part concurrency is fixed at 8 rather than
+following -c, because a recursive copy already runs one pool worker per file
+and drawing part workers from the same pool could deadlock. Measured, nothing
+is lost by the fixed value: 64, 128 and 256 MiB parts at concurrency 4, 8 and
+16 all landed within noise of each other.
 
 **Ordering, and what NOT to do first.**
 
