@@ -40,7 +40,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 				wg.Add(1)
 				pool.Add(func() {
 					defer wg.Done()
-					if e := dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars}); e != nil {
+					if e := dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
 						common.ExitWith(e)
 					}
 				})
@@ -58,7 +58,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 		wg.Add(1)
 		pool.Add(func() {
 			defer wg.Done()
-			if e := dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars}); e != nil {
+			if e := dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
 				common.ExitWith(e)
 			}
 		})
@@ -164,7 +164,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 						logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
 						common.Exit()
 					}
-					if err = dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+					if err = dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
 						logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPath, err)
 						common.Exit()
 					}
@@ -195,7 +195,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
 			common.Exit()
 		}
-		if err = dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool}); err != nil {
+		if err = dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
 			logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPrefix, err)
 			common.Exit()
 		}

@@ -177,6 +177,28 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	// -- which the service notices, so the price of a stale entry is a whole
 	// upload spent to be told it was stale. On the gs side that trade was
 	// measured at 111ms of hashing against a 4s upload of the same 190MB file.
+	fi, err := f.Stat()
+	if err != nil {
+		logger.Info(module, "cannot measure %s: %s", srcFile, err)
+		return err
+	}
+	fileSize := fi.Size()
+
+	// Above the threshold the object goes up in parts. Nothing forces this on
+	// oci -- a single PutObject stored a 40 GiB object fine, and so did
+	// Oracle's own CLI with --no-multipart -- but measured on a 2 GiB object,
+	// one request managed 36 MB/s against 47-55 MB/s with parts in flight
+	// together, and a part that fails costs one part rather than the whole
+	// transfer.
+	if fileSize > ociMultipartThreshold {
+		partSize, parts := common.PartGeometry(fileSize, ctx.ChunkSize, ociMinPartSize, ociMaxPartSize)
+		var mpb *bar.ProgressBar
+		if ctx.Bars != nil {
+			mpb = ctx.Bars.New(fileSize, fmt.Sprintf("Uploading [%s]:", object))
+		}
+		return o.uploadMultipart(f, fileSize, bucket, object, partSize, parts, mpb)
+	}
+
 	crc, size, err := crc32cOfReader(f)
 	if err != nil {
 		return err
