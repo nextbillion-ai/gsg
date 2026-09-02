@@ -12,7 +12,7 @@ printf 'no trailing newline' > $fcat/nonl.txt
 
 for f in text.txt blob.bin nonl.txt
 do
-    oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --file $fcat/$f --name "$testid/$fcat/$f" --force >/dev/null 2>&1
 done
 
@@ -42,9 +42,9 @@ start "isobject and isdirectory: a path is classified correctly"
 
 # Reached through cp, which asks FileType before doing anything: a directory
 # without -r is refused with a distinctive message.
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $fcat/text.txt --name "$testid/edge/abc.txt" --force >/dev/null 2>&1
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $fcat/text.txt --name "$testid/edge/dir/inner.txt" --force >/dev/null 2>&1
 
 isdir() {
@@ -73,12 +73,12 @@ assertEq "something absent is not a directory" "$(isdir edge/nothing-here)" "no"
 # against this fixture: listing "both/" at limit 1 returns just the marker, at
 # limit 2 the marker and its child.
 : > empty_marker
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file empty_marker --name "$testid/marker/lone/" --force >/dev/null 2>&1
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file empty_marker --name "$testid/marker/both/" --force >/dev/null 2>&1
 rm -f empty_marker
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $fcat/text.txt --name "$testid/marker/both/child.txt" --force >/dev/null 2>&1
 
 assertEq "a marker with nothing beneath it is an object, not a directory" \
@@ -91,7 +91,7 @@ assertEq "the same marker named without a trailing slash is a directory" \
 # A directory whose children are all sub-directories carries no objects in a
 # delimited listing, only prefixes -- so the Prefixes arm has to be read, and
 # nothing above would notice if it were dropped.
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $fcat/text.txt --name "$testid/subsonly/only/deeper/x.txt" --force >/dev/null 2>&1
 assertEq "a directory holding only sub-directories is a directory" \
     "$(isdir subsonly)" "yes"
@@ -117,19 +117,19 @@ do
     printf 'x' > "$fbig/f$(printf '%04d' $i).txt"
     i=$((i + 1))
 done
-oci os object bulk-upload --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object bulk-upload --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --src-dir $fbig --object-prefix "$testid/$fbig/" --overwrite \
     --parallel-upload-count 40 >/dev/null 2>&1
 
 assertEq "the provider really has more than one page of objects" \
-    "$(oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object list --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --prefix "$testid/$fbig/" --all --query 'length(data)' 2>/dev/null)" "1005"
 
 assertEq "a directory of 1005 objects is a directory" "$(isdir $fbig)" "yes"
 assertEq "and one of its objects is not" "$(isdir $fbig/f0001.txt)" "no"
 assertEq "nor is a partial name inside it" "$(isdir $fbig/f000)" "no"
 
-oci os object bulk-delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --prefix "$testid/$fbig/" --force >/dev/null 2>&1
 rm -rf $fbig
 

@@ -1289,3 +1289,55 @@ ttl either way, so this costs availability rather than correctness.
 
 Found by review of the OCI locking backend; the uat there pins the current
 behaviour so a fix is noticed rather than silent.
+
+## 25. A recursive move into a descendant escapes the guard when the bucket is spelled differently
+
+`cmd/mv.go`'s `wouldDestroySource` refuses a move whose destination is the
+source, or lives inside it. The second shape is the one that loses data: `cp -r`
+writes a directory's *contents* into the destination, so `d` and `d/sub` both
+want to produce `d/sub/a.txt`, and the delete that follows removes the source
+list regardless.
+
+It compares the buckets as written:
+
+```go
+if a.System != b.System || a.Bucket != b.Bucket {
+    return false
+}
+```
+
+and its own comment says why that is not the whole story -- "a backend where one
+object has more than one spelling catches its own variants -- oci does, for
+bucket versus bucket@namespace -- because only it can resolve them."
+
+The backend does catch them, but only for a single object. `oci.sameObject`
+compares one source prefix to one destination prefix, so it sees a self-move.
+Nothing compares a *descendant*, and that is the case the guard exists for. So:
+
+```
+gsg mv -r oci://b@ap-singapore-1/d oci://b@axkm4tp1h2ba.ap-singapore-1/d/sub
+```
+
+passes both checks. `wouldDestroySource` sees two different bucket strings and
+returns false; `Copy` sees `d` != `d/sub` and proceeds. The copy writes into the
+tree being moved, then the delete runs over the source list that was computed
+before it.
+
+Not introduced by the region change, and deliberately not made worse by it:
+the two spellings were `b` and `b@namespace` before, and are `b@region` and
+`b@namespace.region` now -- the same hole, the same size. Keeping it that size
+is why an oci path admits exactly one spelling of a region: short names and
+differently-cased names are both refused rather than folded, since either would
+have added a third and fourth spelling of one bucket for this guard to miss. It is filed rather
+than fixed there because the fix is not local to oci. `wouldDestroySource` has
+only the raw strings, and canonicalising them means the `System` interface
+gaining a way to resolve a bucket spec, which every backend then has to answer
+-- gs and s3 trivially, since one bucket has one spelling on both.
+
+**Fix:** add a canonicalising method to the storage interface, have
+`wouldDestroySource` compare canonical buckets rather than written ones, and
+cover it in the uat with a recursive move into a descendant spelled the other
+way. Until then the guard is correct only for paths spelled identically, which
+is what the common case does.
+
+Found by review of the region-in-the-path change.

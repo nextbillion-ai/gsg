@@ -12,7 +12,7 @@
 start "harness: the oci assert helpers agree with the bucket"
 
 prepare_file harness.txt
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file harness.txt --name "$testid/harness.txt" --force >/dev/null 2>&1
 
 # assert checks existence and that the content is $testid, which prepare_file wrote.
@@ -20,7 +20,7 @@ assert harness.txt remote
 
 # assertValue checks existence and an explicit expected value.
 prepare_file valued.txt "a specific value"
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file valued.txt --name "$testid/valued.txt" --force >/dev/null 2>&1
 assertValue valued.txt "a specific value" remote
 
@@ -28,7 +28,7 @@ assertValue valued.txt "a specific value" remote
 # was written and then removed -- the second is the case that matters, since a
 # helper that always says "not there" would pass the first.
 assert_not never-written.txt remote
-oci os object delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --name "$testid/valued.txt" --force >/dev/null 2>&1
 assert_not valued.txt remote
 

@@ -23,10 +23,11 @@ import (
 // looking like the real one -- a later rsync would see the wrong size and
 // copy it again, but anything reading the path directly would not.
 func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx system.RunContext) error {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 
 	// Size and mtime up front: the size gives the progress bar something to
 	// count against, and the mtime has to be applied after the rename.
@@ -138,10 +139,11 @@ func crc32cOfReader(f *os.File) (crc uint32, size int64, err error) {
 
 // Upload stores srcFile as an object.
 func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) error {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 	f, err := os.Open(srcFile)
 	if err != nil {
 		logger.Info(module, "cannot read %s: %s", srcFile, err)

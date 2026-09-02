@@ -7,7 +7,7 @@
 # fails in a way that reads like the objects are still there.
 oci_count() {
     local n
-    n=$(oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    n=$(oci os object list --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --prefix "$1" --all --query 'length(data)' 2>/dev/null)
     echo "${n:-0}"
 }
@@ -29,10 +29,10 @@ prepare_file $fcp/sub/b.txt "nested copy payload"
 assertEq "both objects exist the moment cp returns" \
     "$(oci_count "$testid/dst/")" "2"
 assertEq "and the copy has the source's content" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/dst/a.txt" --file - 2>/dev/null)" "copy payload"
 assertEq "including the nested one" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/dst/sub/b.txt" --file - 2>/dev/null)" "nested copy payload"
 
 finish
@@ -47,7 +47,7 @@ else
     echo "OK: copying a missing object fails"
 fi
 assertEq "and wrote nothing at the destination" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/dst/absent.txt" >/dev/null 2>&1 && echo present || echo absent)" "absent"
 
 finish
@@ -59,13 +59,13 @@ start "move: the source goes only after the copy is real"
 # exist -- the data would simply be gone. Both halves are checked at once.
 ../gsg mv "$remote_base/dst/a.txt" "$remote_base/moved/a.txt" >/dev/null 2>&1
 assertEq "the destination exists" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/moved/a.txt" >/dev/null 2>&1 && echo present || echo absent)" "present"
 assertEq "with the right content" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/moved/a.txt" --file - 2>/dev/null)" "copy payload"
 assertEq "and the source is gone" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/dst/a.txt" >/dev/null 2>&1 && echo present || echo absent)" "absent"
 
 finish
@@ -77,33 +77,34 @@ start "move: moving an object onto itself must not delete it"
 # followed by an unconditional delete -- one object in, nothing out. Measured
 # before the fix, the object was simply gone.
 #
-# Both spellings are covered, because one object has two of them: "bucket" and
-# "bucket@namespace" resolve to the same object, and comparing the raw strings
-# misses it. That second spelling is the one that actually lost data.
+# Both spellings are covered, because one object has two of them:
+# "bucket@region" and "bucket@namespace.region" resolve to the same object, and
+# comparing the raw strings misses it. That second spelling is the one that
+# actually lost data.
 prepare_file self.txt "must survive a self-move"
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file self.txt --name "$testid/self/k.txt" --force >/dev/null 2>&1
 
 ../gsg mv "$remote_base/self/k.txt" "$remote_base/self/k.txt" >/dev/null 2>&1 || true
 assertEq "an identical path leaves the object alone" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/self/k.txt" >/dev/null 2>&1 && echo present || echo absent)" "present"
 
-../gsg mv "$remote_base/self/k.txt" "oci://$oci_bucket@$oci_ns/$testid/self/k.txt" >/dev/null 2>&1 || true
+../gsg mv "$remote_base/self/k.txt" "oci://$oci_bucket@$oci_ns.$oci_region/$testid/self/k.txt" >/dev/null 2>&1 || true
 assertEq "and so does the same object spelled with its namespace" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/self/k.txt" >/dev/null 2>&1 && echo present || echo absent)" "present"
 assertEq "with its content untouched" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/self/k.txt" --file - 2>/dev/null)" "must survive a self-move"
 
 # And a real move must still move.
 ../gsg mv "$remote_base/self/k.txt" "$remote_base/self/elsewhere.txt" >/dev/null 2>&1
 assertEq "a genuine move still removes the source" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/self/k.txt" >/dev/null 2>&1 && echo present || echo absent)" "absent"
 assertEq "and delivers the destination" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/self/elsewhere.txt" --file - 2>/dev/null)" "must survive a self-move"
 
 finish
@@ -112,7 +113,7 @@ start "delete: rm removes exactly what it was asked to"
 
 ../gsg rm "$remote_base/moved/a.txt" >/dev/null 2>&1
 assertEq "the named object is gone" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/moved/a.txt" >/dev/null 2>&1 && echo present || echo absent)" "absent"
 assertEq "and its neighbours are untouched" \
     "$(oci_count "$testid/src/")" "2"

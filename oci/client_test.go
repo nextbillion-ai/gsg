@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	ocicommon "github.com/oracle/oci-go-sdk/v65/common"
 )
 
 // A bucket that exists is checked once and remembered.
@@ -16,7 +18,7 @@ func TestVerifyBucketAsksOnlyOnce(t *testing.T) {
 	calls := 0
 	check := func() error { calls++; return nil }
 	for i := 0; i < 5; i++ {
-		assert.NoError(t, o.verifyBucketWith("ns", "b", check))
+		assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns", "b", check))
 	}
 	assert.Equal(t, 1, calls, "the bucket should be checked once, not once per use")
 }
@@ -29,7 +31,7 @@ func TestVerifyBucketRemembersADefiniteAbsence(t *testing.T) {
 	calls := 0
 	check := func() error { calls++; return fakeServiceError{status: 404, code: "BucketNotFound"} }
 	for i := 0; i < 3; i++ {
-		err := o.verifyBucketWith("ns", "b", check)
+		err := o.verifyBucketWith("ap-singapore-1", "ns", "b", check)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "cannot reach bucket")
 	}
@@ -56,25 +58,37 @@ func TestVerifyBucketDoesNotRememberATransientFailure(t *testing.T) {
 			}
 			return nil
 		}
-		assert.Error(t, o.verifyBucketWith("ns", "b", check), "first attempt fails: %v", transient)
-		assert.NoError(t, o.verifyBucketWith("ns", "b", check), "the retry must be allowed to ask again: %v", transient)
+		assert.Error(t, o.verifyBucketWith("ap-singapore-1", "ns", "b", check), "first attempt fails: %v", transient)
+		assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns", "b", check), "the retry must be allowed to ask again: %v", transient)
 		assert.Equal(t, 2, calls, "the check should have been made twice for %v", transient)
 	}
 }
 
-// Each bucket is remembered separately, and the namespace is part of the
-// identity: one bucket name can exist in more than one namespace.
-func TestVerifyBucketKeysOnNamespaceAndBucket(t *testing.T) {
+// Each bucket is remembered separately, and both the region and the namespace
+// are part of the identity: one bucket name can exist in more than one of
+// either, and those are different buckets.
+func TestVerifyBucketKeysOnRegionNamespaceAndBucket(t *testing.T) {
 	o := &OCI{}
 	calls := map[string]int{}
 	mk := func(key string) func() error {
 		return func() error { calls[key]++; return nil }
 	}
-	assert.NoError(t, o.verifyBucketWith("ns1", "b", mk("ns1/b")))
-	assert.NoError(t, o.verifyBucketWith("ns2", "b", mk("ns2/b")))
-	assert.NoError(t, o.verifyBucketWith("ns1", "other", mk("ns1/other")))
-	assert.NoError(t, o.verifyBucketWith("ns1", "b", mk("ns1/b")))
-	assert.Equal(t, map[string]int{"ns1/b": 1, "ns2/b": 1, "ns1/other": 1}, calls)
+	assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns1", "b", mk("ap-singapore-1/ns1/b")))
+	assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns2", "b", mk("ap-singapore-1/ns2/b")))
+	assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns1", "other", mk("ap-singapore-1/ns1/other")))
+	assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns1", "b", mk("ap-singapore-1/ns1/b")))
+	assert.NoError(t, o.verifyBucketWith("us-ashburn-1", "ns1", "b", mk("us-ashburn-1/ns1/b")))
+	assert.Equal(t, map[string]int{
+		"ap-singapore-1/ns1/b":     1,
+		"ap-singapore-1/ns2/b":     1,
+		"ap-singapore-1/ns1/other": 1,
+		// The same name in a second region is a second bucket, and has to be
+		// established on its own. Sharing the entry would let a bucket that
+		// exists in one region vouch for a name that does not exist in
+		// another -- and, once it 404s there, make that absence permanent for
+		// the bucket that does exist.
+		"us-ashburn-1/ns1/b": 1,
+	}, calls)
 }
 
 // gsg runs these from a worker pool, so many goroutines hit an unchecked
@@ -88,7 +102,7 @@ func TestVerifyBucketUnderConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); assert.NoError(t, o.verifyBucketWith("ns", "b", check)) }()
+		go func() { defer wg.Done(); assert.NoError(t, o.verifyBucketWith("ap-singapore-1", "ns", "b", check)) }()
 	}
 	wg.Wait()
 	assert.Equal(t, 1, calls, "50 workers should produce one bucket check, not 50")
@@ -148,4 +162,82 @@ func TestHTTPClientStillBoundsADeadPeer(t *testing.T) {
 	if tr.DialContext == nil {
 		t.Error("DialContext is nil, so connecting to an unreachable host is unbounded")
 	}
+}
+
+// One process serves many regions, and each gets its own client. A single
+// cached client was what confined a run to the region named in ~/.oci/config;
+// keying on the region is what lets one command name buckets in several.
+func TestClientsAreBuiltPerRegionAndReused(t *testing.T) {
+	if _, err := (&OCI{}).clientFor("ap-singapore-1"); err != nil {
+		t.Skipf("no usable OCI credentials on this machine: %s", err)
+	}
+	o := &OCI{}
+
+	sin, err := o.clientFor("ap-singapore-1")
+	assert.NoError(t, err)
+	iad, err := o.clientFor("us-ashburn-1")
+	assert.NoError(t, err)
+
+	assert.NotSame(t, sin, iad, "two regions must not share one client")
+	assert.NotEqual(t, sin.Host, iad.Host, "each client must address its own region's endpoint")
+	assert.Contains(t, sin.Host, "ap-singapore-1")
+	assert.Contains(t, iad.Host, "us-ashburn-1")
+
+	again, err := o.clientFor("ap-singapore-1")
+	assert.NoError(t, err)
+	assert.Same(t, sin, again, "a region's client should be built once and reused")
+	assert.Len(t, o.clients, 2)
+}
+
+// stubConfigProvider stands in for credentials that have already been read.
+// Embedding the interface satisfies it without implementing anything: nothing
+// here calls its methods, only checks which value comes back.
+type stubConfigProvider struct {
+	ocicommon.ConfigurationProvider
+}
+
+// Credentials are read once however many regions are in play. A request is
+// signed with the tenancy's key, and that key says nothing about where the
+// request is going -- the region is carried by the endpoint. So re-reading
+// ~/.oci/config per region would be pure cost, and on a config whose key is
+// passphrase-protected it would be a repeated prompt.
+func TestCredentialsAreReadOnceForEveryRegion(t *testing.T) {
+	o := &OCI{}
+	assert.Nil(t, o.provider, "nothing should be read before the first use")
+	assert.NotNil(t, o.configProvider(), "the first use reads the credentials")
+	assert.NotNil(t, o.provider, "and remembers them")
+
+	// A provider that has already been read is handed back rather than built
+	// again -- which is what makes the second region free.
+	stub := &stubConfigProvider{}
+	o.provider = stub
+	assert.Same(t, stub, o.configProvider(), "an already-read provider must be reused")
+}
+
+// sameBucket is what Copy and Move ask before refusing to copy an object onto
+// itself, and what Move asks before deleting a source. Both halves matter: it
+// has to see through the two spellings of one bucket, and it has to keep two
+// same-named buckets in different regions apart. Getting the second wrong
+// would make a legitimate cross-region copy look like a self-copy -- and in
+// cmd/mv.go, which copies and then deletes unconditionally, that loses data.
+func TestSameBucketComparesRegionNamespaceAndName(t *testing.T) {
+	ref := func(region, ns, name string) bucketRef {
+		return bucketRef{region: region, ns: ns, name: name}
+	}
+	sin := ref("ap-singapore-1", "nsx", "b")
+
+	assert.True(t, sin.sameBucket(ref("ap-singapore-1", "nsx", "b")),
+		"the same bucket, however it was spelled, is the same bucket")
+	assert.False(t, sin.sameBucket(ref("us-ashburn-1", "nsx", "b")),
+		"one name in two regions is two buckets")
+	assert.False(t, sin.sameBucket(ref("ap-singapore-1", "nsy", "b")),
+		"one name in two namespaces is two buckets")
+	assert.False(t, sin.sameBucket(ref("ap-singapore-1", "nsx", "other")),
+		"different names are different buckets")
+}
+
+// A reference prints the way a path is written, so a message about a bucket
+// says which of the possibly several buckets of that name it means.
+func TestBucketRefPrintsAsAPath(t *testing.T) {
+	assert.Equal(t, "b@ap-singapore-1", bucketRef{name: "b", region: "ap-singapore-1", ns: "nsx"}.String())
 }

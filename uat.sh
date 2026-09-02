@@ -49,10 +49,10 @@ assertValue() {
             # $remote_base is oci://<bucket>/<testid>, so the object name is
             # everything after the bucket. head is the cheapest existence
             # check; get --file - streams the body to stdout.
-            if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+            if oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
                 --name "$testid/$1" >/dev/null 2>&1
             then
-                content="$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                content="$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
                     --name "$testid/$1" --file - 2>/dev/null)"
                 if [[ "$content" == "$2" ]]
                 then
@@ -129,10 +129,10 @@ assert() {
             # $remote_base is oci://<bucket>/<testid>, so the object name is
             # everything after the bucket. head is the cheapest existence
             # check; get --file - streams the body to stdout.
-            if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+            if oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
                 --name "$testid/$1" >/dev/null 2>&1
             then
-                content="$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+                content="$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
                     --name "$testid/$1" --file - 2>/dev/null)"
                 if [[ "$content" == "$testid" ]]
                 then
@@ -199,7 +199,7 @@ assert_not() {
             fi
             ;;
         oci)
-            if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+            if oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
                 --name "$testid/$1" >/dev/null 2>&1
             then
                 echo FATAL: required file $1 does exists remotely.
@@ -278,7 +278,7 @@ remote_count() {
         aws s3 ls "s3://gsg-uat/$testid/$1" --recursive 2>/dev/null | wc -l | tr -d ' '
         ;;
     oci)
-        oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+        oci os object list --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
             --prefix "$testid/$1" --all --query 'length(data)' 2>/dev/null || echo 0
         ;;
     esac
@@ -289,7 +289,7 @@ remote_size() {
     case $mode in
     gs)  gsutil stat "$remote_base/$1" 2>/dev/null | awk '/Content-Length:/{print $2}' ;;
     s3)  aws s3api head-object --bucket gsg-uat --key "$testid/$1" --query ContentLength --output text 2>/dev/null ;;
-    oci) oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" --name "$testid/$1" 2>/dev/null \
+    oci) oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" --name "$testid/$1" 2>/dev/null \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["content-length"])' 2>/dev/null ;;
     esac
 }
@@ -306,7 +306,7 @@ is_multipart() {
         then echo yes; else echo no; fi
         ;;
     oci)
-        if oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" --name "$testid/$1" 2>/dev/null \
+        if oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" --name "$testid/$1" 2>/dev/null \
              | grep -q 'opc-multipart-md5'
         then echo yes; else echo no; fi
         ;;
@@ -1736,12 +1736,39 @@ GOHELPER
 do_test_oci() {
     mode=oci
     oci_bucket="${GSG_UAT_OCI_BUCKET:-nb-oci-sin-test}"
-    remote_base="oci://$oci_bucket/$testid"
+
+    # The region an oci:// path names. gsg no longer takes it from
+    # ~/.oci/config -- that is what this suite is here to prove -- so the
+    # harness has to supply it the same way a user does, in the path. It is
+    # still read from the config by default, because that is the region the
+    # oci cli will use for the assertions and the two have to agree.
+    oci_region="${GSG_UAT_OCI_REGION:-$(awk -F= '/^[[:space:]]*region[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${OCI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)}"
+
+    # A second region, for the cross-region cases. Optional: most runs have one
+    # bucket, and the cases that need two skip themselves rather than fail.
+    oci_bucket2="${GSG_UAT_OCI_BUCKET2:-}"
+    oci_region2="${GSG_UAT_OCI_REGION2:-}"
+
+    remote_base="oci://$oci_bucket@$oci_region/$testid"
+
+    # Without a region there is no path to test with, since every oci:// path
+    # now carries one. Guessing a default here would test a bucket the user
+    # did not name.
+    if [[ -z "$oci_region" ]]
+    then
+        if [[ "$target" == "oci" ]]
+        then
+            echo "FATAL: oci mode needs a region -- set GSG_UAT_OCI_REGION, or a region= line in ~/.oci/config"
+            exit 1
+        fi
+        echo "skipping oci: no region in ~/.oci/config and GSG_UAT_OCI_REGION is unset"
+        return 0
+    fi
 
     # A run that cannot reach OCI has not tested OCI. Saying "everything OK"
     # here would be a false green on the one target whose whole purpose is to
     # exercise this backend, so an explicit `uat.sh oci` fails instead.
-    if ! oci_ns=$(oci os ns get --query data --raw-output 2>/dev/null) || [[ -z "$oci_ns" ]]
+    if ! oci_ns=$(oci os ns get --region "$oci_region" --query data --raw-output 2>/dev/null) || [[ -z "$oci_ns" ]]
     then
         if [[ "$target" == "oci" ]]
         then
@@ -1755,11 +1782,12 @@ do_test_oci() {
     trap 'code=$?; if [[ $code -ne 0 ]]; then
         echo
         echo "test data left behind for inspection at: $remote_base"
-        echo "remove it with: oci os object bulk-delete --namespace '"$oci_ns"' \\"
+        echo "remove it with: oci os object bulk-delete --region '"$oci_region"' \\"
+        echo "                  --namespace '"$oci_ns"' \\"
         echo "                  --bucket-name '"$oci_bucket"' --prefix '"$testid"' --force"
     fi' EXIT
 
-    start "prepare test ground for mode: oci (namespace $oci_ns, bucket $oci_bucket)"
+    start "prepare test ground for mode: oci (namespace $oci_ns, bucket $oci_bucket, region $oci_region)"
     rm -rf uat_temp || true
     testbase="uat_temp"
     mkdir $testbase
@@ -1793,7 +1821,7 @@ do_test_oci() {
     start "cleanup test ground"
     rm -rf uat_temp || true
     cleaned=true
-    oci os object bulk-delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
     if [[ "$cleaned" != "true" ]]
     then
@@ -1816,6 +1844,8 @@ usage() {
     echo "  gs   requires gsutil and GOOGLE_APPLICATION_CREDENTIALS"
     echo "  s3   requires the aws cli and its credentials"
     echo "  oci  requires the oci cli and ~/.oci/config"
+    echo "       GSG_UAT_OCI_REGION overrides the region taken from ~/.oci/config"
+    echo "       GSG_UAT_OCI_BUCKET2 + GSG_UAT_OCI_REGION2 enable the cross-region cases"
     echo
     echo "OCI cases live one per file in uat/oci and are sourced in name"
     echo "order. Override the bucket with GSG_UAT_OCI_BUCKET."

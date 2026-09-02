@@ -8,7 +8,7 @@ start "attrs: gsg hash reports the checksum the service stored"
 # oci_crc32c_dec <object-name> -> the stored CRC32C as a decimal number, or ""
 oci_crc32c_dec() {
     local b64 hex
-    b64=$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    b64=$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$1" --query '"opc-content-crc32c"' --raw-output 2>/dev/null)
     [[ -z "$b64" || "$b64" == "null" ]] && return 0
     hex=$(printf '%s' "$b64" | base64 -d 2>/dev/null | xxd -p)
@@ -17,7 +17,7 @@ oci_crc32c_dec() {
 }
 
 prepare_file withcrc.txt "attrs case payload"
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file withcrc.txt --name "$testid/withcrc.txt" --force \
     --opc-checksum-algorithm CRC32C >/dev/null 2>&1
 
@@ -33,14 +33,14 @@ assertEq "gsg hash matches the checksum the service reports" "$got" "$expected"
 
 # The same object addressed with an explicit namespace must give the same
 # answer -- the two url forms are meant to be interchangeable.
-got2=$(../gsg hash "oci://$oci_bucket@$oci_ns/$testid/withcrc.txt" 2>/dev/null | awk '/Hash/ {print $NF}')
+got2=$(../gsg hash "oci://$oci_bucket@$oci_ns.$oci_region/$testid/withcrc.txt" 2>/dev/null | awk '/Hash/ {print $NF}')
 assertEq "the bucket@namespace form resolves to the same object" "$got2" "$expected"
 
 # An object stored without a checksum must not be reported as one whose
 # checksum happens to be zero. Attrs cannot carry the difference (TODO 18), so
 # the backend says so in the log; the number itself is 0.
 prepare_file nocrc.txt "no checksum stored"
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file nocrc.txt --name "$testid/nocrc.txt" --force >/dev/null 2>&1
 out=$(../gsg hash "$remote_base/nocrc.txt" 2>&1)
 assertEq "a checksum-less object is called out, not silently reported as 0" \
@@ -69,12 +69,12 @@ assertEq "and is not confused with a bucket problem" \
     "$(echo "$out" | grep -c 'cannot reach bucket')" "0"
 
 # A missing bucket: must be an error naming the bucket, not absence.
-out=$(../gsg hash "oci://no-such-bucket-$testid/some-key" 2>&1) || true
+out=$(../gsg hash "oci://no-such-bucket-$testid@$oci_region/some-key" 2>&1) || true
 assertEq "a missing bucket is an error, not absence" \
     "$(echo "$out" | grep -c 'cannot reach bucket')" "1"
 
 # A wrong namespace: likewise.
-out=$(../gsg hash "oci://$oci_bucket@nosuchnamespace9/some-key" 2>&1) || true
+out=$(../gsg hash "oci://$oci_bucket@nosuchnamespace9.$oci_region/some-key" 2>&1) || true
 assertEq "a wrong namespace is an error, not absence" \
     "$(echo "$out" | grep -c 'cannot reach bucket')" "1"
 
