@@ -29,6 +29,11 @@ func TestParseBucketSpecReadsEveryAcceptedForm(t *testing.T) {
 		// means a surprising name degrades predictably instead of silently
 		// swapping the fields.
 		{"we@ird@us-ashburn-1", "we@ird", "", "us-ashburn-1"},
+		// Same rule, degenerate input: the name keeps the trailing "@" rather
+		// than the two fields silently swapping. No such bucket can exist, and
+		// the service says so; what matters is that it is not read as some
+		// other bucket that does.
+		{"bucket@@ap-singapore-1", "bucket@", "", "ap-singapore-1"},
 		// A namespace may contain dots -- a few older tenancies carry them --
 		// so the region is what follows the LAST dot, not the first. Splitting
 		// on the first would make those namespaces unaddressable.
@@ -101,6 +106,9 @@ func TestParseBucketSpecRefusesDegenerateSpellings(t *testing.T) {
 		{"bucket@not-a-region", "not a region name"},
 		{"bucket@ap-singapore", "a region name ends in a number"},
 		{"bucket@apsingapore1", "a region name is hyphenated"},
+		// An empty segment either side of a dot is not a namespace.
+		{"bucket@ns..ap-singapore-1", "an empty inner segment"},
+		{"bucket@.ns.ap-singapore-1", "an empty leading segment"},
 	} {
 		_, err := parseBucketSpec(c.in)
 		assert.Error(t, err, "%q must be refused: %s", c.in, c.because)

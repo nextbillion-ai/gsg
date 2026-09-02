@@ -173,6 +173,40 @@ func (o *OCI) tenancyNamespace(c *objectstorage.ObjectStorageClient, region stri
 	return o.namespace, nil
 }
 
+// CanonicalBucket returns the single spelling of the bucket a path names.
+//
+// One bucket has two spellings -- "b@region" with the namespace left to the
+// tenancy, and "b@namespace.region" with it written out -- and only this
+// backend can tell that they are the same. Callers that must compare two paths
+// without performing an operation on them ask here; cmd/mv.go is the one that
+// has to, because its guard against a recursive move into its own descendant
+// runs before any copy and so has nothing else to compare.
+//
+// The namespace is resolved only when the path omits it, and that answer is
+// cached for the run, so the common case of two paths spelled the same way
+// costs one GetNamespace at most and usually nothing.
+func (o *OCI) CanonicalBucket(spec string) (string, error) {
+	s, err := parseBucketSpec(spec)
+	if err != nil {
+		return "", err
+	}
+	if s.namespace == "" {
+		o.mu.Lock()
+		c, cerr := o.clientForLocked(s.region)
+		if cerr != nil {
+			o.mu.Unlock()
+			return "", cerr
+		}
+		ns, nerr := o.tenancyNamespace(c, s.region)
+		o.mu.Unlock()
+		if nerr != nil {
+			return "", nerr
+		}
+		s.namespace = ns
+	}
+	return s.name + "@" + s.namespace + "." + s.region, nil
+}
+
 // resolve turns the authority of a path into something addressable.
 //
 // It also establishes that the bucket exists, once. That matters for what a

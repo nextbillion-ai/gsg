@@ -63,11 +63,13 @@
 // client is built per region on first use, so a single command may name
 // buckets in several regions and a copy may cross between them.
 //
-// The region in ~/.oci/config is no longer what gsg routes by, but it is still
-// required: the SDK refuses to build a client from a provider that cannot
-// answer Region(), whatever gsg does with the client afterwards. Existing
-// config files therefore keep working unchanged; their region simply stops
-// deciding where objects are read and written.
+// The region in ~/.oci/config is no longer what gsg routes by, but the
+// credentials must still name one somewhere: the SDK refuses to build a client
+// from a provider that cannot answer Region(), whatever gsg does with the
+// client afterwards. A config file's region= satisfies that, and so does
+// OCI_REGION when the file has none. Either way the value stops deciding where
+// objects are read and written, so existing config files keep working
+// unchanged.
 package oci
 
 import (
@@ -174,9 +176,11 @@ type bucketSpec struct {
 // or more words, and a number -- "ap-singapore-1", and also the four-part
 // government forms such as "us-gov-ashburn-1".
 //
-// It is a shape check, not a membership test. The SDK has no exported list of
-// regions to test against, and hard-coding one in gsg would go stale every
-// time Oracle opens a region -- rejecting a region that genuinely exists is a
+// It is a shape check, not a membership test. The SDK keeps its region tables
+// unexported; the one exported thing that would reject an unknown region,
+// Region.RealmID, rejects it precisely because the table is fixed at the
+// version of the SDK in go.mod -- and a list that goes stale every time Oracle
+// opens a region -- rejecting a region that genuinely exists is a
 // worse failure than accepting a typo, because the user has no way to proceed.
 // What this does catch is the shape of a mistake: anything that is not a
 // region name at all is refused here, at the point where it was written.
@@ -251,6 +255,17 @@ func parseBucketSpec(spec string) (bucketSpec, error) {
 		if s.namespace == "" {
 			return bucketSpec{}, fmt.Errorf(
 				"oci: %q has an empty namespace; drop the dot to use the tenancy's own", spec)
+		}
+		// A namespace may contain dots, but not empty pieces between them: a
+		// leading, trailing or doubled dot is a mistyped separator rather than
+		// a namespace that happens to look odd. Caught here so it reads as a
+		// bad path, which it is, instead of as a namespace the tenancy does
+		// not have.
+		for _, seg := range strings.Split(s.namespace, ".") {
+			if seg == "" {
+				return bucketSpec{}, fmt.Errorf(
+					"oci: %q has an empty piece in its namespace %q", spec, s.namespace)
+			}
 		}
 	} else {
 		s.region = qualifier

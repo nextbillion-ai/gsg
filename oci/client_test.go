@@ -241,3 +241,50 @@ func TestSameBucketComparesRegionNamespaceAndName(t *testing.T) {
 func TestBucketRefPrintsAsAPath(t *testing.T) {
 	assert.Equal(t, "b@ap-singapore-1", bucketRef{name: "b", region: "ap-singapore-1", ns: "nsx"}.String())
 }
+
+// CanonicalBucket is what cmd/mv.go compares instead of the raw path, so that
+// one bucket spelled two ways is seen as one bucket. A path that already names
+// its namespace needs no lookup, which is what makes it answerable here
+// without a service.
+func TestCanonicalBucketNeedsNoLookupWhenTheNamespaceIsGiven(t *testing.T) {
+	o := &OCI{}
+	got, err := o.CanonicalBucket("b@axkm4tp1h2ba.ap-singapore-1")
+	if assert.NoError(t, err) {
+		assert.Equal(t, "b@axkm4tp1h2ba.ap-singapore-1", got)
+	}
+	assert.Empty(t, o.clients, "an explicit namespace must not build a client")
+	assert.Nil(t, o.provider, "nor read any credentials")
+}
+
+// Two different buckets must not canonicalise to one string. This is the half
+// that keeps a legitimate cross-region move working: collapsing these would
+// make cmd/mv.go refuse it as a self-move.
+func TestCanonicalBucketKeepsDifferentBucketsApart(t *testing.T) {
+	o := &OCI{}
+	specs := []string{
+		"b@ns1.ap-singapore-1",
+		"b@ns1.us-phoenix-1",
+		"b@ns2.ap-singapore-1",
+		"other@ns1.ap-singapore-1",
+	}
+	seen := map[string]string{}
+	for _, spec := range specs {
+		got, err := o.CanonicalBucket(spec)
+		assert.NoError(t, err)
+		if prev, clash := seen[got]; clash {
+			t.Errorf("%q and %q both canonicalise to %q", prev, spec, got)
+		}
+		seen[got] = spec
+	}
+}
+
+// An unusable path is an error rather than a string that happens not to match,
+// so that cmd/mv.go falls back to comparing what was written instead of
+// silently treating two paths as different because one was malformed.
+func TestCanonicalBucketReportsAnUnusablePath(t *testing.T) {
+	o := &OCI{}
+	for _, spec := range []string{"b", "b@sin", "b@not-a-region"} {
+		_, err := o.CanonicalBucket(spec)
+		assert.Error(t, err, "%q should not canonicalise", spec)
+	}
+}

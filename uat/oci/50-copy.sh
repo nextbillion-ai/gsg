@@ -98,6 +98,50 @@ assertEq "with its content untouched" \
     "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/self/k.txt" --file - 2>/dev/null)" "must survive a self-move"
 
+# A recursive move into the source's own descendant, with the destination
+# spelled the other way.
+#
+# cp -r copies a directory's contents rather than the directory, so d/a.txt and
+# d/sub/a.txt both want to become d/sub/a.txt -- and mv deletes the source list
+# afterwards. cmd/mv.go refuses that shape, but it used to compare the bucket
+# as written, so the explicit-namespace spelling looked like a different bucket
+# and went straight through. The backend's own self-copy check does not save it
+# either: that compares one object to one object, and this is a directory to
+# its descendant.
+# The two objects are deliberately both named a.txt: the flattening makes them
+# collide at the destination, which is what turns "the move is odd" into "one
+# of them is gone". Measured with the guard reverted to comparing the paths as
+# written, this exact fixture went from two objects to one -- only
+# rec/sub/sub/a.txt survived, and rec/sub/a.txt was empty.
+prepare_file root.txt "root"
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file root.txt --name "$testid/rec/a.txt" --force >/dev/null 2>&1
+prepare_file nested.txt "nested"
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    --file nested.txt --name "$testid/rec/sub/a.txt" --force >/dev/null 2>&1
+
+if ../gsg mv -r "$remote_base/rec" "oci://$oci_bucket@$oci_ns.$oci_region/$testid/rec/sub" >/dev/null 2>&1
+then
+    echo "FATAL: a recursive move into its own descendant was allowed"
+    exit 1
+fi
+echo "OK: a recursive move into its own descendant is refused, however the bucket is spelled"
+
+assertEq "and the source tree is untouched" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" \
+        --bucket-name "$oci_bucket" --name "$testid/rec/a.txt" --file - 2>/dev/null)" "root"
+assertEq "including the object it would have collided with" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" \
+        --bucket-name "$oci_bucket" --name "$testid/rec/sub/a.txt" --file - 2>/dev/null)" "nested"
+
+# The guard must not be so broad that it refuses a real move. The same
+# destination spelling, to a key outside the source tree, has to work.
+assertOk "a genuine move using the other spelling still moves" \
+    ../gsg mv "$remote_base/rec/a.txt" "oci://$oci_bucket@$oci_ns.$oci_region/$testid/rec-moved.txt"
+assertEq "and its content arrived" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" \
+        --bucket-name "$oci_bucket" --name "$testid/rec-moved.txt" --file - 2>/dev/null)" "root"
+
 # And a real move must still move.
 ../gsg mv "$remote_base/self/k.txt" "$remote_base/self/elsewhere.txt" >/dev/null 2>&1
 assertEq "a genuine move still removes the source" \

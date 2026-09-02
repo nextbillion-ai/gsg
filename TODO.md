@@ -1290,7 +1290,7 @@ ttl either way, so this costs availability rather than correctness.
 Found by review of the OCI locking backend; the uat there pins the current
 behaviour so a fix is noticed rather than silent.
 
-## 25. A recursive move into a descendant escapes the guard when the bucket is spelled differently
+## 25. A recursive move into a descendant escaped the guard when the bucket was spelled differently -- FIXED
 
 `cmd/mv.go`'s `wouldDestroySource` refuses a move whose destination is the
 source, or lives inside it. The second shape is the one that loses data: `cp -r`
@@ -1298,46 +1298,61 @@ writes a directory's *contents* into the destination, so `d` and `d/sub` both
 want to produce `d/sub/a.txt`, and the delete that follows removes the source
 list regardless.
 
-It compares the buckets as written:
-
-```go
-if a.System != b.System || a.Bucket != b.Bucket {
-    return false
-}
-```
-
-and its own comment says why that is not the whole story -- "a backend where one
-object has more than one spelling catches its own variants -- oci does, for
-bucket versus bucket@namespace -- because only it can resolve them."
-
-The backend does catch them, but only for a single object. `oci.sameObject`
-compares one source prefix to one destination prefix, so it sees a self-move.
-Nothing compares a *descendant*, and that is the case the guard exists for. So:
+It compared the buckets as written. oci accepts two spellings of one bucket, so
 
 ```
 gsg mv -r oci://b@ap-singapore-1/d oci://b@axkm4tp1h2ba.ap-singapore-1/d/sub
 ```
 
-passes both checks. `wouldDestroySource` sees two different bucket strings and
-returns false; `Copy` sees `d` != `d/sub` and proceeds. The copy writes into the
-tree being moved, then the delete runs over the source list that was computed
-before it.
+passed it: two different strings, so the guard returned false. The backend's own
+self-copy check does not catch this either -- `sameObject` compares one object
+to one object, and this is a directory to its own descendant, which is the case
+this guard exists for. The copy wrote into the tree being moved, then the delete
+ran over a source list computed before it.
 
-Not introduced by the region change, and deliberately not made worse by it:
-the two spellings were `b` and `b@namespace` before, and are `b@region` and
-`b@namespace.region` now -- the same hole, the same size. Keeping it that size
-is why an oci path admits exactly one spelling of a region: short names and
-differently-cased names are both refused rather than folded, since either would
-have added a third and fourth spelling of one bucket for this guard to miss. It is filed rather
-than fixed there because the fix is not local to oci. `wouldDestroySource` has
-only the raw strings, and canonicalising them means the `System` interface
-gaining a way to resolve a bucket spec, which every backend then has to answer
--- gs and s3 trivially, since one bucket has one spelling on both.
+**Fixed** by comparing what the backend resolves rather than what was typed,
+in an order that keeps it cheap and safe. The prefixes are settled first,
+because they are free and they decide whether the buckets matter at all: where
+the destination is neither the source nor inside it, no pair of buckets can
+make the move destructive. Only when the prefixes do collide, and only when the
+two paths are spelled differently, is the backend asked to resolve them --
+through an optional interface:
 
-**Fix:** add a canonicalising method to the storage interface, have
-`wouldDestroySource` compare canonical buckets rather than written ones, and
-cover it in the uat with a recursive move into a descendant spelled the other
-way. Until then the guard is correct only for paths spelled identically, which
-is what the common case does.
+```go
+type bucketCanonicaliser interface {
+    CanonicalBucket(spec string) (string, error)
+}
+```
 
-Found by review of the region-in-the-path change.
+Only oci implements it -- gs and s3 give one bucket one spelling, so they are
+never asked and `ISystem` did not change.
+
+A backend that says it can resolve and then cannot -- no credentials, a
+namespace lookup that failed for a moment -- makes the guard **refuse**.
+Falling back to the raw strings there, which the first version of this fix did,
+reproduces the original bug exactly whenever resolution fails for an instant:
+the two spellings compare unequal, the guard waves the move through, and the
+copy and delete that follow resolve the namespace perfectly well on their next
+attempt. A move refused because gsg could not tell costs a retry; a move
+allowed because gsg could not tell costs an object. Because the prefixes are
+checked first, this can only ever refuse a move that was already the dangerous
+shape.
+
+The first draft of this entry claimed the fix needed a new method on `ISystem`
+that every backend would have to implement, and filed it on that basis. That
+was wrong: an optional interface reaches only the backend that needs it.
+
+Verified against a real bucket both ways. With the guard reverted to comparing
+the paths as written, `mv -r oci://b@ap-singapore-1/rec
+oci://b@<ns>.ap-singapore-1/rec/sub` over `rec/a.txt` ("root") and
+`rec/sub/a.txt` ("nested") exited 0 and left a single object, `rec/sub/sub/a.txt`
+-- two objects in, one out. With the fix it is refused, both objects survive,
+and a genuine move using the same alternate spelling to a key outside the tree
+still moves.
+
+Covered by `TestWouldDestroySourceSeesThroughBucketSpellings`,
+`TestWouldDestroySourceRefusesWhenItCannotTell`,
+`TestCanonicalBucketIsAskedOnlyWhenItCanChangeTheAnswer`, their counterpart
+that a same-named bucket in another region is *not* collapsed -- which matters
+just as much, since collapsing them would refuse a legitimate cross-region
+move -- and in the uat by the recursive descendant move above.
