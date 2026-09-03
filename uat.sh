@@ -1744,6 +1744,11 @@ do_test_oci() {
     # oci cli will use for the assertions and the two have to agree.
     oci_region="${GSG_UAT_OCI_REGION:-$(awk -F= '/^[[:space:]]*region[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${OCI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)}"
 
+    # A second bucket in the same region, for the cross-bucket cases. They
+    # skip themselves if it is not reachable, so a run needs only the first.
+    oci_bucket_dst="${GSG_UAT_OCI_BUCKET_DST:-nb-oci-sin-test-dst}"
+    oci_dst_used=false
+
     # A second region, for the cross-region cases. Optional: most runs have one
     # bucket, and the cases that need two skip themselves rather than fail.
     oci_bucket2="${GSG_UAT_OCI_BUCKET2:-}"
@@ -1785,6 +1790,7 @@ do_test_oci() {
         echo "remove it with: oci os object bulk-delete --region '"$oci_region"' \\"
         echo "                  --namespace '"$oci_ns"' \\"
         echo "                  --bucket-name '"$oci_bucket"' --prefix '"$testid"' --force"
+        echo "  and the same for --bucket-name '"$oci_bucket_dst"' if the cross-bucket cases ran"
     fi' EXIT
 
     start "prepare test ground for mode: oci (namespace $oci_ns, bucket $oci_bucket, region $oci_region)"
@@ -1823,9 +1829,18 @@ do_test_oci() {
     cleaned=true
     oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
+    # The second bucket is swept only when the cross-bucket cases actually ran.
+    # That distinction is what makes a failure here worth reporting: if they
+    # skipped, there is nothing to remove and a failed delete says nothing,
+    # whereas if they ran, a failed delete means test data was left behind.
+    if [[ "${oci_dst_used:-false}" == "true" ]]
+    then
+        oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" \
+            --bucket-name "$oci_bucket_dst" --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
+    fi
     if [[ "$cleaned" != "true" ]]
     then
-        echo "WARNING: could not remove $remote_base -- objects may still be there"
+        echo "WARNING: could not remove $testid from $oci_bucket or $oci_bucket_dst -- objects may still be there"
     fi
     finish
 
@@ -1845,6 +1860,8 @@ usage() {
     echo "  s3   requires the aws cli and its credentials"
     echo "  oci  requires the oci cli and ~/.oci/config"
     echo "       GSG_UAT_OCI_REGION overrides the region taken from ~/.oci/config"
+    echo "       GSG_UAT_OCI_BUCKET_DST is the second bucket, same region, for the"
+    echo "       cross-bucket cases; they skip if it is not reachable"
     echo "       GSG_UAT_OCI_BUCKET2 + GSG_UAT_OCI_REGION2 enable the cross-region cases"
     echo
     echo "OCI cases live one per file in uat/oci and are sourced in name"

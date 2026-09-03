@@ -74,22 +74,7 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 		return fmt.Errorf("oci: no object at oci://%s/%s", src, srcPrefix)
 	}
 
-	// The request goes to the source's region and names the destination's.
-	// DestinationRegion is mandatory even when the two are the same, which is
-	// why it was always sent; sending the destination's own is what makes a
-	// copy across regions work rather than quietly targeting a bucket of the
-	// same name back in the source region.
-	r, err := src.c.CopyObject(context.Background(), objectstorage.CopyObjectRequest{
-		NamespaceName: &src.ns,
-		BucketName:    &src.name,
-		CopyObjectDetails: objectstorage.CopyObjectDetails{
-			SourceObjectName:      &srcPrefix,
-			DestinationRegion:     &dst.region,
-			DestinationNamespace:  &dst.ns,
-			DestinationBucket:     &dst.name,
-			DestinationObjectName: &dstPrefix,
-		},
-	})
+	r, err := src.c.CopyObject(context.Background(), copyRequest(src, dst, srcPrefix, dstPrefix))
 	if err != nil {
 		logger.Info(module, "copy of oci://%s/%s failed: %s", src, srcPrefix, err)
 		return err
@@ -105,6 +90,35 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	logger.Info(module, "Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
 		src, srcPrefix, dst, dstPrefix)
 	return nil
+}
+
+// copyRequest addresses a copy: which bucket it is asked of, and where the
+// object is to end up.
+//
+// It is a function of its own so that the addressing can be checked without a
+// service. The field that matters is DestinationRegion. It is mandatory even
+// when the source and destination are in one region, so it was always sent --
+// but it used to be sent as the *source's* region, read from the one client
+// the backend had. That is invisible for as long as every bucket is in one
+// region, and there is no way to see it in a same-region test either: with
+// src.region == dst.region the wrong version and this one build byte-identical
+// requests. What it did was make a copy to another region quietly target a
+// bucket of the same name back in the source region, or fail as absent.
+//
+// The request itself goes to the source's region, because that is the bucket
+// being asked to copy; only the destination is named.
+func copyRequest(src, dst bucketRef, srcPrefix, dstPrefix string) objectstorage.CopyObjectRequest {
+	return objectstorage.CopyObjectRequest{
+		NamespaceName: &src.ns,
+		BucketName:    &src.name,
+		CopyObjectDetails: objectstorage.CopyObjectDetails{
+			SourceObjectName:      &srcPrefix,
+			DestinationRegion:     &dst.region,
+			DestinationNamespace:  &dst.ns,
+			DestinationBucket:     &dst.name,
+			DestinationObjectName: &dstPrefix,
+		},
+	}
 }
 
 // awaitWorkRequest blocks until the request finishes, or says why it did not.
