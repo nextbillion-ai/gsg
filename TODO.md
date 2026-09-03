@@ -1356,3 +1356,47 @@ Covered by `TestWouldDestroySourceSeesThroughBucketSpellings`,
 that a same-named bucket in another region is *not* collapsed -- which matters
 just as much, since collapsing them would refuse a legitimate cross-region
 move -- and in the uat by the recursive descendant move above.
+
+## 26. A cross-region copy has never run against the service
+
+`oci://bucket@region/key` lets one process address several regions, and `Copy`
+sends the destination's own region as `CopyObject`'s `DestinationRegion`, so a
+copy between regions should work. Nothing has ever proved that against a live
+service.
+
+The obstacle is a bucket, not the code. The uat tenancy is subscribed to
+`ap-singapore-1` (home) and `us-phoenix-1`, but every bucket it has is in
+Singapore, so `uat/oci/55-cross-region.sh` skips. That file is written and
+waiting: set `GSG_UAT_OCI_BUCKET2` and `GSG_UAT_OCI_REGION2` and it runs four
+cases -- two regions addressed from one command, a copy across them, a move
+across them, and a round trip back to a file.
+
+What *is* established, so the gap is narrower than it sounds:
+
+  - **Routing.** A request for a bucket in `us-phoenix-1` demonstrably reaches
+    Phoenix: it resolves the namespace there and returns `BucketNotFound` with
+    a `phx-1:` request id. A second region's client really is built and used.
+  - **Addressing.** `TestCopyRequestNamesTheDestinationsRegionNotTheSources`
+    pins that `DestinationRegion` carries the destination's region, and fails
+    when it is reverted to the source's. That is the field the bug was in.
+  - **Everything either side of it.** The copy path itself is covered between
+    two buckets in one region by `uat/oci/52-cross-bucket.sh`.
+
+So the untested claim is specifically that the service honours a
+`DestinationRegion` naming a region other than the one the request was sent to
+-- including whether the work request, which `awaitWorkRequest` follows through
+the *source's* client, reports completion the same way when the object lands
+elsewhere. That last part is the one worth watching: if a cross-region work
+request is tracked in the destination's region instead, the poll would fail to
+find it and the copy would report an error after having succeeded. For `Move`,
+which deletes only after the copy is confirmed, that fails safe -- the source
+survives and nothing is lost -- but it would still be wrong.
+
+**To close it:** create a bucket in a second subscribed region, then
+
+```
+GSG_UAT_OCI_BUCKET2=<bucket> GSG_UAT_OCI_REGION2=us-phoenix-1 ./uat.sh oci
+```
+
+Filed when the region-in-the-path change landed, with the cross-region cases
+written but skipped for want of a second bucket.
