@@ -1289,3 +1289,114 @@ ttl either way, so this costs availability rather than correctness.
 
 Found by review of the OCI locking backend; the uat there pins the current
 behaviour so a fix is noticed rather than silent.
+
+## 25. A recursive move into a descendant escaped the guard when the bucket was spelled differently -- FIXED
+
+`cmd/mv.go`'s `wouldDestroySource` refuses a move whose destination is the
+source, or lives inside it. The second shape is the one that loses data: `cp -r`
+writes a directory's *contents* into the destination, so `d` and `d/sub` both
+want to produce `d/sub/a.txt`, and the delete that follows removes the source
+list regardless.
+
+It compared the buckets as written. oci accepts two spellings of one bucket, so
+
+```
+gsg mv -r oci://b@ap-singapore-1/d oci://b@axkm4tp1h2ba.ap-singapore-1/d/sub
+```
+
+passed it: two different strings, so the guard returned false. The backend's own
+self-copy check does not catch this either -- `sameObject` compares one object
+to one object, and this is a directory to its own descendant, which is the case
+this guard exists for. The copy wrote into the tree being moved, then the delete
+ran over a source list computed before it.
+
+**Fixed** by comparing what the backend resolves rather than what was typed,
+in an order that keeps it cheap and safe. The prefixes are settled first,
+because they are free and they decide whether the buckets matter at all: where
+the destination is neither the source nor inside it, no pair of buckets can
+make the move destructive. Only when the prefixes do collide, and only when the
+two paths are spelled differently, is the backend asked to resolve them --
+through an optional interface:
+
+```go
+type bucketCanonicaliser interface {
+    CanonicalBucket(spec string) (string, error)
+}
+```
+
+Only oci implements it -- gs and s3 give one bucket one spelling, so they are
+never asked and `ISystem` did not change.
+
+A backend that says it can resolve and then cannot -- no credentials, a
+namespace lookup that failed for a moment -- makes the guard **refuse**.
+Falling back to the raw strings there, which the first version of this fix did,
+reproduces the original bug exactly whenever resolution fails for an instant:
+the two spellings compare unequal, the guard waves the move through, and the
+copy and delete that follow resolve the namespace perfectly well on their next
+attempt. A move refused because gsg could not tell costs a retry; a move
+allowed because gsg could not tell costs an object. Because the prefixes are
+checked first, this can only ever refuse a move that was already the dangerous
+shape.
+
+The first draft of this entry claimed the fix needed a new method on `ISystem`
+that every backend would have to implement, and filed it on that basis. That
+was wrong: an optional interface reaches only the backend that needs it.
+
+Verified against a real bucket both ways. With the guard reverted to comparing
+the paths as written, `mv -r oci://b@ap-singapore-1/rec
+oci://b@<ns>.ap-singapore-1/rec/sub` over `rec/a.txt` ("root") and
+`rec/sub/a.txt` ("nested") exited 0 and left a single object, `rec/sub/sub/a.txt`
+-- two objects in, one out. With the fix it is refused, both objects survive,
+and a genuine move using the same alternate spelling to a key outside the tree
+still moves.
+
+Covered by `TestWouldDestroySourceSeesThroughBucketSpellings`,
+`TestWouldDestroySourceRefusesWhenItCannotTell`,
+`TestCanonicalBucketIsAskedOnlyWhenItCanChangeTheAnswer`, their counterpart
+that a same-named bucket in another region is *not* collapsed -- which matters
+just as much, since collapsing them would refuse a legitimate cross-region
+move -- and in the uat by the recursive descendant move above.
+
+## 26. A cross-region copy has never run against the service
+
+`oci://bucket@region/key` lets one process address several regions, and `Copy`
+sends the destination's own region as `CopyObject`'s `DestinationRegion`, so a
+copy between regions should work. Nothing has ever proved that against a live
+service.
+
+The obstacle is a bucket, not the code. The uat tenancy is subscribed to
+`ap-singapore-1` (home) and `us-phoenix-1`, but every bucket it has is in
+Singapore, so `uat/oci/55-cross-region.sh` skips. That file is written and
+waiting: set `GSG_UAT_OCI_BUCKET2` and `GSG_UAT_OCI_REGION2` and it runs four
+cases -- two regions addressed from one command, a copy across them, a move
+across them, and a round trip back to a file.
+
+What *is* established, so the gap is narrower than it sounds:
+
+  - **Routing.** A request for a bucket in `us-phoenix-1` demonstrably reaches
+    Phoenix: it resolves the namespace there and returns `BucketNotFound` with
+    a `phx-1:` request id. A second region's client really is built and used.
+  - **Addressing.** `TestCopyRequestNamesTheDestinationsRegionNotTheSources`
+    pins that `DestinationRegion` carries the destination's region, and fails
+    when it is reverted to the source's. That is the field the bug was in.
+  - **Everything either side of it.** The copy path itself is covered between
+    two buckets in one region by `uat/oci/52-cross-bucket.sh`.
+
+So the untested claim is specifically that the service honours a
+`DestinationRegion` naming a region other than the one the request was sent to
+-- including whether the work request, which `awaitWorkRequest` follows through
+the *source's* client, reports completion the same way when the object lands
+elsewhere. That last part is the one worth watching: if a cross-region work
+request is tracked in the destination's region instead, the poll would fail to
+find it and the copy would report an error after having succeeded. For `Move`,
+which deletes only after the copy is confirmed, that fails safe -- the source
+survives and nothing is lost -- but it would still be wrong.
+
+**To close it:** create a bucket in a second subscribed region, then
+
+```
+GSG_UAT_OCI_BUCKET2=<bucket> GSG_UAT_OCI_REGION2=us-phoenix-1 ./uat.sh oci
+```
+
+Filed when the region-in-the-path change landed, with the cross-region cases
+written but skipped for want of a second bucket.

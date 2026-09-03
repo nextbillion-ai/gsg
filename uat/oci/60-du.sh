@@ -12,7 +12,7 @@ printf '%0.sC' $(seq 1 1000) > $fdu/sub/deep/c.txt
 
 ../gsg -m cp -r $fdu "$remote_base/$fdu" >/dev/null 2>&1
 
-expected=$(oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+expected=$(oci os object list --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --prefix "$testid/$fdu/" --all --query 'sum(data[].size)' 2>/dev/null)
 assertEq "the provider agrees on the total" "$expected" "1350"
 
@@ -35,11 +35,11 @@ start "du: a path naming an object is its own answer"
 
 # Checked before listing: a prefix search for "a.txt" would also match
 # "a.txt.bak", so an object's du must not depend on what else is named like it.
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $fdu/sub/b.txt --name "$testid/$fdu/a.txt.bak" --force >/dev/null 2>&1
 assertEq "du of an object reports only that object" \
     "$(../gsg du "$remote_base/$fdu/a.txt" 2>/dev/null | awk '{print $1}')" "100"
-oci os object delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --name "$testid/$fdu/a.txt.bak" --force >/dev/null 2>&1
 
 finish
@@ -56,17 +56,17 @@ do
     printf 'x' > "$fdup/$(printf 'f%04d' $i).txt"
     i=$((i + 1))
 done
-oci os object bulk-upload --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object bulk-upload --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --src-dir $fdup --object-prefix "$testid/$fdup/" --overwrite \
     --parallel-upload-count 40 >/dev/null 2>&1
 
 assertEq "the provider has 1005 one-byte objects" \
-    "$(oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object list --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --prefix "$testid/$fdup/" --all --query 'sum(data[].size)' 2>/dev/null)" "1005"
 assertEq "du -s counts every one of them" \
     "$(../gsg du -s "$remote_base/$fdup" 2>/dev/null | awk '{print $1}')" "1005"
 
-oci os object bulk-delete --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --prefix "$testid/$fdup/" --force >/dev/null 2>&1
 rm -rf $fdup
 

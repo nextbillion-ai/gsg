@@ -31,18 +31,18 @@ const (
 // followed by Delete, so it would remove the source before the copy existed.
 // That is how data gets lost, so this waits for the work request to complete.
 func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
-	c, ns, srcName, err := o.resolve(srcBucket)
+	src, err := o.resolve(srcBucket)
 	if err != nil {
 		return err
 	}
-	// The destination may name its own namespace. Its bucket is resolved
-	// against the same client: one client serves every bucket in a region.
-	dstName, dstNs := splitBucket(dstBucket)
-	if dstNs == "" {
-		dstNs = ns
-	}
-	if dstName == "" {
-		return fmt.Errorf("oci: no destination bucket given")
+	// The destination is resolved in full, not just parsed. It may name its
+	// own namespace and its own region, and resolving establishes that its
+	// bucket exists before an asynchronous copy is started against it -- the
+	// same reason the source is checked below. The check is cached per bucket,
+	// so a tree copy pays for it once.
+	dst, err := o.resolve(dstBucket)
+	if err != nil {
+		return err
 	}
 
 	// A copy onto itself is refused, not quietly skipped.
@@ -55,10 +55,13 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	// anything.
 	//
 	// The comparison is made after resolution because one object has two
-	// spellings: "bucket" and "bucket@namespace" are the same object, and
-	// comparing the raw strings misses it.
-	if ns == dstNs && srcName == dstName && srcPrefix == dstPrefix {
-		return fmt.Errorf("oci: refusing to copy oci://%s/%s onto itself", srcName, srcPrefix)
+	// spellings: "bucket@region" and "bucket@namespace.region" are the same
+	// object, and comparing the raw strings misses it. The region is part of
+	// the comparison for the opposite reason: the same bucket name in two
+	// regions is two different buckets, and refusing that copy would refuse a
+	// legitimate cross-region one.
+	if src.sameBucket(dst) && srcPrefix == dstPrefix {
+		return fmt.Errorf("oci: refusing to copy oci://%s/%s onto itself", src, srcPrefix)
 	}
 
 	// The source must exist. Without this the work request is accepted and
@@ -68,38 +71,54 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 		return err
 	}
 	if head == nil {
-		return fmt.Errorf("oci: no object at oci://%s/%s", srcName, srcPrefix)
+		return fmt.Errorf("oci: no object at oci://%s/%s", src, srcPrefix)
 	}
 
-	region := o.region
-	if region == "" {
-		return fmt.Errorf("oci: cannot copy without a region; none is configured")
-	}
-
-	r, err := c.CopyObject(context.Background(), objectstorage.CopyObjectRequest{
-		NamespaceName: &ns,
-		BucketName:    &srcName,
-		CopyObjectDetails: objectstorage.CopyObjectDetails{
-			SourceObjectName:      &srcPrefix,
-			DestinationRegion:     &region,
-			DestinationNamespace:  &dstNs,
-			DestinationBucket:     &dstName,
-			DestinationObjectName: &dstPrefix,
-		},
-	})
+	r, err := src.c.CopyObject(context.Background(), copyRequest(src, dst, srcPrefix, dstPrefix))
 	if err != nil {
-		logger.Info(module, "copy of oci://%s/%s failed: %s", srcName, srcPrefix, err)
+		logger.Info(module, "copy of oci://%s/%s failed: %s", src, srcPrefix, err)
 		return err
 	}
 	if r.OpcWorkRequestId == nil {
-		return fmt.Errorf("oci: copy of oci://%s/%s was accepted without a work request to track", srcName, srcPrefix)
+		return fmt.Errorf("oci: copy of oci://%s/%s was accepted without a work request to track", src, srcPrefix)
 	}
-	if err = o.awaitWorkRequest(c, *r.OpcWorkRequestId); err != nil {
+	// The work request lives in the region that accepted it, so it is followed
+	// through the source's client even when the object lands elsewhere.
+	if err = o.awaitWorkRequest(src.c, *r.OpcWorkRequestId); err != nil {
 		return err
 	}
 	logger.Info(module, "Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
-		srcName, srcPrefix, dstName, dstPrefix)
+		src, srcPrefix, dst, dstPrefix)
 	return nil
+}
+
+// copyRequest addresses a copy: which bucket it is asked of, and where the
+// object is to end up.
+//
+// It is a function of its own so that the addressing can be checked without a
+// service. The field that matters is DestinationRegion. It is mandatory even
+// when the source and destination are in one region, so it was always sent --
+// but it used to be sent as the *source's* region, read from the one client
+// the backend had. That is invisible for as long as every bucket is in one
+// region, and there is no way to see it in a same-region test either: with
+// src.region == dst.region the wrong version and this one build byte-identical
+// requests. What it did was make a copy to another region quietly target a
+// bucket of the same name back in the source region, or fail as absent.
+//
+// The request itself goes to the source's region, because that is the bucket
+// being asked to copy; only the destination is named.
+func copyRequest(src, dst bucketRef, srcPrefix, dstPrefix string) objectstorage.CopyObjectRequest {
+	return objectstorage.CopyObjectRequest{
+		NamespaceName: &src.ns,
+		BucketName:    &src.name,
+		CopyObjectDetails: objectstorage.CopyObjectDetails{
+			SourceObjectName:      &srcPrefix,
+			DestinationRegion:     &dst.region,
+			DestinationNamespace:  &dst.ns,
+			DestinationBucket:     &dst.name,
+			DestinationObjectName: &dstPrefix,
+		},
+	}
 }
 
 // awaitWorkRequest blocks until the request finishes, or says why it did not.
@@ -157,21 +176,22 @@ func (o *OCI) workRequestErrors(c *objectstorage.ObjectStorageClient, id string)
 // sameObject reports whether two paths name the same stored object.
 //
 // It must compare what the paths resolve to, not how they are spelled. One
-// object has two spellings -- "bucket" and "bucket@namespace" -- and a raw
-// string comparison sees them as different while the service does not.
+// object has two spellings -- "bucket@region" and "bucket@namespace.region" --
+// and a raw string comparison sees them as different while the service does
+// not. It must also not treat one name in two regions as one object.
 func (o *OCI) sameObject(srcBucket, srcPrefix, dstBucket, dstPrefix string) (bool, error) {
 	if srcPrefix != dstPrefix {
 		return false, nil
 	}
-	_, srcNs, srcName, err := o.resolve(srcBucket)
+	src, err := o.resolve(srcBucket)
 	if err != nil {
 		return false, err
 	}
-	_, dstNs, dstName, err := o.resolve(dstBucket)
+	dst, err := o.resolve(dstBucket)
 	if err != nil {
 		return false, err
 	}
-	return srcNs == dstNs && srcName == dstName, nil
+	return src.sameBucket(dst), nil
 }
 
 // Move copies an object and then removes the source.
@@ -182,7 +202,7 @@ func (o *OCI) sameObject(srcBucket, srcPrefix, dstBucket, dstPrefix string) (boo
 // asynchronous copy that had only been accepted would lose the data outright.
 //
 // And the source and destination are compared after resolution. Comparing the
-// raw strings meant that "oci://b/k" and "oci://b@namespace/k" -- the same
+// raw strings meant that "oci://b@r/k" and "oci://b@namespace.r/k" -- the same
 // object, spelled two ways -- looked different here, while Copy resolved them
 // as identical and returned without doing anything. Move then deleted the
 // source: one object in, nothing out. Measured before the fix, the object was
@@ -206,16 +226,16 @@ func (o *OCI) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 
 // Delete removes an object.
 func (o *OCI) Delete(bucket, prefix string) error {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return err
 	}
-	if _, err = c.DeleteObject(context.Background(), objectstorage.DeleteObjectRequest{
-		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
+	if _, err = ref.c.DeleteObject(context.Background(), objectstorage.DeleteObjectRequest{
+		NamespaceName: &ref.ns, BucketName: &ref.name, ObjectName: &prefix,
 	}); err != nil {
-		logger.Info(module, "cannot delete oci://%s/%s: %s", name, prefix, err)
+		logger.Info(module, "cannot delete oci://%s/%s: %s", ref, prefix, err)
 		return err
 	}
-	logger.Info(module, "Removing bucket[%s] prefix[%s]", name, prefix)
+	logger.Info(module, "Removing bucket[%s] prefix[%s]", ref, prefix)
 	return nil
 }

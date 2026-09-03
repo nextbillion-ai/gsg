@@ -53,65 +53,161 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-// clientAndNamespace returns the shared client and the namespace to address.
+// bucketRef is a bucket with nothing left to infer: the client that reaches
+// its region, the namespace it really lives in, and its name.
 //
-// Both are resolved once and cached. One OCI client covers every bucket in the
-// configured region, so unlike the S3 backend -- which needs a client per
-// bucket because a bucket's region is discovered per bucket -- there is
-// nothing to key a cache on.
-//
-// bucketSpec is the raw Bucket field, which may carry an explicit namespace as
-// "bucket@namespace". An explicit namespace wins; otherwise the tenancy's own
-// is looked up once and reused. Passing "" asks for the tenancy's own.
-func (o *OCI) clientAndNamespace(bucketSpec string) (*objectstorage.ObjectStorageClient, string, error) {
-	_, explicit := splitBucket(bucketSpec)
-
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if o.client == nil {
-		p := ocicommon.DefaultConfigProvider()
-		c, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(p)
-		if err != nil {
-			logger.Debug(module, "cannot build client: %s", err)
-			return nil, "", fmt.Errorf("oci: cannot build client: %w", err)
-		}
-		c.HTTPClient = newHTTPClient()
-		o.client = &c
-		// Region comes from the same provider as the credentials. A copy needs
-		// it on every request, so reading it once here avoids re-parsing the
-		// config file per object.
-		if reg, rerr := p.Region(); rerr == nil {
-			o.region = reg
-		} else {
-			logger.Debug(module, "cannot read region from config: %s", rerr)
-		}
-	}
-
-	// An explicit namespace needs no lookup, and must not overwrite the cached
-	// one: a single run may legitimately touch both its own tenancy and
-	// another, and the cache is what the bucket-only form falls back on.
-	if explicit != "" {
-		return o.client, explicit, nil
-	}
-
-	if o.namespace == "" {
-		r, err := o.client.GetNamespace(context.Background(), objectstorage.GetNamespaceRequest{})
-		if err != nil {
-			logger.Debug(module, "cannot resolve namespace: %s", err)
-			return nil, "", fmt.Errorf("oci: cannot resolve namespace: %w", err)
-		}
-		if r.Value == nil || *r.Value == "" {
-			return nil, "", fmt.Errorf("oci: tenancy returned an empty namespace")
-		}
-		o.namespace = *r.Value
-		logger.Debug(module, "resolved namespace %s", o.namespace)
-	}
-	return o.client, o.namespace, nil
+// Operations take this rather than three loose strings because the three have
+// to agree. A client for one region with a bucket name from another addresses
+// a bucket that does not exist, and the service reports that as an ordinary
+// 404 -- indistinguishable, from the reply alone, from a bucket that was
+// deleted.
+type bucketRef struct {
+	c      *objectstorage.ObjectStorageClient
+	ns     string
+	name   string
+	region string
 }
 
-// resolve is the form every operation wants: the client, the namespace, and
-// the bucket name with any "@namespace" suffix already stripped off.
+// String renders the reference the way a user would write it, so that a
+// message about a bucket says which of the possibly several buckets of that
+// name it means.
+func (r bucketRef) String() string {
+	return r.name + "@" + r.region
+}
+
+// sameBucket reports whether two resolved references name the same bucket.
+//
+// All three parts have to match. The namespace catches the two spellings of
+// one bucket -- with and without an explicit namespace -- and the region
+// catches the opposite mistake, two different buckets that happen to share a
+// name. Comparing the raw path strings would get both wrong.
+func (r bucketRef) sameBucket(other bucketRef) bool {
+	return r.region == other.region && r.ns == other.ns && r.name == other.name
+}
+
+// configProvider reads the credentials, once.
+//
+// One provider serves every region. A request is signed with the tenancy's API
+// key, and that key says nothing about where the request is going -- the
+// region is carried by the endpoint the client dispatches to. So the config
+// file is parsed once however many regions a command touches.
+//
+// The caller holds o.mu.
+func (o *OCI) configProvider() ocicommon.ConfigurationProvider {
+	if o.provider == nil {
+		o.provider = ocicommon.DefaultConfigProvider()
+	}
+	return o.provider
+}
+
+// clientFor returns the client that talks to a region, building it on first
+// use and caching it.
+//
+// Every client is built from the same credentials and then pointed at its own
+// region. SetRegion is what makes that work: it rewrites the endpoint host for
+// the region's realm, so one key reaches every region the tenancy is
+// subscribed to.
+//
+// The region the config file carries is not used for routing -- the path
+// decides that -- but it is still what the SDK validates the provider against
+// when the client is constructed, which is why a config file with no region at
+// all fails here rather than silently defaulting.
+func (o *OCI) clientFor(region string) (*objectstorage.ObjectStorageClient, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.clientForLocked(region)
+}
+
+// clientForLocked is clientFor with o.mu already held.
+func (o *OCI) clientForLocked(region string) (*objectstorage.ObjectStorageClient, error) {
+	if c, ok := o.clients[region]; ok {
+		return c, nil
+	}
+	c, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(o.configProvider())
+	if err != nil {
+		logger.Debug(module, "cannot build client for %s: %s", region, err)
+		return nil, fmt.Errorf("oci: cannot build client for region %q: %w", region, err)
+	}
+	c.SetRegion(region)
+	c.HTTPClient = newHTTPClient()
+	if o.clients == nil {
+		o.clients = map[string]*objectstorage.ObjectStorageClient{}
+	}
+	o.clients[region] = &c
+	logger.Debug(module, "built a client for region %s", region)
+	return &c, nil
+}
+
+// tenancyNamespace returns the namespace of the configured tenancy.
+//
+// It is asked for once and reused. A tenancy has exactly one namespace, it
+// cannot change, and it is the same string in every region -- so which
+// region's client answers the question does not matter, and a second region
+// does not need to ask again.
+//
+// The region is named in the error because this is where a region the tenancy
+// is not subscribed to first shows up, and it does not announce itself: the
+// service answers 401 NotAuthenticated rather than anything about regions, so
+// the bare SDK error reads as a credentials problem. Measured against a real
+// tenancy, asking us-ashburn-1 from a tenancy subscribed only to
+// ap-singapore-1 and us-phoenix-1 returns exactly that. The credentials are
+// fine; they are simply not accepted there.
+//
+// The caller holds o.mu.
+func (o *OCI) tenancyNamespace(c *objectstorage.ObjectStorageClient, region string) (string, error) {
+	if o.namespace != "" {
+		return o.namespace, nil
+	}
+	r, err := c.GetNamespace(context.Background(), objectstorage.GetNamespaceRequest{})
+	if err != nil {
+		logger.Debug(module, "cannot resolve namespace in %s: %s", region, err)
+		return "", fmt.Errorf(
+			"oci: cannot resolve the namespace in region %q (is the tenancy subscribed to it?): %w",
+			region, err)
+	}
+	if r.Value == nil || *r.Value == "" {
+		return "", fmt.Errorf("oci: tenancy returned an empty namespace")
+	}
+	o.namespace = *r.Value
+	logger.Debug(module, "resolved namespace %s", o.namespace)
+	return o.namespace, nil
+}
+
+// CanonicalBucket returns the single spelling of the bucket a path names.
+//
+// One bucket has two spellings -- "b@region" with the namespace left to the
+// tenancy, and "b@namespace.region" with it written out -- and only this
+// backend can tell that they are the same. Callers that must compare two paths
+// without performing an operation on them ask here; cmd/mv.go is the one that
+// has to, because its guard against a recursive move into its own descendant
+// runs before any copy and so has nothing else to compare.
+//
+// The namespace is resolved only when the path omits it, and that answer is
+// cached for the run, so the common case of two paths spelled the same way
+// costs one GetNamespace at most and usually nothing.
+func (o *OCI) CanonicalBucket(spec string) (string, error) {
+	s, err := parseBucketSpec(spec)
+	if err != nil {
+		return "", err
+	}
+	if s.namespace == "" {
+		o.mu.Lock()
+		c, cerr := o.clientForLocked(s.region)
+		if cerr != nil {
+			o.mu.Unlock()
+			return "", cerr
+		}
+		ns, nerr := o.tenancyNamespace(c, s.region)
+		o.mu.Unlock()
+		if nerr != nil {
+			return "", nerr
+		}
+		s.namespace = ns
+	}
+	return s.name + "@" + s.namespace + "." + s.region, nil
+}
+
+// resolve turns the authority of a path into something addressable.
 //
 // It also establishes that the bucket exists, once. That matters for what a
 // 404 on an object means: a HEAD has no response body, so the SDK reports a
@@ -120,29 +216,45 @@ func (o *OCI) clientAndNamespace(bucketSpec string) (*objectstorage.ObjectStorag
 // there beforehand is what makes a later 404 mean "no such object" -- so
 // headObject does not have to ask about the bucket every time one is missing,
 // which over a large listing would be a bucket lookup per absent object.
-func (o *OCI) resolve(bucketSpec string) (*objectstorage.ObjectStorageClient, string, string, error) {
-	c, ns, err := o.clientAndNamespace(bucketSpec)
+func (o *OCI) resolve(spec string) (bucketRef, error) {
+	s, err := parseBucketSpec(spec)
 	if err != nil {
-		return nil, "", "", err
+		logger.Info(module, "%s", err)
+		return bucketRef{}, err
 	}
-	name, _ := splitBucket(bucketSpec)
-	if name == "" {
-		return nil, "", "", fmt.Errorf("oci: no bucket given")
+
+	o.mu.Lock()
+	c, err := o.clientForLocked(s.region)
+	if err != nil {
+		o.mu.Unlock()
+		return bucketRef{}, err
 	}
-	if err = o.verifyBucket(c, ns, name); err != nil {
-		return nil, "", "", err
+	ns := s.namespace
+	if ns == "" {
+		// Resolved against this path's own client, so a run that only ever
+		// touches one region never builds a client for another just to ask.
+		if ns, err = o.tenancyNamespace(c, s.region); err != nil {
+			o.mu.Unlock()
+			return bucketRef{}, err
+		}
 	}
-	return c, ns, name, nil
+	o.mu.Unlock()
+
+	r := bucketRef{c: c, ns: ns, name: s.name, region: s.region}
+	if err = o.verifyBucket(r); err != nil {
+		return bucketRef{}, err
+	}
+	return r, nil
 }
 
 // verifyBucket checks that a bucket exists, at most once per bucket.
-func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket string) error {
-	return o.verifyBucketWith(ns, bucket, func() error {
+func (o *OCI) verifyBucket(r bucketRef) error {
+	return o.verifyBucketWith(r.region, r.ns, r.name, func() error {
 		// GetBucket, not HeadBucket: a HEAD gives the same empty body the
 		// object calls do, so its 404 carries no code. GetBucket answers with
 		// BucketNotFound, which is worth having in the message.
-		_, err := c.GetBucket(context.Background(), objectstorage.GetBucketRequest{
-			NamespaceName: &ns, BucketName: &bucket,
+		_, err := r.c.GetBucket(context.Background(), objectstorage.GetBucketRequest{
+			NamespaceName: &r.ns, BucketName: &r.name,
 		})
 		return err
 	})
@@ -154,8 +266,8 @@ func (o *OCI) verifyBucket(c *objectstorage.ObjectStorageClient, ns, bucket stri
 // The lock is held across the check on purpose. Under -m the first operation
 // on a bucket starts many workers at once, and releasing the lock before the
 // call would send all of them to the service for the same answer.
-func (o *OCI) verifyBucketWith(ns, bucket string, check func() error) error {
-	key := ns + "/" + bucket
+func (o *OCI) verifyBucketWith(region, ns, bucket string, check func() error) error {
+	key := region + "/" + ns + "/" + bucket
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -169,8 +281,8 @@ func (o *OCI) verifyBucketWith(ns, bucket string, check func() error) error {
 		// prints whatever error it is handed, and an info line worded
 		// differently from the error would be printed alongside it rather
 		// than instead of it.
-		logger.Debug(module, "cannot reach bucket oci://%s: %s", bucket, cerr)
-		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q: %w", bucket, ns, cerr)
+		logger.Debug(module, "cannot reach bucket oci://%s@%s: %s", bucket, region, cerr)
+		err = fmt.Errorf("oci: cannot reach bucket %q in namespace %q in region %q: %w", bucket, ns, region, cerr)
 		// Only a definite answer is worth remembering. A throttle, a 5xx or a
 		// dropped connection says nothing about whether the bucket exists, and
 		// caching it would make the first unlucky moment of a run permanent:

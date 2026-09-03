@@ -12,7 +12,7 @@ printf 'no trailing newline' > $fx/nonl.txt
 
 ../gsg -m cp -r $fx "$remote_base/$fx" >/dev/null 2>&1
 assertEq "every file was uploaded" \
-    "$(oci os object list --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object list --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --prefix "$testid/$fx/" --all --query 'length(data)' 2>/dev/null)" "4"
 
 # gsg must record a CRC32C on upload. Without one the service keeps only an
@@ -21,7 +21,7 @@ assertEq "every file was uploaded" \
 # Query the header rather than grepping the whole response: the string
 # "opc-content-crc32c" also appears inside access-control-expose-headers, so a
 # grep matches whether or not a checksum was stored.
-stored_crc=$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+stored_crc=$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --name "$testid/$fx/a.txt" --query '"opc-content-crc32c"' --raw-output 2>/dev/null)
 if [[ -n "$stored_crc" && "$stored_crc" != "null" ]]
 then
@@ -71,7 +71,7 @@ assertEq "re-uploading a changed file succeeds" "$editrc" "0"
 assertEq "and was not refused and retried" \
     "$(echo "$editout" | grep -c 'does not match the expected')" "0"
 assertEq "the stored object is the new content" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$fre/edited.txt" --file - 2>/dev/null)" "second"
 
 # Then the case the cache cannot see: the modification time put back exactly.
@@ -111,7 +111,7 @@ assertEq "a change that keeps the modification time still uploads" "$sneakrc" "0
 assertEq "and is not refused either" \
     "$(echo "$sneakout" | grep -c 'does not match the expected')" "0"
 assertEq "and stores the new content" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$fre/sneaky.txt" --file - 2>/dev/null)" "afterx"
 
 # Everything above would also pass if the checksum were never sent: OCI would
@@ -164,7 +164,7 @@ mkdir -p $fmp
 dd if=/dev/urandom of=$fmp/big.bin bs=1m count=130 2>/dev/null
 
 ../gsg cp $fmp/big.bin "$remote_base/$fmp/big.bin" >/dev/null 2>&1
-head=$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+head=$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --name "$testid/$fmp/big.bin" 2>/dev/null)
 assertEq "the object stored the whole file" \
     "$(echo "$head" | python3 -c 'import sys,json; print(json.load(sys.stdin)["content-length"])' 2>/dev/null)" \
@@ -256,22 +256,22 @@ printf 'BBBB' > $funk/b
 # Uploaded with the oci CLI on purpose: it stores no CRC32C, which is the
 # condition being tested. Uploading with gsg would store one and the two
 # objects would differ on checksum like any other pair.
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $funk/a --name "$testid/$funk/src/a.txt" --force >/dev/null 2>&1
-oci os object put --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+oci os object put --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --file $funk/b --name "$testid/$funk/dst/a.txt" --force >/dev/null 2>&1
 
 assertEq "neither object carries a comparable checksum" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$funk/src/a.txt" 2>/dev/null | grep -c 'opc-content-crc32c')" "0"
 assertEq "and they really are the same size" \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$funk/dst/a.txt" 2>/dev/null \
         | python3 -c 'import sys,json; print(json.load(sys.stdin)["content-length"])' 2>/dev/null)" "4"
 
 ../gsg rsync -r -v "$remote_base/$funk/src" "$remote_base/$funk/dst" >/dev/null 2>&1
 assertEq "rsync -v replaces an object it cannot compare" \
-    "$(oci os object get --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object get --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$funk/dst/a.txt" --file - 2>/dev/null)" "AAAA"
 
 rm -rf $funk
@@ -285,7 +285,7 @@ start "transfer: mtime survives the round trip"
 # TZ=UTC matters: `date -j -f` ignores the literal GMT in the format and reads
 # the timestamp as local time, which put this eight hours out in Singapore.
 remote_epoch=$(TZ=UTC date -j -f '%a, %d %b %Y %H:%M:%S GMT' \
-    "$(oci os object head --namespace "$oci_ns" --bucket-name "$oci_bucket" \
+    "$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
         --name "$testid/$fx/a.txt" --query '"last-modified"' --raw-output 2>/dev/null)" \
     +%s 2>/dev/null)
 local_epoch=$(stat -f %m ${fx}_down/a.txt)

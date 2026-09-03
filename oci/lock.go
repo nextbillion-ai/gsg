@@ -47,10 +47,11 @@ func validLockETag(etag string) bool {
 
 // DoAttemptLock takes the lock and returns the ETag that proves it is ours.
 func (o *OCI) DoAttemptLock(bucket, object string, ttl time.Duration) (string, error) {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return "", err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 
 	// An existing lock is either still held, in which case we lose, or expired,
 	// in which case it is cleared out of the way -- conditionally, so a lock
@@ -119,10 +120,11 @@ func (o *OCI) DoAttemptLock(bucket, object string, ttl time.Duration) (string, e
 
 // DoAttemptUnlock releases a lock, but only if this ETag still identifies it.
 func (o *OCI) DoAttemptUnlock(bucket, object, etag string) error {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 	if !validLockETag(etag) {
 		logger.Info(module, "DoAttemptUnlock: unusable ETag %q for oci://%s/%s", etag, name, object)
 		return fmt.Errorf("cannot release the lock on oci://%s/%s: %q is not an ETag that proves it is ours", name, object, etag)

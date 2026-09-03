@@ -16,10 +16,11 @@ import (
 
 // Cat returns an object's bytes.
 func (o *OCI) Cat(bucket, prefix string) ([]byte, error) {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return nil, err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 	r, err := c.GetObject(context.Background(), objectstorage.GetObjectRequest{
 		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
 	})
@@ -86,10 +87,11 @@ func (o *OCI) IsDirectory(bucket, prefix string) (bool, error) {
 // large object is not held in memory in its entirety just to be copied
 // somewhere else. The caller closes it.
 func (o *OCI) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return nil, err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 	r, err := c.GetObject(context.Background(), objectstorage.GetObjectRequest{
 		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
 	})
@@ -119,10 +121,11 @@ func (o *OCI) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
 // spooled to a temporary file first. Either way memory stays bounded and the
 // upload is still checked on arrival.
 func (o *OCI) PutObject(bucket, prefix string, from io.Reader) error {
-	c, ns, name, err := o.resolve(bucket)
+	ref, err := o.resolve(bucket)
 	if err != nil {
 		return err
 	}
+	c, ns, name := ref.c, ref.ns, ref.name
 
 	body, size, sum, cleanup, err := measureBody(from)
 	if cleanup != nil {

@@ -43,7 +43,17 @@ var mvCmd = &cobra.Command{
 		//
 		// gsutil does refuse the identical-path case, with "are the same file
 		// - abort", and so does this.
-		if wouldDestroySource(src, dst) {
+		// A guard that cannot answer refuses. It is consulted only when the
+		// destination is the source or inside it, so "cannot tell" here means
+		// "cannot tell whether this is the destructive shape", and the only
+		// safe reading of that is that it might be.
+		destroys, derr := wouldDestroySource(src, dst)
+		if derr != nil {
+			logger.Info(module, "refusing to move %s to %s: the destination is the source or inside it, and whether the two name one bucket could not be established: %s",
+				args[0], args[1], derr)
+			common.Exit()
+		}
+		if destroys {
 			logger.Info(module, "refusing to move %s to %s: the destination is the source, or inside it, and the copy would overwrite what the delete then removes",
 				args[0], args[1])
 			common.Exit()
@@ -107,22 +117,79 @@ var mvCmd = &cobra.Command{
 // sibling whose name merely begins with the source's is left alone: "a.txt" to
 // "a.txt.bak" is a real move, and so is "d" to "dsub".
 //
-// The paths are compared as given. A backend where one object has more than
-// one spelling catches its own variants -- oci does, for bucket versus
-// bucket@namespace -- because only it can resolve them.
-func wouldDestroySource(a, b *system.FileObject) bool {
+// The buckets are compared as the backend resolves them, not as they were
+// typed. Comparing the raw strings is not enough where one bucket has more
+// than one spelling: oci accepts both "b@region" and "b@namespace.region" for
+// the same bucket, so `mv -r oci://b@region/d oci://b@ns.region/d/sub` looked
+// like two different buckets here and sailed past the guard. Measured against
+// a real bucket before the fix, with d/a.txt holding "root" and d/sub/a.txt
+// holding "nested", that command left one object where there had been two.
+//
+// The backend's own self-copy check does not catch it either -- that compares
+// one object to one object, and this is a directory to its own descendant,
+// which is exactly the shape this function exists for.
+//
+// gs and s3 give one bucket one spelling, so they do not implement this and
+// are never asked.
+type bucketCanonicaliser interface {
+	CanonicalBucket(spec string) (string, error)
+}
+
+// sameBucket reports whether two paths name one bucket.
+//
+// The order of the checks is what keeps this cheap and safe. Identical
+// spellings are the overwhelmingly common case and settle it outright, so a
+// backend is asked to resolve anything only when two spellings differ and the
+// prefixes have already been found to collide -- which is rare, and is the
+// only case where the answer can cost data.
+//
+// There it fails closed. Falling back to the raw strings, as the first version
+// of this did, reproduces the original bug whenever resolution fails for a
+// moment: the two spellings compare unequal, the guard waves the move through,
+// and the copy and delete that follow resolve the namespace perfectly well on
+// their next attempt. A move refused because gsg could not tell costs a retry;
+// a move allowed because gsg could not tell costs an object.
+func sameBucket(a, b *system.FileObject) (bool, error) {
+	if a.Bucket == b.Bucket {
+		return true, nil
+	}
+	c, ok := a.System.(bucketCanonicaliser)
+	if !ok {
+		// One bucket, one spelling: different strings are different buckets.
+		return false, nil
+	}
+	ab, err := c.CanonicalBucket(a.Bucket)
+	if err != nil {
+		return false, err
+	}
+	bb, err := c.CanonicalBucket(b.Bucket)
+	if err != nil {
+		return false, err
+	}
+	return ab == bb, nil
+}
+
+// wouldDestroySource reports whether moving a onto b would lose data. The
+// error is a third answer -- "cannot tell" -- and the caller must treat it as
+// a refusal rather than as a false.
+func wouldDestroySource(a, b *system.FileObject) (bool, error) {
 	if a == nil || b == nil || a.System == nil || b.System == nil {
-		return false
+		return false, nil
 	}
 	// Two FileObjects for one scheme share the single registered backend, so
 	// comparing the pointers is both cheaper and exact.
-	if a.System != b.System || a.Bucket != b.Bucket {
-		return false
+	if a.System != b.System {
+		return false, nil
 	}
+	// The prefixes are settled before the buckets, because they are free and
+	// they decide whether the buckets matter at all. Where the destination is
+	// neither the source nor inside it, no pair of buckets can make this move
+	// destructive -- so an ordinary move never resolves anything, and the
+	// fail-closed path above can never refuse one.
 	src := strings.TrimRight(a.Prefix, "/")
 	dst := strings.TrimRight(b.Prefix, "/")
-	if src == dst {
-		return true
+	if src != dst && !(src != "" && strings.HasPrefix(dst, src+"/")) {
+		return false, nil
 	}
-	return src != "" && strings.HasPrefix(dst, src+"/")
+	return sameBucket(a, b)
 }

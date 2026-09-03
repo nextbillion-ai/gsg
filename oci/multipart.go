@@ -43,11 +43,12 @@ const (
 //
 // The service is asked to verify each part against a checksum computed here,
 // so a part corrupted in transit is rejected rather than assembled.
-func (o *OCI) uploadMultipart(f *os.File, size int64, bucketSpec, object string, partSize, parts int64, pb *bar.ProgressBar) error {
-	c, ns, bucket, err := o.resolve(bucketSpec)
+func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partSize, parts int64, pb *bar.ProgressBar) error {
+	ref, err := o.resolve(spec)
 	if err != nil {
 		return err
 	}
+	c, ns, bucket := ref.c, ref.ns, ref.name
 	ctx := context.Background()
 
 	wholeCRC, _, err := crc32cOfReader(f)

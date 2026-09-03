@@ -34,11 +34,12 @@ const maxListPages = 10000
 // Recursion is expressed to the service rather than filtered here: with no
 // delimiter every key under the prefix comes back, and with "/" the service
 // collapses anything deeper into Prefixes.
-func (o *OCI) walkObjects(bucketSpec, prefix string, recursive bool) ([]objectstorage.ObjectSummary, []string, error) {
-	c, ns, bucket, err := o.resolve(bucketSpec)
+func (o *OCI) walkObjects(spec, prefix string, recursive bool) ([]objectstorage.ObjectSummary, []string, error) {
+	ref, err := o.resolve(spec)
 	if err != nil {
 		return nil, nil, err
 	}
+	c, ns, bucket := ref.c, ref.ns, ref.name
 
 	// "some/dir" and "some/dir/" are different requests. Asked for the former
 	// with a delimiter, the service answers with one common prefix -- the
@@ -51,7 +52,7 @@ func (o *OCI) walkObjects(bucketSpec, prefix string, recursive bool) ([]objectst
 	// under the prefix and a slash would exclude an object named exactly
 	// "some/dir".
 	if !recursive && prefix != "" && !strings.HasSuffix(prefix, "/") {
-		r, herr := o.headObject(bucketSpec, prefix)
+		r, herr := o.headObject(spec, prefix)
 		if herr != nil {
 			return nil, nil, herr
 		}
@@ -149,11 +150,12 @@ func dedupePrefixes(in []string) []string {
 // million keys underneath would have the service walk them all.
 // self, when non-empty, names the entry that is the caller's own prefix rather
 // than something beneath it, and is not counted.
-func (o *OCI) anyEntryUnder(bucketSpec, prefix, self string) (bool, error) {
-	c, ns, bucket, err := o.resolve(bucketSpec)
+func (o *OCI) anyEntryUnder(spec, prefix, self string) (bool, error) {
+	ref, err := o.resolve(spec)
 	if err != nil {
 		return false, err
 	}
+	c, ns, bucket := ref.c, ref.ns, ref.name
 	// Two, not one. An object named exactly self is the zero-byte marker a
 	// console's "create folder" writes, and it is the caller's own path rather
 	// than something beneath it, so it is not counted -- gs and s3 draw the

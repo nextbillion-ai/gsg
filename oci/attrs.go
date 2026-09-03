@@ -43,11 +43,12 @@ import (
 // holds objects, so "everything under it is absent" is a true answer by the
 // time the bucket can go, and losing access mid-run gives 401 or 403, which
 // is not a 404 and is reported as the error it is.
-func (o *OCI) headObject(bucketSpec, prefix string) (*objectstorage.HeadObjectResponse, error) {
-	c, ns, bucket, err := o.resolve(bucketSpec)
+func (o *OCI) headObject(spec, prefix string) (*objectstorage.HeadObjectResponse, error) {
+	ref, err := o.resolve(spec)
 	if err != nil {
 		return nil, err
 	}
+	c, ns, bucket := ref.c, ref.ns, ref.name
 	if prefix == "" {
 		return nil, nil
 	}
@@ -186,7 +187,7 @@ func (o *OCI) BatchAttributes(bucket, prefix string, recursive bool) ([]*system.
 }
 
 // summaryToAttrs converts one listing entry, deferring the checksum.
-func (o *OCI) summaryToAttrs(bucketSpec string, s objectstorage.ObjectSummary) *system.Attrs {
+func (o *OCI) summaryToAttrs(spec string, s objectstorage.ObjectSummary) *system.Attrs {
 	a := &system.Attrs{}
 	if s.Size != nil {
 		a.Size = *s.Size
@@ -206,18 +207,18 @@ func (o *OCI) summaryToAttrs(bucketSpec string, s objectstorage.ObjectSummary) *
 			// checksum of 0: Same treats "could not determine" as a
 			// difference, so the object is copied again rather than skipped
 			// on the strength of two failures agreeing.
-			r, err := o.headObject(bucketSpec, name)
+			r, err := o.headObject(spec, name)
 			if err != nil {
-				logger.Info(module, "cannot read the checksum of oci://%s/%s, treating it as unknown: %s", bucketSpec, name, err)
+				logger.Info(module, "cannot read the checksum of oci://%s/%s, treating it as unknown: %s", spec, name, err)
 				return 0, false
 			}
 			if r == nil {
-				logger.Info(module, "oci://%s/%s vanished while reading its checksum, treating it as unknown", bucketSpec, name)
+				logger.Info(module, "oci://%s/%s vanished while reading its checksum, treating it as unknown", spec, name)
 				return 0, false
 			}
 			crc, stored := crc32cOf(r.OpcContentCrc32c)
 			if !stored {
-				logger.Debug(module, "oci://%s/%s has no stored CRC32C", bucketSpec, name)
+				logger.Debug(module, "oci://%s/%s has no stored CRC32C", spec, name)
 				return 0, false
 			}
 			return crc, true
