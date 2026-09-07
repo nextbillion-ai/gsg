@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/logger"
@@ -19,8 +20,35 @@ const (
 	tempFileSuffix = "_.gstmp"
 	// crc32cCacheSize is the exact byte length of a crc32c cache file.
 	crc32cCacheSize = 4
-	// crc32cCachePerm keeps the cache readable by other users sharing /tmp.
+	// crc32cCachePerm keeps the cache readable by other users sharing the
+	// cache directory.
 	crc32cCachePerm = 0644
+	// defaultCacheDir is where every cache file has always lived.
+	defaultCacheDir = "/tmp"
+	// cacheDirEnv names a directory to hold the crc32c cache instead of
+	// defaultCacheDir.
+	//
+	// That cache is keyed by path and mtime, and Download stamps a downloaded
+	// file with the remote object's mtime, so an entry stays valid for as long
+	// as the object does -- across processes, and across the life of whatever
+	// wrote it. In a container /tmp is the ephemeral layer, which throws that
+	// away on every restart and is not even shared between two containers of
+	// the same pod, so a caller that has a persistent disk had no way to keep
+	// a cache that is designed to outlive a single run. Point this at
+	// somewhere on that disk and it does.
+	//
+	// It moves ONLY the crc32c cache. The lock generation caches keep using
+	// GenTempFileName and stay in /tmp on purpose: their name is derived from
+	// the locked object alone, so two processes sharing a directory share one
+	// file, and the second to lock overwrites the generation the first is
+	// holding -- after which the first can unlock the second's lock. Two
+	// processes in one container can already collide that way, since /tmp is
+	// container-local rather than process-local; the point is not to widen it
+	// to every process that mounts the same volume.
+	cacheDirEnv = "GSG_CACHE_DIR"
+	// cacheDirPerm matches the 0755 CreateFolder uses. The files inside carry
+	// their own modes; 0700 would stop the sharing crc32cCachePerm allows.
+	cacheDirPerm = 0755
 )
 
 var (
@@ -107,19 +135,103 @@ func GetFileSize(path string) int64 {
 	return fi.Size()
 }
 
-// GenTempFileName generate /tmp/%x files where %x is md5 value of all parts concate together
-func GenTempFileName(parts ...string) string {
+// hashParts is the %x half of a cache file name: the md5 of all parts
+// concatenated. Unchanged from when every name was built as /tmp/%x, so a
+// cache written by an older gsg is still found.
+func hashParts(parts []string) string {
 	var buf bytes.Buffer
 	for _, part := range parts {
 		buf.WriteString(part)
 	}
-	return fmt.Sprintf("/tmp/%x", md5.Sum(buf.Bytes()))
+	return fmt.Sprintf("%x", md5.Sum(buf.Bytes()))
+}
 
+// GenTempFileName generates /tmp/%x files where %x is md5 value of all parts
+// concate together. Used for the lock generation caches, which must stay
+// process-local -- see cacheDirEnv.
+func GenTempFileName(parts ...string) string {
+	return filepath.Join(defaultCacheDir, hashParts(parts))
+}
+
+// genCacheFileName is GenTempFileName for files that may be shared and kept:
+// the crc32c cache, under cacheDir rather than always /tmp.
+func genCacheFileName(parts ...string) string {
+	return filepath.Join(cacheDir(), hashParts(parts))
+}
+
+var (
+	cacheDirOnce sync.Once
+	cacheDirPath string
+)
+
+// cacheDir is the directory the crc32c cache lives in: defaultCacheDir, or
+// whatever cacheDirEnv names.
+//
+// Resolved once per process. It has to be stable: the read side has to agree
+// with the write side on where an entry is, and re-deciding per call would let
+// a directory that appears or disappears mid-run split the cache in two.
+func cacheDir() string {
+	cacheDirOnce.Do(func() { cacheDirPath = resolveCacheDir() })
+	return cacheDirPath
+}
+
+// resetCacheDir makes the next cacheDir call re-read the environment. Tests
+// only -- nothing in a real run changes cacheDirEnv mid-process.
+func resetCacheDir() {
+	cacheDirOnce = sync.Once{}
+	cacheDirPath = ""
+}
+
+// resolveCacheDir picks the directory, falling back to defaultCacheDir when
+// the configured one cannot actually be used. A misconfigured GSG_CACHE_DIR
+// then costs the persistence it was set to gain, but never more than not
+// setting it at all, which is the safe direction for a cache.
+//
+// The directory is created here rather than at the write, because the read
+// side has to agree on the name before anything has been written.
+//
+// Note that a directory shared by several processes is only safe when they all
+// see the same filesystem at the same paths -- as two containers mounting one
+// volume do. The crc32c key is a path and an mtime, so processes that mean
+// different files by the same path would read each other's checksums.
+func resolveCacheDir() string {
+	dir := os.Getenv(cacheDirEnv)
+	if dir == "" {
+		return defaultCacheDir
+	}
+	// Resolved against the working directory once, here. The result is
+	// memoized, so holding on to a relative path would mean a later chdir
+	// silently moved the cache: the same stored string, a different directory,
+	// and entries written before the chdir no longer found.
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		logger.Info(module, "%s is [%s], which cannot be resolved to an absolute path (%s); falling back to %s", cacheDirEnv, dir, err, defaultCacheDir)
+		return defaultCacheDir
+	}
+	dir = abs
+	if err := os.MkdirAll(dir, cacheDirPerm); err != nil {
+		logger.Info(module, "%s is [%s], which cannot be created (%s); falling back to %s", cacheDirEnv, dir, err, defaultCacheDir)
+		return defaultCacheDir
+	}
+	// MkdirAll reports success for a directory that already exists, whatever
+	// its mode or owner. Selecting a read-only mount, or one belonging to
+	// another uid, would leave every write failing at Debug level and every
+	// file rehashed with nothing saying why -- so prove it is writable rather
+	// than assume it.
+	probe, err := os.CreateTemp(dir, ".gsg-probe")
+	if err != nil {
+		logger.Info(module, "%s is [%s], which is not writable (%s); falling back to %s", cacheDirEnv, dir, err, defaultCacheDir)
+		return defaultCacheDir
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(name)
+	return dir
 }
 
 func readOrComputeCRC32c(path string) uint32 {
 	result := uint32(0)
-	cacheFileName := GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
+	cacheFileName := genCacheFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
 
 	if cached, ok := readCRC32cCache(cacheFileName); ok {
 		logger.Debug(module, "loaded crc32c [%s] from catch: %d", cacheFileName, cached)
@@ -236,8 +348,8 @@ func readCRC32cCache(cacheFileName string) (uint32, bool) {
 // that neither a concurrent reader nor a later run can observe it half written.
 //
 // 0644 rather than the 0600 the lock caches use: a checksum cached by one user
-// staying readable by another sharing /tmp saves real work, and there is
-// nothing sensitive in it.
+// staying readable by another sharing the cache directory saves real work, and
+// there is nothing sensitive in it.
 func writeCRC32cCache(cacheFileName string, result uint32) {
 	crcBytes := make([]byte, crc32cCacheSize)
 	binary.LittleEndian.PutUint32(crcBytes, result)

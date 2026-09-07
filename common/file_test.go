@@ -1,7 +1,9 @@
 package common
 
 import (
+	"crypto/md5"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -69,7 +71,7 @@ func TestGetTempFile(t *testing.T) {
 // crc32cCachePath mirrors the cache name readOrComputeCRC32c derives for a path.
 func crc32cCachePath(t *testing.T, path string) string {
 	t.Helper()
-	return GenTempFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
+	return genCacheFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c")
 }
 
 // newCRC32cFixture writes a data file and returns it with its cache path,
@@ -190,4 +192,167 @@ func TestGetFileCRC32CIgnoresNonRegularCache(t *testing.T) {
 	assert.NotPanics(t, func() {
 		assert.Equal(t, want, GetFileCRC32C(path))
 	})
+}
+
+// setCacheDir points the crc32c cache at dir for one test, and makes the next
+// resolution re-read the environment on both sides of it -- cacheDir memoizes,
+// so a stale value would leak between tests.
+func setCacheDir(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv(cacheDirEnv, dir)
+	resetCacheDir()
+	t.Cleanup(resetCacheDir)
+}
+
+// The crc32c cache defaults to /tmp, so one written by a build that predates
+// GSG_CACHE_DIR is still the one this build reads.
+func TestGenCacheFileNameDefaultsToTmp(t *testing.T) {
+	setCacheDir(t, "")
+	name := genCacheFileName("gs://bucket", "/", "object")
+	assert.Equal(t, defaultCacheDir, filepath.Dir(name))
+	assert.Equal(t, fmt.Sprintf("%x", md5.Sum([]byte("gs://bucket/object"))), filepath.Base(name))
+}
+
+// The point of the env var: the cache lands on a caller-chosen disk, and the
+// name under it is the same one /tmp would have carried.
+func TestGenCacheFileNameHonoursCacheDir(t *testing.T) {
+	dir := t.TempDir()
+	setCacheDir(t, "")
+	want := filepath.Base(genCacheFileName("gs://bucket", "/", "object"))
+
+	setCacheDir(t, dir)
+	got := genCacheFileName("gs://bucket", "/", "object")
+	assert.Equal(t, dir, filepath.Dir(got))
+	assert.Equal(t, want, filepath.Base(got))
+}
+
+// The lock generation caches must NOT follow GSG_CACHE_DIR. Their name comes
+// from the locked object alone, so two processes sharing a directory would
+// share one file: the second to lock would overwrite the generation the first
+// holds, and the first could then delete the second's lock. Keeping them
+// process-local is what makes a stale generation fail GenerationMatch.
+func TestGenTempFileNameIgnoresCacheDir(t *testing.T) {
+	setCacheDir(t, t.TempDir())
+	assert.Equal(t, defaultCacheDir, filepath.Dir(GenTempFileName("gs://bucket", "/", "lock")))
+}
+
+// The two namers agree on everything but the directory, so relocating the
+// crc32c cache cannot change which entry a given input maps to.
+func TestCacheFileNamesShareTheirHash(t *testing.T) {
+	setCacheDir(t, t.TempDir())
+	assert.Equal(t,
+		filepath.Base(GenTempFileName("a", "b")),
+		filepath.Base(genCacheFileName("a", "b")),
+	)
+}
+
+// A cache directory that does not exist yet is created, otherwise every write
+// into it would fail and the cache would silently never work.
+func TestGenCacheFileNameCreatesCacheDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "cache")
+	setCacheDir(t, dir)
+
+	name := genCacheFileName("anything")
+	assert.Equal(t, dir, filepath.Dir(name))
+	fi, err := os.Stat(dir)
+	assert.NoError(t, err)
+	assert.True(t, fi.IsDir())
+
+	// And it is usable: the whole point is that writeCRC32cCache can rename
+	// into it.
+	writeCRC32cCache(name, 42)
+	got, ok := readCRC32cCache(name)
+	assert.True(t, ok)
+	assert.Equal(t, uint32(42), got)
+}
+
+// A GSG_CACHE_DIR that cannot be created must not take the cache down with it:
+// falling back to /tmp is no worse than never setting the variable.
+func TestGenCacheFileNameFallsBackWhenCacheDirCannotBeCreated(t *testing.T) {
+	// A regular file cannot become a directory, so MkdirAll on a path under
+	// it always fails.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	assert.NoError(t, os.WriteFile(blocker, []byte("x"), 0644))
+	setCacheDir(t, filepath.Join(blocker, "cache"))
+
+	assert.Equal(t, defaultCacheDir, filepath.Dir(genCacheFileName("anything")))
+}
+
+// MkdirAll reports success for a directory that already exists whatever its
+// mode, so an unwritable one used to be selected and then fail every write at
+// Debug level, rehashing every file with nothing saying why.
+func TestGenCacheFileNameFallsBackWhenCacheDirIsNotWritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write a 0555 directory, so there is nothing to detect")
+	}
+	dir := filepath.Join(t.TempDir(), "readonly")
+	assert.NoError(t, os.Mkdir(dir, 0555))
+	setCacheDir(t, dir)
+
+	assert.Equal(t, defaultCacheDir, filepath.Dir(genCacheFileName("anything")))
+}
+
+// A relative GSG_CACHE_DIR has to be pinned to an absolute path at resolution
+// time. The result is memoized, so keeping the relative string would let a
+// later chdir point the same stored value at a different directory, losing
+// every entry written before it.
+func TestResolveCacheDirAbsolutizesRelativePaths(t *testing.T) {
+	base := t.TempDir()
+	cwd, err := os.Getwd()
+	assert.NoError(t, err)
+	assert.NoError(t, os.Chdir(base))
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+	setCacheDir(t, "relative-cache")
+	got := cacheDir()
+	assert.True(t, filepath.IsAbs(got), "cache dir should be absolute, got %q", got)
+
+	// It must name the directory that was current when it resolved, not
+	// whatever is current later.
+	resolved, err := filepath.EvalSymlinks(got)
+	assert.NoError(t, err)
+	want, err := filepath.EvalSymlinks(filepath.Join(base, "relative-cache"))
+	assert.NoError(t, err)
+	assert.Equal(t, want, resolved)
+
+	assert.NoError(t, os.Chdir(cwd))
+	assert.Equal(t, got, cacheDir())
+}
+
+// The probe must not leave anything behind: it runs once per process, but a
+// leaked probe file in a persisted directory would accumulate forever.
+func TestResolveCacheDirLeavesNoProbeFile(t *testing.T) {
+	dir := t.TempDir()
+	setCacheDir(t, dir)
+
+	assert.Equal(t, dir, cacheDir())
+	entries, err := os.ReadDir(dir)
+	assert.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+// The end-to-end property nbroute needs: a checksum computed once is persisted
+// into the configured directory, and a later read comes back from there rather
+// than from the file.
+func TestGetFileCRC32CPersistsIntoCacheDir(t *testing.T) {
+	dir := t.TempDir()
+	setCacheDir(t, dir)
+
+	path := filepath.Join(t.TempDir(), "data")
+	assert.NoError(t, os.WriteFile(path, []byte("hello world"), 0644))
+	want := GetFileCRC32C(path)
+
+	// GetFileCRC32C itself must have written the entry -- the half the test
+	// used to skip by writing the sentinel before ever checking. Without this
+	// the test would still pass if nothing were ever persisted.
+	cachePath := crc32cCachePath(t, path)
+	assert.Equal(t, dir, filepath.Dir(cachePath))
+	b, err := os.ReadFile(cachePath)
+	assert.NoError(t, err)
+	assert.Equal(t, crc32cCacheSize, len(b))
+	assert.Equal(t, want, binary.LittleEndian.Uint32(b))
+
+	// And it is those bytes that come back, not a fresh computation.
+	writeCRC32cCache(cachePath, want+1)
+	assert.Equal(t, want+1, GetFileCRC32C(path))
 }
