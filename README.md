@@ -18,3 +18,11 @@ which in a container is the ephemeral layer: it is thrown away on every restart
 and is not shared between two containers of the same pod. Set `GSG_CACHE_DIR`
 to a directory on a persistent disk and the cache survives both, so a restart
 over unchanged data no longer re-reads it. Unset, it stays `/tmp`.
+
+Only the checksum cache moves. Lock generation caches stay in `/tmp`, where
+being process-local is what keeps one process from releasing another's lock.
+
+A directory shared by several processes is only safe when they all see the same
+filesystem at the same paths — as two containers mounting one volume do. The
+key is a path and an mtime, so processes that mean different files by the same
+path would read each other's checksums.
