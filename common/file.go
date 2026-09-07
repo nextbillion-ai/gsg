@@ -39,11 +39,12 @@ const (
 	//
 	// It moves ONLY the crc32c cache. The lock generation caches keep using
 	// GenTempFileName and stay in /tmp on purpose: their name is derived from
-	// the locked object alone, so two processes sharing a directory would
-	// share one file, and the second to lock would overwrite the generation
-	// the first is holding -- after which the first could unlock the second's
-	// lock. Their being process-local is what makes a stale generation fail
-	// its GenerationMatch precondition instead.
+	// the locked object alone, so two processes sharing a directory share one
+	// file, and the second to lock overwrites the generation the first is
+	// holding -- after which the first can unlock the second's lock. Two
+	// processes in one container can already collide that way, since /tmp is
+	// container-local rather than process-local; the point is not to widen it
+	// to every process that mounts the same volume.
 	cacheDirEnv = "GSG_CACHE_DIR"
 	// cacheDirPerm matches the 0755 CreateFolder uses. The files inside carry
 	// their own modes; 0700 would stop the sharing crc32cCachePerm allows.
@@ -198,6 +199,16 @@ func resolveCacheDir() string {
 	if dir == "" {
 		return defaultCacheDir
 	}
+	// Resolved against the working directory once, here. The result is
+	// memoized, so holding on to a relative path would mean a later chdir
+	// silently moved the cache: the same stored string, a different directory,
+	// and entries written before the chdir no longer found.
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		logger.Info(module, "%s is [%s], which cannot be resolved to an absolute path (%s); falling back to %s", cacheDirEnv, dir, err, defaultCacheDir)
+		return defaultCacheDir
+	}
+	dir = abs
 	if err := os.MkdirAll(dir, cacheDirPerm); err != nil {
 		logger.Info(module, "%s is [%s], which cannot be created (%s); falling back to %s", cacheDirEnv, dir, err, defaultCacheDir)
 		return defaultCacheDir

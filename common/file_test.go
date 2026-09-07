@@ -292,6 +292,33 @@ func TestGenCacheFileNameFallsBackWhenCacheDirIsNotWritable(t *testing.T) {
 	assert.Equal(t, defaultCacheDir, filepath.Dir(genCacheFileName("anything")))
 }
 
+// A relative GSG_CACHE_DIR has to be pinned to an absolute path at resolution
+// time. The result is memoized, so keeping the relative string would let a
+// later chdir point the same stored value at a different directory, losing
+// every entry written before it.
+func TestResolveCacheDirAbsolutizesRelativePaths(t *testing.T) {
+	base := t.TempDir()
+	cwd, err := os.Getwd()
+	assert.NoError(t, err)
+	assert.NoError(t, os.Chdir(base))
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+	setCacheDir(t, "relative-cache")
+	got := cacheDir()
+	assert.True(t, filepath.IsAbs(got), "cache dir should be absolute, got %q", got)
+
+	// It must name the directory that was current when it resolved, not
+	// whatever is current later.
+	resolved, err := filepath.EvalSymlinks(got)
+	assert.NoError(t, err)
+	want, err := filepath.EvalSymlinks(filepath.Join(base, "relative-cache"))
+	assert.NoError(t, err)
+	assert.Equal(t, want, resolved)
+
+	assert.NoError(t, os.Chdir(cwd))
+	assert.Equal(t, got, cacheDir())
+}
+
 // The probe must not leave anything behind: it runs once per process, but a
 // leaked probe file in a persisted directory would accumulate forever.
 func TestResolveCacheDirLeavesNoProbeFile(t *testing.T) {
