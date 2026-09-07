@@ -19,8 +19,31 @@ const (
 	tempFileSuffix = "_.gstmp"
 	// crc32cCacheSize is the exact byte length of a crc32c cache file.
 	crc32cCacheSize = 4
-	// crc32cCachePerm keeps the cache readable by other users sharing /tmp.
+	// crc32cCachePerm keeps the cache readable by other users sharing the
+	// cache directory.
 	crc32cCachePerm = 0644
+	// defaultCacheDir is where GenTempFileName has always put its files.
+	defaultCacheDir = "/tmp"
+	// cacheDirEnv names a directory to use instead of defaultCacheDir.
+	//
+	// The crc32c cache is keyed by path and mtime, and Download stamps a
+	// downloaded file with the remote object's mtime, so an entry stays valid
+	// for as long as the object does -- across processes, and across the life
+	// of whatever wrote it. In a container /tmp is the ephemeral layer, which
+	// throws that away on every restart and is not even shared between two
+	// containers of the same pod, so a caller that has a persistent disk had
+	// no way to keep a cache that is designed to outlive a single run. Point
+	// this at somewhere on that disk and it does.
+	//
+	// It moves every GenTempFileName file, not only the crc32c cache: the lock
+	// generation caches live there too, and AttemptUnLock finds a lock's
+	// generation by rebuilding its name. So changing this between a lock and
+	// its unlock loses the generation and leaves the remote lock standing
+	// until its TTL -- the same way clearing /tmp in between always has.
+	cacheDirEnv = "GSG_CACHE_DIR"
+	// cacheDirPerm matches the 0755 CreateFolder uses. The files inside carry
+	// their own modes; 0700 would stop the sharing crc32cCachePerm allows.
+	cacheDirPerm = 0755
 )
 
 var (
@@ -107,14 +130,35 @@ func GetFileSize(path string) int64 {
 	return fi.Size()
 }
 
-// GenTempFileName generate /tmp/%x files where %x is md5 value of all parts concate together
+// cacheDir is the directory GenTempFileName builds names in: defaultCacheDir,
+// or whatever cacheDirEnv names.
+//
+// The directory is created here rather than at the write, because the read
+// side has to agree on the name before anything has been written. A directory
+// that cannot be created falls back to defaultCacheDir: a misconfigured
+// GSG_CACHE_DIR then costs the persistence it was set to gain, but never more
+// than not setting it at all, which is the safe direction for a cache.
+func cacheDir() string {
+	dir := os.Getenv(cacheDirEnv)
+	if dir == "" {
+		return defaultCacheDir
+	}
+	if err := os.MkdirAll(dir, cacheDirPerm); err != nil {
+		logger.Info(module, "%s is [%s], which cannot be used as a cache directory (%s); falling back to %s", cacheDirEnv, dir, err, defaultCacheDir)
+		return defaultCacheDir
+	}
+	return dir
+}
+
+// GenTempFileName generates <cache dir>/%x files where %x is md5 value of all
+// parts concate together. The %x half is unchanged, so a cache written before
+// cacheDirEnv existed is still found under defaultCacheDir.
 func GenTempFileName(parts ...string) string {
 	var buf bytes.Buffer
 	for _, part := range parts {
 		buf.WriteString(part)
 	}
-	return fmt.Sprintf("/tmp/%x", md5.Sum(buf.Bytes()))
-
+	return filepath.Join(cacheDir(), fmt.Sprintf("%x", md5.Sum(buf.Bytes())))
 }
 
 func readOrComputeCRC32c(path string) uint32 {
@@ -236,8 +280,8 @@ func readCRC32cCache(cacheFileName string) (uint32, bool) {
 // that neither a concurrent reader nor a later run can observe it half written.
 //
 // 0644 rather than the 0600 the lock caches use: a checksum cached by one user
-// staying readable by another sharing /tmp saves real work, and there is
-// nothing sensitive in it.
+// staying readable by another sharing the cache directory saves real work, and
+// there is nothing sensitive in it.
 func writeCRC32cCache(cacheFileName string, result uint32) {
 	crcBytes := make([]byte, crc32cCacheSize)
 	binary.LittleEndian.PutUint32(crcBytes, result)

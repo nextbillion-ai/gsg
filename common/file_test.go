@@ -1,7 +1,9 @@
 package common
 
 import (
+	"crypto/md5"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -190,4 +192,75 @@ func TestGetFileCRC32CIgnoresNonRegularCache(t *testing.T) {
 	assert.NotPanics(t, func() {
 		assert.Equal(t, want, GetFileCRC32C(path))
 	})
+}
+
+// GenTempFileName defaults to /tmp, so a cache written by a build that predates
+// GSG_CACHE_DIR is still the one this build reads.
+func TestGenTempFileNameDefaultsToTmp(t *testing.T) {
+	t.Setenv(cacheDirEnv, "")
+	name := GenTempFileName("gs://bucket", "/", "object")
+	assert.Equal(t, defaultCacheDir, filepath.Dir(name))
+	assert.Equal(t, fmt.Sprintf("%x", md5.Sum([]byte("gs://bucket/object"))), filepath.Base(name))
+}
+
+// The point of the env var: the cache lands on a caller-chosen disk, and the
+// name under it is the same one /tmp would have carried.
+func TestGenTempFileNameHonoursCacheDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(cacheDirEnv, "")
+	want := filepath.Base(GenTempFileName("gs://bucket", "/", "object"))
+
+	t.Setenv(cacheDirEnv, dir)
+	got := GenTempFileName("gs://bucket", "/", "object")
+	assert.Equal(t, dir, filepath.Dir(got))
+	assert.Equal(t, want, filepath.Base(got))
+}
+
+// A cache directory that does not exist yet is created, otherwise every write
+// into it would fail and the cache would silently never work.
+func TestGenTempFileNameCreatesCacheDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "cache")
+	t.Setenv(cacheDirEnv, dir)
+
+	name := GenTempFileName("anything")
+	assert.Equal(t, dir, filepath.Dir(name))
+	fi, err := os.Stat(dir)
+	assert.NoError(t, err)
+	assert.True(t, fi.IsDir())
+
+	// And it is usable: the whole point is that writeCRC32cCache can rename
+	// into it.
+	writeCRC32cCache(name, 42)
+	got, ok := readCRC32cCache(name)
+	assert.True(t, ok)
+	assert.Equal(t, uint32(42), got)
+}
+
+// A GSG_CACHE_DIR that cannot be created must not take the cache down with it:
+// falling back to /tmp is no worse than never setting the variable.
+func TestGenTempFileNameFallsBackWhenCacheDirUnusable(t *testing.T) {
+	// A regular file cannot become a directory, so MkdirAll on a path under
+	// it always fails.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	assert.NoError(t, os.WriteFile(blocker, []byte("x"), 0644))
+	t.Setenv(cacheDirEnv, filepath.Join(blocker, "cache"))
+
+	assert.Equal(t, defaultCacheDir, filepath.Dir(GenTempFileName("anything")))
+}
+
+// The end-to-end property nbroute needs: with the cache on a disk that outlives
+// the process, an unchanged file is not re-read.
+func TestGetFileCRC32CUsesCacheDirAcrossRuns(t *testing.T) {
+	t.Setenv(cacheDirEnv, t.TempDir())
+
+	path := filepath.Join(t.TempDir(), "data")
+	assert.NoError(t, os.WriteFile(path, []byte("hello world"), 0644))
+	want := GetFileCRC32C(path)
+
+	// Overwriting the cached value proves the second call reads the cache
+	// rather than the file, exactly as TestGetFileCRC32CUsesCache does for the
+	// default directory.
+	cachePath := crc32cCachePath(t, path)
+	writeCRC32cCache(cachePath, want+1)
+	assert.Equal(t, want+1, GetFileCRC32C(path))
 }
