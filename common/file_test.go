@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -120,6 +121,30 @@ func TestGetFileCRC32CUsesCache(t *testing.T) {
 	binary.LittleEndian.PutUint32(sentinelBytes, sentinel)
 	assert.NoError(t, os.WriteFile(cachePath, sentinelBytes, 0766))
 	assert.Equal(t, sentinel, GetFileCRC32C(path))
+}
+
+// An entry read every run must not age out of an mtime-based sweep.
+func TestGetFileCRC32CHitRefreshesCacheMtime(t *testing.T) {
+	path, cachePath := newCRC32cFixture(t)
+	want := GetFileCRC32C(path)
+	dataBefore, err := os.Stat(path)
+	assert.NoError(t, err)
+
+	stale := time.Now().Add(-30 * 24 * time.Hour)
+	assert.NoError(t, os.Chtimes(cachePath, stale, stale))
+	before, err := os.Stat(cachePath)
+	assert.NoError(t, err)
+	assert.WithinDuration(t, stale, before.ModTime(), time.Minute)
+
+	assert.Equal(t, want, GetFileCRC32C(path))
+
+	after, err := os.Stat(cachePath)
+	assert.NoError(t, err)
+	assert.WithinDuration(t, time.Now(), after.ModTime(), time.Minute)
+	// The data file's mtime is the cache key and must not move.
+	dataAfter, err := os.Stat(path)
+	assert.NoError(t, err)
+	assert.True(t, dataAfter.ModTime().Equal(dataBefore.ModTime()))
 }
 
 // The cache file must never be observable at any size other than 4 bytes,

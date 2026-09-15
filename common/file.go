@@ -335,6 +335,11 @@ func readCRC32cCache(cacheFileName string) (uint32, bool) {
 	if fi.Mode().IsRegular() && fi.Size() == crc32cCacheSize {
 		b := make([]byte, crc32cCacheSize)
 		if _, err = io.ReadFull(cf, b); err == nil {
+			// touch on hit, so an mtime sweep of the cache dir measures time since last use
+			now := time.Now()
+			if err := os.Chtimes(cacheFileName, now, now); err != nil {
+				logger.Debug(module, "touch crc32c cachefile [%s] failed with %s", cacheFileName, err)
+			}
 			return binary.LittleEndian.Uint32(b), true
 		}
 		logger.Debug(module, "read crc32c cachefile [%s] failed with %s", cacheFileName, err)
