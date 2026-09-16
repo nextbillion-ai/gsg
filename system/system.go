@@ -81,10 +81,11 @@ func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
 }
 
 type RunContext struct {
-	Bars      *bar.Container
-	Pool      *worker.Pool
-	ChunkSize int64
-	GentleIO  bool
+	Bars        *bar.Container
+	Pool        *worker.Pool
+	Concurrency int // workers the pool runs with; 1 unless -m is given
+	ChunkSize   int64
+	GentleIO    bool
 }
 
 type DiskUsage struct {
