@@ -4,11 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -24,6 +30,7 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	htransport "google.golang.org/api/transport/http"
 )
 
 const (
@@ -43,6 +50,8 @@ func ConfigPath() string {
 }
 
 type GCS struct {
+	composeMu sync.Mutex
+	composeOK map[string]bool
 	// mu guards the lazy client. One GCS is registered for the whole process
 	// and every worker goroutine calls Init, so the check-then-set this
 	// replaces raced: two goroutines could both find a nil client and both
@@ -102,7 +111,34 @@ func (g *GCS) Init(_ ...string) error {
 		logger.Info(module, "gcs: failed in loading [%s=%s] with error: %s", googleApplicationCredentialsEnv, path, err)
 		return err
 	}
-	g.client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(path))
+	// Over HTTP/2 every chunk of a transfer is multiplexed onto one TCP connection, which
+	// caps a gsg process at roughly 230 MB/s. HTTP/1.1 with a keep-alive pool spreads the
+	// chunks over as many connections as there are workers. GSG_HTTP2=1 keeps HTTP/2.
+	var clientOpts []option.ClientOption
+	if os.Getenv("GSG_HTTP2") != "1" {
+		base := &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: time.Second,
+			MaxIdleConns:          1024,
+			MaxIdleConnsPerHost:   1024,
+			ForceAttemptHTTP2:     false,
+			// no h2 in ALPN either, or the server still negotiates HTTP/2
+			TLSClientConfig: &tls.Config{NextProtos: []string{"http/1.1"}},
+			TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{},
+		}
+		rt, terr := htransport.NewTransport(context.Background(), base, option.WithCredentialsFile(path), option.WithScopes(storage.ScopeFullControl))
+		if terr != nil {
+			logger.Info(module, "get transport failed with %s", terr)
+			return terr
+		}
+		clientOpts = []option.ClientOption{option.WithHTTPClient(&http.Client{Transport: rt})}
+	} else {
+		clientOpts = []option.ClientOption{option.WithCredentialsFile(path)}
+	}
+	g.client, err = storage.NewClient(context.Background(), clientOpts...)
 	if err != nil {
 		logger.Info(module, "get client failed with %s", err)
 		return err
@@ -626,6 +662,10 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		logger.Info(module, "cannot measure %s, so the upload cannot be verified: %s", srcFile, cerr)
 		return cerr
 	}
+	if ctx.Concurrency > 1 && size > compositeMinSize && g.bucketAllowsCompose(bucket) {
+		abort()
+		return g.uploadComposite(f, size, crc, modTime, bucket, object, pb, ctx)
+	}
 	wc.CRC32C = crc
 	wc.SendCRC32C = true
 	if _, err = io.Copy(io.MultiWriter(wc, pb), f); err != nil {
@@ -640,6 +680,171 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		return err
 	}
 	return nil
+}
+
+// A resumable upload is one sequential stream and moves about 60 MB/s however
+// large its chunks are. With -m, files above compositeMinSize go as parallel
+// parts that GCS composes into the object. The service computes the CRC32C of
+// the composition and, given the local file's, refuses the compose when they
+// differ, so the destination is only ever replaced by a verified object.
+const compositeMinSize = 256 << 20
+const compositeMaxParts = 32
+
+// bucketAllowsCompose is false when a retention policy would keep the parts from
+// being deleted afterwards. A bucket that cannot be inspected counts as allowed;
+// parts left behind are then reported by the upload.
+func (g *GCS) bucketAllowsCompose(bucket string) bool {
+	g.composeMu.Lock()
+	defer g.composeMu.Unlock()
+	if ok, seen := g.composeOK[bucket]; seen {
+		return ok
+	}
+	ok := true
+	if attrs, err := g.client.Bucket(bucket).Attrs(context.Background()); err == nil && attrs.RetentionPolicy != nil {
+		logger.Info(module, "bucket %s has a retention policy, uploading %s as one stream", bucket, "large objects")
+		ok = false
+	}
+	if g.composeOK == nil {
+		g.composeOK = map[string]bool{}
+	}
+	g.composeOK[bucket] = ok
+	return ok
+}
+
+func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.Time, bucket, object string, pb *bar.ProgressBar, ctx system.RunContext) error {
+	parts := int(math.Ceil(float64(size) / float64(compositeMinSize)))
+	if parts > compositeMaxParts {
+		parts = compositeMaxParts
+	}
+	partSize := int64(math.Ceil(float64(size) / float64(parts)))
+	bkt := g.client.Bucket(bucket)
+	// parts are named per upload and referenced by the generation each one was
+	// written as, so two uploads of the same object never touch each other's parts
+	var uid [8]byte
+	if _, err := rand.Read(uid[:]); err != nil {
+		return err
+	}
+	prefix := fmt.Sprintf("%s.gsg-part-%s-", object, hex.EncodeToString(uid[:]))
+	handles := make([]*storage.ObjectHandle, parts)
+	errs := make([]error, parts)
+	uploadCtx, abort := context.WithCancel(context.Background())
+	defer abort()
+	var wg sync.WaitGroup
+	for i := 0; i < parts; i++ {
+		i := i
+		wg.Add(1)
+		ctx.Pool.AddWithDepth(1, func() {
+			defer wg.Done()
+			off := int64(i) * partSize
+			length := partSize
+			if off+length > size {
+				length = size - off
+			}
+			name := fmt.Sprintf("%s%02d", prefix, i)
+			wc := bkt.Object(name).NewWriter(uploadCtx)
+			if _, err := io.Copy(io.MultiWriter(wc, pb), io.NewSectionReader(f, off, length)); err != nil {
+				errs[i] = err
+				abort()
+				return
+			}
+			if err := wc.Close(); err != nil {
+				errs[i] = err
+				return
+			}
+			handles[i] = bkt.Object(name).Generation(wc.Attrs().Generation)
+		})
+	}
+	wg.Wait()
+	cleanup := func() []string {
+		return deleteParts(handles, func(h *storage.ObjectHandle) error {
+			return h.Delete(context.Background())
+		})
+	}
+	for i, err := range errs {
+		if err != nil {
+			logger.Info(module, "upload object failed on part %d with %s", i, err)
+			if left := cleanup(); len(left) > 0 {
+				logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
+			}
+			return err
+		}
+	}
+	composer := bkt.Object(object).ComposerFrom(handles...)
+	composer.Metadata = map[string]string{
+		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
+	}
+	// a single-stream upload leaves ContentType to the service, which sniffs the
+	// first bytes; a composition gets no such detection
+	composer.ContentType = sniffContentType(f)
+	composer.CRC32C = crc
+	composer.SendCRC32C = true
+	_, err := composer.Run(context.Background())
+	left := cleanup()
+	if len(left) > 0 {
+		// the object is already committed and verified: a retry of the upload would
+		// only leave another set of parts, so this is reported, not returned
+		logger.Info(module, "warning: upload parts of %s could not be deleted: %v", object, left)
+	}
+	if err != nil {
+		logger.Info(module, "upload object failed when composing with %s", err)
+		return err
+	}
+	return nil
+}
+
+// deleteParts deletes the parts concurrently and returns the names of those still
+// there. Only errors that may pass (408, 429, 5xx, no status at all) are tried again,
+// with a wait between attempts; a refusal such as 403 or a hold is final at once.
+var partDeleteBackoff = time.Second
+var partDeleteSleep = time.Sleep
+
+const partDeleteAttempts = 3
+
+func transientDeleteError(err error) bool {
+	var ge *googleapi.Error
+	if errors.As(err, &ge) {
+		return ge.Code == 408 || ge.Code == 429 || ge.Code >= 500
+	}
+	return true
+}
+
+func deleteParts(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []string {
+	failed := make([]bool, len(handles))
+	var wg sync.WaitGroup
+	for i, h := range handles {
+		if h == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, h *storage.ObjectHandle) {
+			defer wg.Done()
+			for attempt := 1; ; attempt++ {
+				err := del(h)
+				if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
+					return
+				}
+				if attempt == partDeleteAttempts || !transientDeleteError(err) {
+					failed[i] = true
+					return
+				}
+				partDeleteSleep(time.Duration(attempt) * partDeleteBackoff)
+			}
+		}(i, h)
+	}
+	wg.Wait()
+	var left []string
+	for i, h := range handles {
+		if failed[i] {
+			left = append(left, h.ObjectName())
+		}
+	}
+	return left
+}
+
+func sniffContentType(f *os.File) string {
+	head := make([]byte, 512)
+	n, _ := f.ReadAt(head, 0)
+	return http.DetectContentType(head[:n])
 }
 
 // MoveObject moves an object

@@ -55,7 +55,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
 		if e := common.DoWithRetrySimple(func() error {
-			return fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
+			return fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Concurrency: getMultiThread(), Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
 		}); e != nil {
 			common.ExitWith(e)
 		}
@@ -94,7 +94,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 		pool.Add(func() {
 			if e := common.DoWithRetrySimple(func() error {
-				return dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, ChunkSize: chunkSize, GentleIO: gentleIO})
+				return dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 			}); e != nil {
 				common.ExitWith(e)
 			}

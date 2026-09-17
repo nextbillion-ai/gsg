@@ -5,12 +5,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/nextbillion-ai/gsg/common"
 
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/api/googleapi"
 )
 
 func TestConfigPath(t *testing.T) {
@@ -143,4 +146,65 @@ func TestCRC32CToSendIgnoresAStaleModificationTime(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, crc32.Checksum(changed, crc32.MakeTable(crc32.Castagnoli)), crc,
 		"the checksum must describe the current bytes, whatever the mtime says")
+}
+
+func TestDeletePartsRetriesOnlyTransientErrorsAndReportsWhatIsLeft(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
+	sleeps := map[time.Duration]int{}
+	partDeleteSleep = func(d time.Duration) {
+		mu.Lock()
+		sleeps[d]++
+		mu.Unlock()
+	}
+	defer func() { partDeleteSleep = time.Sleep }()
+
+	c := &storage.Client{}
+	flaky := c.Bucket("b").Object("flaky")     // 503 twice, then deleted
+	gone := c.Bucket("b").Object("gone")       // already deleted
+	refused := c.Bucket("b").Object("refused") // 403: final at once
+	down := c.Bucket("b").Object("down")       // 503 every time
+	left := deleteParts([]*storage.ObjectHandle{flaky, nil, gone, refused, down}, func(h *storage.ObjectHandle) error {
+		mu.Lock()
+		calls[h.ObjectName()]++
+		n := calls[h.ObjectName()]
+		mu.Unlock()
+		switch h.ObjectName() {
+		case "flaky":
+			if n < 3 {
+				return &googleapi.Error{Code: 503}
+			}
+			return nil
+		case "gone":
+			return storage.ErrObjectNotExist
+		case "refused":
+			return &googleapi.Error{Code: 403}
+		default:
+			return &googleapi.Error{Code: 503}
+		}
+	})
+	assert.Equal(t, []string{"refused", "down"}, left)
+	assert.Equal(t, 3, calls["flaky"])
+	assert.Equal(t, 1, calls["gone"])
+	assert.Equal(t, 1, calls["refused"])
+	assert.Equal(t, 3, calls["down"])
+	// waits happen between attempts only: two parts made three attempts each
+	assert.Equal(t, map[time.Duration]int{partDeleteBackoff: 2, 2 * partDeleteBackoff: 2}, sleeps)
+}
+
+func TestSniffContentTypeMatchesTheServiceDetection(t *testing.T) {
+	dir := t.TempDir()
+	text := filepath.Join(dir, "a.csv")
+	assert.NoError(t, os.WriteFile(text, []byte("1,2,30\n3,4,40\n"), 0o644))
+	bin := filepath.Join(dir, "a.bin")
+	assert.NoError(t, os.WriteFile(bin, []byte{0x00, 0x01, 0xff, 0x00, 0x7f}, 0o644))
+	ft, _ := os.Open(text)
+	defer ft.Close()
+	fb, _ := os.Open(bin)
+	defer fb.Close()
+	assert.Equal(t, "text/plain; charset=utf-8", sniffContentType(ft))
+	assert.Equal(t, "application/octet-stream", sniffContentType(fb))
+	// the upload reads the file by offset, so sniffing must not move it
+	pos, _ := ft.Seek(0, io.SeekCurrent)
+	assert.Equal(t, int64(0), pos)
 }
