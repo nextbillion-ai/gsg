@@ -13,7 +13,7 @@ type Pool struct {
 	enableLog bool
 	size      int
 	jcs       []chan func()
-	wg        *sync.WaitGroup
+	wgs       []*sync.WaitGroup
 }
 
 func (p *Pool) log(s string, vs ...any) {
@@ -34,20 +34,21 @@ func (p *Pool) AddWithDepth(depth int, job func()) {
 // Run runs all jobs with worker pool
 func (p *Pool) Run() {
 	p.log("starting workers with %d workers", p.size)
-	for i := 0; i < p.size; i++ {
-		p.wg.Add(len(p.jcs))
-		for _, jc := range p.jcs {
-			go p.worker(i, jc, p.wg)
+	for depth, jc := range p.jcs {
+		p.wgs[depth].Add(p.size)
+		for i := 0; i < p.size; i++ {
+			go p.worker(i, jc, p.wgs[depth])
 		}
 	}
 }
 
-// Close closes all workers
+// Close closes the depths in order, each one only after the workers of the
+// depth before it have finished: a job still running there may submit deeper.
 func (p *Pool) Close() {
-	for _, jc := range p.jcs {
+	for depth, jc := range p.jcs {
 		close(jc)
+		p.wgs[depth].Wait()
 	}
-	p.wg.Wait()
 	p.log("finished all the jobs")
 }
 
@@ -74,11 +75,12 @@ func NewWithDepth(size, depth int, enableLog bool) *Pool {
 	p := &Pool{
 		enableLog: enableLog,
 		size:      size,
-		wg:        new(sync.WaitGroup),
 	}
 	p.jcs = make([]chan func(), depth)
+	p.wgs = make([]*sync.WaitGroup, depth)
 	for index := range p.jcs {
 		p.jcs[index] = make(chan func())
+		p.wgs[index] = new(sync.WaitGroup)
 	}
 	p.log("created pool with size %d", size)
 	return p

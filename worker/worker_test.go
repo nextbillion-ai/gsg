@@ -1,7 +1,10 @@
 package worker
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -81,4 +84,31 @@ func TestPool(t *testing.T) {
 	assert.Equal(t, 1, res[0])
 	assert.Equal(t, 2, res[1])
 	assert.Equal(t, 3, res[2])
+}
+
+// A job may still be submitting to the next depth when Close is called, as an
+// upload does with its parts once rsync has queued the last file.
+func TestPoolCloseWaitsForJobsThatSubmitDeeper(t *testing.T) {
+	for _, size := range []int{1, 2, 8} {
+		pool := New(size, false)
+		pool.Run()
+		var done int32
+		const files, parts = 5, 16
+		for f := 0; f < files; f++ {
+			pool.Add(func() {
+				time.Sleep(20 * time.Millisecond)
+				var wg sync.WaitGroup
+				for i := 0; i < parts; i++ {
+					wg.Add(1)
+					pool.AddWithDepth(1, func() {
+						defer wg.Done()
+						atomic.AddInt32(&done, 1)
+					})
+				}
+				wg.Wait()
+			})
+		}
+		pool.Close()
+		assert.Equal(t, int32(files*parts), atomic.LoadInt32(&done), "pool size %d", size)
+	}
 }
