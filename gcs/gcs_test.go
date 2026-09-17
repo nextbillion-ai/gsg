@@ -1,6 +1,7 @@
 package gcs
 
 import (
+	"bytes"
 	"hash/crc32"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/nextbillion-ai/gsg/common"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/api/googleapi"
 )
 
@@ -207,4 +209,83 @@ func TestSniffContentTypeMatchesTheServiceDetection(t *testing.T) {
 	// the upload reads the file by offset, so sniffing must not move it
 	pos, _ := ft.Seek(0, io.SeekCurrent)
 	assert.Equal(t, int64(0), pos)
+}
+
+func gentleAttrs(content []byte) *storage.ObjectAttrs {
+	return &storage.ObjectAttrs{Size: int64(len(content)), CRC32C: crc32.Checksum(content, common.Castagnoli)}
+}
+
+func gentleSums(content []byte, cuts ...int) ([]uint32, []int64) {
+	var sums []uint32
+	var lens []int64
+	start := 0
+	for _, end := range append(cuts, len(content)) {
+		sums = append(sums, crc32.Checksum(content[start:end], common.Castagnoli))
+		lens = append(lens, int64(end-start))
+		start = end
+	}
+	return sums, lens
+}
+
+func TestVerifyGentleDownloadAcceptsChunkSumsThatAddUpToTheObject(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<16)
+	path := filepath.Join(t.TempDir(), "input.osrm.geometry")
+	require.NoError(t, os.WriteFile(path, content, 0644))
+
+	for _, cuts := range [][]int{nil, {1}, {1 << 19, 3 << 18}} {
+		sums, lens := gentleSums(content, cuts...)
+		assert.NoError(t, verifyGentleDownload(true, path, "b", "o", gentleAttrs(content), sums, lens), "cuts %v", cuts)
+	}
+
+	// the sum is now served from the cache: the content below no longer adds up to it
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("x"), len(content)), 0644))
+	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+	assert.Equal(t, gentleAttrs(content).CRC32C, common.GetFileCRC32C(path))
+}
+
+func TestVerifyGentleDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<12)
+	path := filepath.Join(t.TempDir(), "input.osrm.geometry")
+	require.NoError(t, os.WriteFile(path, content, 0644))
+	attrs := gentleAttrs(content)
+
+	sums, lens := gentleSums(content, 1000)
+	sums[1] ^= 1
+	assert.Error(t, verifyGentleDownload(true, path, "b", "o", attrs, sums, lens))
+	assert.NoError(t, verifyGentleDownload(false, path, "b", "o", attrs, sums, lens), "without -v a mismatch is reported, not fatal")
+
+	sums, lens = gentleSums(content[:len(content)-1], 1000)
+	assert.Error(t, verifyGentleDownload(true, path, "b", "o", attrs, sums, lens))
+}
+
+func TestVerifyGentleDownloadOfAnEmptyObject(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty")
+	require.NoError(t, os.WriteFile(path, nil, 0644))
+	assert.NoError(t, verifyGentleDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0}))
+}
+
+func TestAdviseRangeCoversEveryWindowTwiceAndNoMore(t *testing.T) {
+	const chunk = 95*1024*1024 + 123
+	asked := make([]int, chunk/(1<<20)+1)
+	var start, previous, total int64
+	for start < chunk {
+		length := int64(gentleWindow)
+		if start+length > chunk {
+			length = chunk - start
+		}
+		offset, n := adviseRange(start, length, previous)
+		require.True(t, n > 0 && offset >= 0 && offset+n == start+length, "window at %d: [%d,+%d)", start, offset, n)
+		for mb := offset >> 20; mb <= (offset+n-1)>>20; mb++ {
+			asked[mb]++
+		}
+		total += n
+		start, previous = start+length, length
+	}
+	assert.LessOrEqual(t, total, int64(2*chunk), "requests stay linear in the chunk")
+	for mb, times := range asked[:len(asked)-1] {
+		assert.GreaterOrEqual(t, times, 1, "MB %d is never asked for", mb)
+		assert.LessOrEqual(t, times, 3, "MB %d is asked for again and again", mb)
+	}
 }

@@ -388,9 +388,13 @@ func (g *GCS) Download(
 	var wg sync.WaitGroup
 	var once sync.Once
 	dstFileTemp := common.GetTempFile(dstFile)
+	// gentle mode sums each chunk from the file while its pages are still cached
+	chunkSums := make([]uint32, chunkNumber)
+	chunkLens := make([]int64, chunkNumber)
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
+		i := i
 		startByte := int64(i) * chunkSize
 		length := chunkSize
 		if i == chunkNumber-1 {
@@ -443,6 +447,34 @@ func (g *GCS) Download(
 					buf := make([]byte, 1*1024*1024) // 1MB buffer
 					totalWritten := int64(0)
 
+					// Each window is summed from the file, at its offset, while its pages are
+					// still cached and right before the kernel is asked to drop them: what is
+					// verified is what landed in the file, and the whole file does not have to
+					// be read back from disk afterwards.
+					verifier, verr := os.Open(dstFileTemp)
+					if verr != nil {
+						logger.Info(module, "download object failed when open for verify: %s", verr)
+						common.Exit()
+					}
+					defer func() { _ = verifier.Close() }()
+					sum := crc32.New(common.Castagnoli)
+					summed := int64(0)
+					previous := int64(0)
+					closeWindow := func() {
+						windowStart, windowLen := summed, totalWritten-summed
+						if windowLen == 0 {
+							return
+						}
+						if _, err := io.CopyBuffer(sum, io.NewSectionReader(verifier, startByte+windowStart, windowLen), buf); err != nil {
+							logger.Info(module, "download object failed when read back for verify: %s", err)
+							common.Exit()
+						}
+						summed = totalWritten
+						offset, length := adviseRange(windowStart, windowLen, previous)
+						common.FadviseWriteDontNeed(fl, startByte+offset, length)
+						previous = windowLen
+					}
+
 					for {
 						n, readErr := rc.Read(buf)
 						if n > 0 {
@@ -456,8 +488,8 @@ func (g *GCS) Download(
 							totalWritten += int64(n)
 
 							// Every 10MB, pause and drop cache
-							if totalWritten%(10*1024*1024) == 0 {
-								common.FadviseWriteDontNeed(fl, startByte, totalWritten)
+							if totalWritten-summed >= gentleWindow {
+								closeWindow()
 								time.Sleep(time.Millisecond * 20) // 20ms pause every 10MB
 							}
 						}
@@ -470,8 +502,9 @@ func (g *GCS) Download(
 						}
 					}
 
-					// Final fadvise to drop remaining data
-					common.FadviseWriteDontNeed(fl, startByte, totalWritten)
+					// the last, partial window
+					closeWindow()
+					chunkSums[i], chunkLens[i] = sum.Sum32(), totalWritten
 				} else {
 					// Fast mode: use buffered writer
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
@@ -506,8 +539,52 @@ func (g *GCS) Download(
 		return err
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
+	if ctx.GentleIO {
+		return verifyGentleDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
+	}
 	if err = g.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
 		return err
+	}
+	return nil
+}
+
+// gentleWindow is how much a gentle download writes before it sums the window
+// and asks the kernel to drop it.
+const gentleWindow = 10 * 1024 * 1024
+
+// adviseRange is what a gentle download asks the kernel to drop when it closes a
+// window: that window and the one before it. The request does not free dirty
+// pages, it only starts their writeback, so a window can go no sooner than the
+// next request; asked for alone, the file stayed in the page cache whole. Two
+// windows keep the requests linear in the chunk, where a range from the start
+// of the chunk made every request longer than the last. A window is never
+// empty: to fadvise a zero length means up to the end of the file.
+func adviseRange(windowStart, windowLen, previousLen int64) (offset, length int64) {
+	return windowStart - previousLen, previousLen + windowLen
+}
+
+// verifyGentleDownload settles a gentle download from the sums its chunks took
+// while writing. The file is not read again: gentle mode has been asking the
+// kernel to drop it from the page cache all along, so that read would come from
+// disk, as large as the file, against whatever else is reading that disk.
+func verifyGentleDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) error {
+	crc, total := uint32(0), int64(0)
+	for i := range sums {
+		crc = common.CombineCRC32C(crc, sums[i], lens[i])
+		total += lens[i]
+	}
+	if total != attrs.Size || crc != attrs.CRC32C {
+		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
+			dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
+		logger.Info(module, log)
+		if !forceChecksum {
+			return nil
+		}
+		return fmt.Errorf(log)
+	}
+	common.StoreFileCRC32C(dstFile, crc)
+	if forceChecksum {
+		logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 	}
 	return nil
 }

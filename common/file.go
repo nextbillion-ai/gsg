@@ -366,6 +366,15 @@ func writeCRC32cCache(cacheFileName string, result uint32) {
 	logger.Debug(module, "wrote crc32c cachefile : %s", cacheFileName)
 }
 
+// StoreFileCRC32C records a crc32c that was computed over the file's content
+// while it was being written, so that GetFileCRC32C does not read the file to
+// learn it. Call it once the file has its final name and modification time:
+// both are part of the key.
+func StoreFileCRC32C(path string, crc uint32) {
+	path, _ = filepath.Abs(path)
+	writeCRC32cCache(genCacheFileName(path, "-", GetFileModificationTime(path).String(), "-crc32c"), crc)
+}
+
 // GetFileCRC32C gets the crc32c of a file
 func GetFileCRC32C(path string) uint32 {
 	path, _ = filepath.Abs(path)
