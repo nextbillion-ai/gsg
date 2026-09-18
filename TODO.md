@@ -1400,3 +1400,118 @@ GSG_UAT_OCI_BUCKET2=<bucket> GSG_UAT_OCI_REGION2=us-phoenix-1 ./uat.sh oci
 
 Filed when the region-in-the-path change landed, with the cross-region cases
 written but skipped for want of a second bucket.
+
+---
+
+## 27. An upload reads the whole file an extra time to checksum it
+
+`gcs` and `oci` both compute the whole-object CRC32C in a pass of its own,
+before the pass that sends the bytes. For `oci` above the multipart threshold
+there is a third pass, because each part is read once to checksum it and again
+to send it:
+
+```go
+// oci/multipart.go
+wholeCRC, _, err := crc32cOfReader(f)                       // 54  -- whole file
+...
+io.Copy(ph, io.NewSectionReader(f, off, length))            // 124 -- part, to a hasher
+UploadPartBody: io.NopCloser(io.NewSectionReader(f, off, length)),  // 134 -- part, to the wire
+```
+
+```go
+// gcs/gcs.go
+crc, cerr := crc32cToSend(f, srcFile)                       // 737 -- whole file
+...
+io.Copy(io.MultiWriter(wc, pb), io.NewSectionReader(f, off, length))  // 822 -- part, to the wire
+```
+
+So a multipart upload reads the file three times on `oci` and twice on `gcs`.
+The two per-part reads on `oci` are deliberate and worth keeping -- the comment
+at lines 119-122 says why, and it is a good reason: a `SectionReader` per part means
+nothing is buffered and each part stays independently seekable, so the SDK can
+rewind and retry one part instead of the whole transfer. The second read is
+also usually cache-warm, since it follows the first immediately.
+
+The *first* pass is the one worth removing. It runs to completion before any
+part is sent, so by the time the parts are read its pages have been evicted:
+it is a genuine cold read of the whole file, and its only purpose is to know
+the value the service is later asked to confirm.
+
+### What it costs
+
+The pass is unpaced -- a plain `io.Copy` in both backends -- and neither
+`crc32cOfReader` nor `crc32cToSend` goes through `common.GetFileCRC32C`, so
+`common.GentleIO` does not reach it and neither does its cache. `oci` never
+reads `RunContext.GentleIO` at all, so on that backend nothing about an upload
+is paced.
+
+Measured downstream: jam-core uploads a 33GB `links.csv` and a 5.7GB
+`junctions.csv` at bake time, on the same pod whose BoltDB mmap it applies
+`MADV_RANDOM` to protect. For `links.csv` alone that is ~99GB of reads through
+the page cache where ~66GB would do; across both files, ~116GB against ~77GB.
+None of it is paced.
+
+What makes that a regression for jam-core rather than merely a cost is what it
+is replacing. jam-core does not use this repo for GCS -- it has its own client,
+whose upload is a single `io.Copy` under `FadviseSequential` with
+`FadviseDontNeed` after. So the same 33GB upload goes from one advised read to
+three unadvised ones when the bucket moves from `gs://` to `oci://`. Within
+this repo the comparison is narrower: `gcs` does two unadvised reads, `oci`
+three, and this item is the one read both have to spare.
+
+### What a fix would involve
+
+The primitive is already here. `common.CombineCRC32C` (#68) returns the CRC32C
+of A followed by B from the two sums and B's length, so the parts can be summed
+independently, in any order, and folded afterwards -- which is exactly what
+`oci/multipart.go` already computes per part at line 124 and then throws away
+once the part is committed.
+
+On `oci` the sums already exist and are discarded: keep each part's raw
+`uint32` beside its `PartNum` in the `commit` slice, which is already indexed
+by part number, fold them in order once every part is done, and drop
+`crc32cOfReader` from `uploadMultipart`.
+
+`gcs` needs one more step first, because its composite path takes no local sum
+at all -- line 822 copies to `wc` and `pb` and nothing else. The sum has to be
+computed **in that same copy**, by adding a hasher to the `MultiWriter`. Folding
+the checksums GCS returns for the parts would not do: those describe whatever
+reached the service, so in-transit corruption would agree with itself, which is
+the property #47 and #57 exist to provide. Taking the sum in a separate pass
+would not do either -- that is the read this item is about. Once the local sums
+are taken alongside the write, `crc32cToSend` can go from the composite branch.
+
+Both functions stay for the single-request paths, which genuinely need the
+value before they start.
+
+`gcs`'s download side already works this way, and for the same reason --
+`verifyGentleDownload` settles the transfer from the sums its chunks took while
+writing rather than reading the file back, because "gentle mode has been asking
+the kernel to drop it from the page cache all along, so that read would come
+from disk, as large as the file, against whatever else is reading that disk"
+(#70). That argument applies unchanged to the upload side.
+
+A second property comes free, and it removes code rather than adding it. The
+whole-file sum and the part sums are taken at different times, so a file
+rewritten in between produces parts that each validate against a whole-object
+sum that no longer describes them -- a hazard `uploadMultipart` already
+documents at lines 181-183 and has to compensate for. The compensation is
+expensive: the mismatch is only detectable *after* `CommitMultipartUpload` has
+published the object, so the backend deletes it afterwards (lines 191-200), and
+if that delete fails the wrong object stays visible where callers will read it.
+
+Folding the part sums makes the object's checksum and its bytes the same bytes
+by construction, so that window closes.
+
+**The response check and the deletion still have to stay.** They cover more
+than source mutation: `CommitMultipartUpload` can return no checksum at all, or
+one that disagrees because the assembly or the response itself was faulty, and
+the object is published before either can be seen. What folding removes is one
+cause of a mismatch, not the need to handle one.
+
+**Related:** `oci` ignoring `RunContext.GentleIO` is a separate, smaller fix --
+`gcs/gcs.go:442` and `s3/s3.go:784` have the pattern to copy. It compounds this
+one, since the passes that remain after this item are unpaced too.
+
+Filed from jam-core's oci integration (nextbillion-ai/jam-core#104), where the
+upload path was the one place gentle I/O could not be preserved.
