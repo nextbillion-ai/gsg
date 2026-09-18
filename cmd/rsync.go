@@ -54,11 +54,17 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	}
 	logger.Info(module, "Starting synchronization...")
 	for _, fo := range copyList {
-		if e := common.DoWithRetrySimple(func() error {
-			return fo.System.Download(fo.Bucket, fo.Prefix, common.JoinPath(dst.Prefix, fo.Attributes.RelativePath), forceChecksum, system.RunContext{Pool: pool, Concurrency: getMultiThread(), Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
-		}); e != nil {
-			common.ExitWith(e)
-		}
+		sys := fo.System
+		bucket := fo.Bucket
+		prefix := fo.Prefix
+		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+		pool.Add(func() {
+			if e := common.DoWithRetrySimple(func() error {
+				return sys.Download(bucket, prefix, dstPath, forceChecksum, system.RunContext{Pool: pool, Concurrency: getMultiThread(), Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
+			}); e != nil {
+				common.ExitWith(e)
+			}
+		})
 	}
 	if isDel {
 		for _, fo := range deleteList {
