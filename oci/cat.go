@@ -87,14 +87,41 @@ func (o *OCI) IsDirectory(bucket, prefix string) (bool, error) {
 // large object is not held in memory in its entirety just to be copied
 // somewhere else. The caller closes it.
 func (o *OCI) GetObjectReader(bucket, prefix string) (io.ReadCloser, error) {
+	return o.getObjectReader(bucket, prefix, 0, -1)
+}
+
+// GetObjectRangeReader streams part of an object: length bytes from offset, or
+// everything from offset on when length is negative.
+//
+// Download fetches an object as parallel ranges rather than one stream, and
+// this is the same capability offered to a library caller, which could not
+// otherwise assemble it -- GetObjectReader takes no offset, so anything
+// wanting a part of an object had to read up to it and throw the rest away.
+//
+// A length of zero yields nothing, and does so without asking the service.
+// Passing it through would be worse than useless: an absent range header means
+// "the whole object", which is exactly what the unranged reader relies on it
+// meaning, so a caller asking for no bytes would be handed all of them.
+func (o *OCI) GetObjectRangeReader(bucket, prefix string, offset, length int64) (io.ReadCloser, error) {
+	if length == 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	return o.getObjectReader(bucket, prefix, offset, length)
+}
+
+func (o *OCI) getObjectReader(bucket, prefix string, offset, length int64) (io.ReadCloser, error) {
 	ref, err := o.resolve(bucket)
 	if err != nil {
 		return nil, err
 	}
 	c, ns, name := ref.c, ref.ns, ref.name
-	r, err := c.GetObject(context.Background(), objectstorage.GetObjectRequest{
+	req := objectstorage.GetObjectRequest{
 		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
-	})
+	}
+	if header, ranged := rangeHeader(offset, length); ranged {
+		req.Range = &header
+	}
+	r, err := c.GetObject(context.Background(), req)
 	if err != nil {
 		logger.Info(module, "cannot read oci://%s/%s: %s", name, prefix, err)
 		return nil, err
