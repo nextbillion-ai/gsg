@@ -639,15 +639,22 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	}
 	// open source file
 	var f *os.File
-	if f, err = os.Open(srcFile); err != nil {
+	if f, err = openSource(srcFile); err != nil {
 		logger.Info(module, "upload object failed when open file with %s", err)
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	// Everything below is decided from this one stat of the opened file: the
+	// bytes come from the handle, and a stat of the path can describe a file
+	// that has replaced it since the open.
+	before, err := f.Stat()
+	if err != nil {
+		logger.Info(module, "upload object failed when measuring file with %s", err)
+		return err
+	}
+	size, modTime := before.Size(), before.ModTime()
 
 	// progress bar
-	size := common.GetFileSize(srcFile)
-	modTime := common.GetFileModificationTime(srcFile)
 	pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
 
 	// upload file
@@ -668,12 +675,6 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	// value before it starts, and pays a pass of its own for it.
 	if ctx.Concurrency > 1 && size > compositeMinSize && g.bucketAllowsCompose(bucket) {
 		abort()
-		// the stat the parts are cut from, and the file is compared with after them
-		before, serr := f.Stat()
-		if serr != nil {
-			logger.Info(module, "cannot measure %s: %s", srcFile, serr)
-			return serr
-		}
 		return g.uploadComposite(f, before, modTime, bucket, object, pb, ctx)
 	}
 
@@ -887,6 +888,9 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 	}
 	return nil
 }
+
+// openSource is os.Open; a test replaces the path the moment it is opened
+var openSource = os.Open
 
 // partFile opens the file f has open once more, for one part to read through.
 // The kernel keeps readahead state per descriptor: parts interleaved on one

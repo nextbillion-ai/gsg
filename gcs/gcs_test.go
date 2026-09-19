@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -589,6 +591,7 @@ type fakeComposite struct {
 	sessions map[string]string
 	composed []string // the crc32c each compose was asked to confirm
 	deleted  []string
+	mtimes   []string // the goog-reserved-file-mtime of each single-stream upload
 	onLast   func(part string)
 }
 
@@ -606,6 +609,22 @@ func (fc *fakeComposite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fc.sessions[id] = meta.Name
 		fc.mu.Unlock()
 		w.Header().Set("Location", "http://"+r.Host+"/session?id="+id)
+	case q.Get("uploadType") == "multipart":
+		_, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		part, err := multipart.NewReader(r.Body, params["boundary"]).NextPart()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var meta struct {
+			Name     string            `json:"name"`
+			Metadata map[string]string `json:"metadata"`
+		}
+		_ = json.NewDecoder(part).Decode(&meta)
+		fc.mu.Lock()
+		fc.mtimes = append(fc.mtimes, meta.Metadata["goog-reserved-file-mtime"])
+		fc.mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"bucket":"b","name":%q,"generation":"1"}`, meta.Name)
 	case r.URL.Path == "/session":
 		_, _ = io.Copy(io.Discard, r.Body)
 		fc.mu.Lock()
@@ -709,4 +728,47 @@ func TestUploadCompositeRefusesAFileRewrittenUnderItsParts(t *testing.T) {
 	assert.ErrorContains(t, err, "changed while its parts were being uploaded")
 	assert.Empty(t, fc.composed, "nothing is composed")
 	assert.Len(t, fc.deleted, 2, "both parts are deleted")
+}
+
+// Upload reads the handle it opened, so everything it decides has to come from
+// that handle too. Here the path is replaced the moment it is opened: an empty
+// file by one large enough for parts. Stats of the path sent the empty handle
+// down the composite branch, where it made zero parts and the compose failed,
+// and would have labelled its bytes with the replacement's mtime.
+func TestUploadDecidesFromTheFileItOpened(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.csv")
+	require.NoError(t, os.WriteFile(src, nil, 0600))
+	opened := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	require.NoError(t, os.Chtimes(src, opened, opened))
+
+	openSource = func(name string) (*os.File, error) {
+		f, err := os.Open(name)
+		if err != nil {
+			return nil, err
+		}
+		big := filepath.Join(dir, "big.csv")
+		require.NoError(t, os.WriteFile(big, nil, 0600))
+		require.NoError(t, os.Truncate(big, compositeMinSize+1))
+		require.NoError(t, os.Rename(big, name))
+		return f, nil
+	}
+	defer func() { openSource = os.Open }()
+
+	fc := &fakeComposite{sessions: map[string]string{}}
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	pool := worker.New(4, false)
+	pool.Run()
+	defer pool.Close()
+	bars, err := bar.New()
+	require.NoError(t, err)
+
+	g := &GCS{client: client}
+	require.NoError(t, g.Upload(src, "b", "o", system.RunContext{Pool: pool, Concurrency: 4, Bars: bars}),
+		"the opened file is empty: one stream")
+	assert.Empty(t, fc.composed)
+	assert.Equal(t, []string{strconv.FormatInt(opened.UnixNano(), 10)}, fc.mtimes, "the opened file's mtime")
 }
