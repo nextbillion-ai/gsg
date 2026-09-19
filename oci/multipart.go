@@ -147,8 +147,27 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 			// each part stays independently seekable, so the SDK can rewind
 			// and retry one part without the whole transfer restarting.
 			ph := crc32.New(tbl)
-			if _, cerr := io.Copy(ph, io.NewSectionReader(f, off, length)); cerr != nil {
+			read, cerr := io.Copy(ph, io.NewSectionReader(f, off, length))
+			if cerr != nil {
 				errs[i] = fmt.Errorf("oci: cannot read part %d of %s: %w", num, f.Name(), cerr)
+				return
+			}
+			// A short read means the file was truncated under us: a section
+			// reader past the new end simply stops, without an error. This is
+			// here so that lens[i] below cannot record a length that was never
+			// hashed, which would fold into the checksum of an object nobody
+			// uploaded.
+			//
+			// It is not what usually reports a truncation, and the comment
+			// should not pretend otherwise. Measured against the bucket: a
+			// file halved two seconds into a 200 MiB upload had already been
+			// hashed by then, and what failed was the body, one layer down --
+			// "http: ContentLength=134217728 with Body length 104857600". The
+			// hash read only sees it when the truncation lands in the moment
+			// between this read and the send.
+			if read != length {
+				errs[i] = fmt.Errorf("oci: part %d of %s is short: read %d of %d bytes, so the file was truncated while it was being uploaded",
+					num, f.Name(), read, length)
 				return
 			}
 			partCRC := ph.Sum32()
