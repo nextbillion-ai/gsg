@@ -3,6 +3,8 @@ package common
 import (
 	"bytes"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -52,13 +54,13 @@ func TestGentleSectionReadsItsOwnBytes(t *testing.T) {
 	const size = 3*GentleWindow + 777
 	f, content := sectionFixture(t, size)
 
-	for _, gentle := range []bool{false, true} {
+	for _, gentle := range []Gentle{{}, {Pause: true, Drop: true}} {
 		for _, span := range [][2]int64{{0, size}, {0, GentleWindow}, {GentleWindow + 5, 2 * GentleWindow}, {size - 10, 10}} {
 			off, length := span[0], span[1]
 			g := NewGentleSection(f, off, length, gentle, nil)
 			got, err := io.ReadAll(g)
 			require.NoError(t, err)
-			assert.Equal(t, content[off:off+length], got, "gentle=%v off=%d len=%d", gentle, off, length)
+			assert.Equal(t, content[off:off+length], got, "gentle=%+v off=%d len=%d", gentle, off, length)
 			assert.Equal(t, length, g.Size())
 		}
 	}
@@ -69,7 +71,7 @@ func TestGentleSectionReadsItsOwnBytes(t *testing.T) {
 func TestGentleSectionPacesNothingWhenNotAskedTo(t *testing.T) {
 	slept, dropped := withRecordedReadPacing(t)
 	f, _ := sectionFixture(t, 3*GentleWindow)
-	_, err := io.Copy(io.Discard, NewGentleSection(f, 0, 3*GentleWindow, false, nil))
+	_, err := io.Copy(io.Discard, NewGentleSection(f, 0, 3*GentleWindow, Gentle{}, nil))
 	require.NoError(t, err)
 	assert.Empty(t, *slept)
 	assert.Empty(t, *dropped)
@@ -83,7 +85,7 @@ func TestGentleSectionDropsEveryByteItReadsAndPacesThem(t *testing.T) {
 	slept, dropped := withRecordedReadPacing(t)
 	f, _ := sectionFixture(t, off+size)
 
-	g := NewGentleSection(f, off, size, true, nil)
+	g := NewGentleSection(f, off, size, Gentle{Pause: true, Drop: true}, nil)
 	_, err := io.Copy(io.Discard, g)
 	require.NoError(t, err)
 
@@ -111,7 +113,7 @@ func TestGentleSectionSeeksAndWindsTheBarBack(t *testing.T) {
 	const size = 2 * GentleWindow
 	f, content := sectionFixture(t, size)
 	bar := &countingBar{}
-	g := NewGentleSection(f, 0, size, true, bar)
+	g := NewGentleSection(f, 0, size, Gentle{Pause: true, Drop: true}, bar)
 
 	var _ io.ReadSeeker = g // the SDK reflects for exactly this
 
@@ -140,7 +142,7 @@ func TestGentleSectionDropsAgainAfterARewind(t *testing.T) {
 	_, dropped := withRecordedReadPacing(t)
 	f, _ := sectionFixture(t, size)
 
-	g := NewGentleSection(f, 0, size, true, nil)
+	g := NewGentleSection(f, 0, size, Gentle{Pause: true, Drop: true}, nil)
 	_, err := io.Copy(io.Discard, g)
 	require.NoError(t, err)
 	first := len(*dropped)
@@ -165,7 +167,7 @@ func TestGentleSectionDoesNotDependOnTheReadSize(t *testing.T) {
 	slept, dropped := withRecordedReadPacing(t)
 	f, content := sectionFixture(t, size)
 
-	g := NewGentleSection(f, 0, size, true, nil)
+	g := NewGentleSection(f, 0, size, Gentle{Pause: true, Drop: true}, nil)
 	var got bytes.Buffer
 	_, err := io.CopyBuffer(&got, struct{ io.Reader }{g}, make([]byte, 5000))
 	require.NoError(t, err)
@@ -182,4 +184,80 @@ func TestGentleSectionDoesNotDependOnTheReadSize(t *testing.T) {
 		total += d
 	}
 	assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total)
+}
+
+// Pause and Drop are separate because an upload wants them in different
+// places: the pause on the checksum read, which is the one that goes to the
+// disk, and the drop on the send, which reads the pages that read just filled.
+func TestGentlePauseAndDropAreIndependent(t *testing.T) {
+	const size = 2*GentleWindow + 11
+
+	slept, dropped := withRecordedReadPacing(t)
+	f, _ := sectionFixture(t, size)
+	_, err := io.Copy(io.Discard, NewGentleSection(f, 0, size, Gentle{Pause: true}, nil))
+	require.NoError(t, err)
+	assert.NotEmpty(t, *slept, "Pause must pace")
+	assert.Empty(t, *dropped, "Pause must not drop: the send still has to read these pages")
+
+	slept, dropped = withRecordedReadPacing(t)
+	f, _ = sectionFixture(t, size)
+	_, err = io.Copy(io.Discard, NewGentleSection(f, 0, size, Gentle{Drop: true}, nil))
+	require.NoError(t, err)
+	assert.Empty(t, *slept, "Drop must not pace: the read it follows already did")
+	var covered int64
+	for _, d := range *dropped {
+		covered += d.length
+	}
+	assert.Equal(t, int64(size), covered, "Drop must cover every byte read")
+}
+
+// The tail, through a real request rather than a mock of one, because the
+// question is what an HTTP client actually does with a known-length body.
+//
+// It was raised in review as a defect -- that net/http reads exactly
+// ContentLength bytes and never comes back for the io.EOF, leaving every
+// body's last window cached. Measured, that is not so: net/http copies
+// through an io.LimitReader and then reads once more to check for extra
+// bytes, so the EOF does arrive. This passes with the length-based release
+// removed.
+//
+// It is kept, and so is that release, because the body is handed to the SDK
+// wrapped and the wrapper decides how it is read. "The last window is dropped"
+// should not rest on a consumer making a read it does not need.
+func TestGentleSectionReleasesItsTailUnderARealRequest(t *testing.T) {
+	for _, size := range []int{GentleWindow / 4, GentleWindow + 1234, 2 * GentleWindow} {
+		slept, dropped := withRecordedReadPacing(t)
+		f, content := sectionFixture(t, size)
+
+		var got int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n, _ := io.Copy(io.Discard, r.Body)
+			got = n
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		body := NewGentleSection(f, 0, int64(size), Gentle{Pause: true, Drop: true}, nil)
+		req, err := http.NewRequest(http.MethodPut, srv.URL, io.NopCloser(body))
+		require.NoError(t, err)
+		req.ContentLength = int64(size)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		require.NoError(t, resp.Body.Close())
+		srv.Close()
+
+		require.Equal(t, int64(len(content)), got, "size %d: the server got the whole body", size)
+
+		var covered int64
+		for _, d := range *dropped {
+			covered += d.length
+		}
+		assert.Equal(t, int64(size), covered, "size %d: every byte sent must be dropped, the tail included", size)
+
+		var total time.Duration
+		for _, d := range *slept {
+			total += d
+		}
+		assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total, "size %d: paced at the usual rate", size)
+	}
 }

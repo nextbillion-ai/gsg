@@ -15,27 +15,33 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 )
 
-// crc32cOfReader hashes everything f holds and rewinds it.
+// crc32cOfReader hashes the bytes the upload is about to send.
 //
 // The point is that the checksum and the body describe the same bytes: this
 // reads the very handle the upload will read, so nothing can be substituted
 // underneath it. Reading the cached checksum for the path would be cheaper and
 // occasionally wrong, and being wrong costs the whole upload.
-func crc32cOfReader(f *os.File) (crc uint32, size int64, err error) {
+//
+// Both read the same section of the same handle, so the length cannot describe
+// one file while the checksum describes another -- and a file that shrank in
+// between gives a short read here, which is an error rather than a checksum of
+// less than was promised.
+//
+// Under gentle I/O this is the read that pauses. It is the one that goes to
+// the disk; the body that follows reads the pages it just filled, and drops
+// them.
+func crc32cOfReader(f *os.File, size int64, gentle bool) (crc uint32, n int64, err error) {
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-	// The byte count comes back with the checksum because both have to
-	// describe the same bytes. Taking the length from a stat of the path
-	// instead would let ContentLength describe one file while the body and
-	// the checksum describe another, if the path is replaced in between --
-	// the mismatch this function exists to rule out.
-	n, err := io.Copy(h, f)
+	section := common.NewGentleSection(f, 0, size, common.Gentle{Pause: gentle}, nil)
+	common.FadviseSequentialRead(f, common.Gentle{Pause: gentle})
+	read, err := io.Copy(h, section)
 	if err != nil {
 		return 0, 0, fmt.Errorf("oci: cannot read %s to checksum it: %w", f.Name(), err)
 	}
-	if _, err = f.Seek(0, io.SeekStart); err != nil {
-		return 0, 0, fmt.Errorf("oci: cannot rewind %s after checksumming it: %w", f.Name(), err)
+	if read != size {
+		return 0, 0, fmt.Errorf("oci: %s is %d bytes, not the %d it measured: it was truncated before its upload started", f.Name(), read, size)
 	}
-	return h.Sum32(), n, nil
+	return h.Sum32(), read, nil
 }
 
 // Upload stores srcFile as an object.
@@ -102,7 +108,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb, ctx.GentleIO)
 	}
 
-	crc, size, err := crc32cOfReader(f)
+	crc, size, err := crc32cOfReader(f, fileSize, ctx.GentleIO)
 	if err != nil {
 		return err
 	}
@@ -121,8 +127,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	if ctx.Bars != nil {
 		pb = ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
 	}
-	body := common.NewGentleSection(f, 0, size, ctx.GentleIO, progressWriter(pb))
-	common.FadviseSequentialRead(f, ctx.GentleIO)
+	body := common.NewGentleSection(f, 0, size, common.Gentle{Drop: ctx.GentleIO}, progressWriter(pb))
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,

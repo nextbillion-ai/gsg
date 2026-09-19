@@ -121,10 +121,10 @@ func TestTheUploadBodyStaysSeekableForTheSdksRetry(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = f.Close() }()
 
-	for _, gentle := range []bool{false, true} {
+	for _, gentle := range []common.Gentle{{}, {Pause: true, Drop: true}} {
 		body := common.NewGentleSection(f, 0, int64(len(content)), gentle, nil)
 		rsc := ocicommon.NewOCIReadSeekCloser(io.NopCloser(body))
-		assert.True(t, rsc.Seekable(), "gentle=%v: the SDK must be able to rewind the body to retry it", gentle)
+		assert.True(t, rsc.Seekable(), "gentle=%+v: the SDK must be able to rewind the body to retry it", gentle)
 	}
 
 	tee := ocicommon.NewOCIReadSeekCloser(io.NopCloser(io.TeeReader(f, io.Discard)))

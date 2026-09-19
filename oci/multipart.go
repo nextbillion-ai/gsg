@@ -147,13 +147,14 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 			// each part stays independently seekable, so the SDK can rewind
 			// and retry one part without the whole transfer restarting.
 			//
-			// This read is not paced even under --gentle-io, and that is the
-			// point of doing it here: it pulls the part into the page cache
-			// and the send that follows reads it back out again, so the part
-			// costs one trip to the disk rather than two. The send is what
-			// drops those pages afterwards.
+			// This is also the read that goes to the disk: it pulls the part
+			// into the page cache and the send that follows reads it back out
+			// again, so the part costs one trip rather than two. That is why
+			// gentle mode pauses *here* and drops on the send -- pacing the
+			// send instead would be throttling a read that comes off the
+			// cache while the cold one ran flat out, eight parts at a time.
 			ph := crc32.New(tbl)
-			read, cerr := io.Copy(ph, io.NewSectionReader(f, off, length))
+			read, cerr := io.Copy(ph, common.NewGentleSection(f, off, length, common.Gentle{Pause: gentle}, nil))
 			if cerr != nil {
 				errs[i] = fmt.Errorf("oci: cannot read part %d of %s: %w", num, f.Name(), cerr)
 				return
@@ -184,7 +185,7 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 				NamespaceName: &ns, BucketName: &bucket, ObjectName: &object,
 				UploadId: uploadID, UploadPartNum: &num,
 				ContentLength:        &length,
-				UploadPartBody:       io.NopCloser(common.NewGentleSection(f, off, length, gentle, nil)),
+				UploadPartBody:       io.NopCloser(common.NewGentleSection(f, off, length, common.Gentle{Drop: gentle}, nil)),
 				OpcChecksumAlgorithm: objectstorage.UploadPartOpcChecksumAlgorithmCrc32c,
 				OpcContentCrc32c:     &partCRC64,
 			})

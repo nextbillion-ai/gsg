@@ -120,7 +120,7 @@ assertEq "and stores the new content" \
 # an overlay so the source tree is untouched -- a gsg whose checksum is one off
 # from its body must have the object rejected, and must leave nothing behind.
 ovdir=$(mktemp -d)
-sed 's/return h.Sum32(), n, nil/return h.Sum32() + 1, n, nil/' ../oci/transfer.go > "$ovdir/transfer.go"
+sed 's/return h.Sum32(), read, nil/return h.Sum32() + 1, read, nil/' ../oci/transfer.go > "$ovdir/transfer.go"
 assertEq "the overlay actually changed the checksum" \
     "$(diff ../oci/transfer.go "$ovdir/transfer.go" | grep -c '^>')" "1"
 printf '{"Replace":{"%s/oci/transfer.go":"%s/transfer.go"}}' "$repoRoot" "$ovdir" > "$ovdir/overlay.json"

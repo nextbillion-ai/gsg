@@ -11,6 +11,27 @@ import (
 // at all.
 var gentleAdviseDropRead = FadviseReadDontNeed
 
+// Gentle says what a gentle read should do. They are separate because an
+// upload wants them in different places.
+//
+// Pause leaves the disk to whatever else is using it, and belongs on the read
+// that actually goes to the disk. Drop leaves the page cache to whatever else
+// is using it, and belongs on the last read of those bytes.
+//
+// An upload reads each range twice -- once to checksum it, because the
+// checksum is a request header and has to be known before the body is sent,
+// and once to send it. The first is the cold one, so it pauses; the second
+// comes off the cache the first one filled, so it drops. Pausing both would
+// pace at twice the intended rate, and dropping on the first would send the
+// second back to the disk for bytes that were just read.
+type Gentle struct {
+	Pause bool
+	Drop  bool
+}
+
+// On reports whether anything is being asked for.
+func (g Gentle) On() bool { return g.Pause || g.Drop }
+
 // GentleSection reads a range of a file and asks the kernel to drop the pages
 // behind it as it goes.
 //
@@ -30,25 +51,24 @@ type GentleSection struct {
 	sr       *io.SectionReader
 	off      int64
 	progress io.Writer
-	gentle   bool
+	gentle   Gentle
 
-	// pos is how far into the section the reader has got, and dropped is how
-	// far the drop requests have reached. Both are reset by a Seek, because a
-	// rewind means the whole thing is about to be read again.
-	pos     int64
-	dropped int64
-	paced   int64
+	// pos is how far into the section the reader has got, and marked is how
+	// far the pausing and dropping have reached. Both are reset by a Seek,
+	// because a rewind means the whole thing is about to be read again.
+	pos    int64
+	marked int64
 }
 
 // NewGentleSection returns a reader over length bytes of f from off.
 //
-// When gentle is false it is an ordinary section reader that counts bytes: no
+// With a zero Gentle it is an ordinary section reader that counts bytes: no
 // advice, no pauses. That is deliberate -- it means the upload path has one
 // body type rather than two, and the seekability that the SDK's retry depends
 // on does not vary with a flag.
 //
 // progress may be nil.
-func NewGentleSection(f *os.File, off, length int64, gentle bool, progress io.Writer) *GentleSection {
+func NewGentleSection(f *os.File, off, length int64, gentle Gentle, progress io.Writer) *GentleSection {
 	return &GentleSection{
 		f:        f,
 		sr:       io.NewSectionReader(f, off, length),
@@ -70,12 +90,25 @@ func (g *GentleSection) Read(p []byte) (int, error) {
 			// fail an upload.
 			_, _ = g.progress.Write(p[:n])
 		}
-		if g.gentle && g.pos-g.dropped >= GentleWindow {
+		if g.gentle.On() && g.pos-g.marked >= GentleWindow {
+			g.release()
+		}
+		// The tail, at the moment the section is used up, rather than when
+		// something gets round to reading past it.
+		//
+		// Measured, net/http does read again and does see the io.EOF below:
+		// it copies ContentLength bytes through an io.LimitReader and then
+		// reads once more to check for extra ones. So this is not fixing a
+		// bug that was there -- it removes the dependency. The body is handed
+		// to the SDK wrapped, the wrapper decides how it is read, and nothing
+		// about "the last window is dropped" should rest on a consumer making
+		// a read it does not need. A body smaller than one window is the case
+		// that would otherwise have been paced and dropped not at all.
+		if g.gentle.On() && g.pos == g.sr.Size() {
 			g.release()
 		}
 	}
-	if err == io.EOF && g.gentle {
-		// The tail, which is never a whole window.
+	if err == io.EOF && g.gentle.On() {
 		g.release()
 	}
 	return n, err
@@ -88,14 +121,17 @@ func (g *GentleSection) Read(p []byte) (int, error) {
 // on how much the caller happens to read per call: gentlePause per
 // GentleWindow, the same rate GentleWrite uses.
 func (g *GentleSection) release() {
-	if window := g.pos - g.dropped; window > 0 {
-		gentleAdviseDropRead(g.f, g.off+g.dropped, window)
-		g.dropped = g.pos
+	window := g.pos - g.marked
+	if window <= 0 {
+		return
 	}
-	if unpaced := g.pos - g.paced; unpaced > 0 {
-		gentleSleep(time.Duration(int64(gentlePause) * unpaced / GentleWindow))
-		g.paced = g.pos
+	if g.gentle.Drop {
+		gentleAdviseDropRead(g.f, g.off+g.marked, window)
 	}
+	if g.gentle.Pause {
+		gentleSleep(time.Duration(int64(gentlePause) * window / GentleWindow))
+	}
+	g.marked = g.pos
 }
 
 // Seek rewinds or moves the reader, and forgets what it had dropped.
@@ -117,14 +153,14 @@ func (g *GentleSection) Seek(offset int64, whence int) (int64, error) {
 			pw.IncrBy(at - g.pos)
 		}
 	}
-	g.pos, g.dropped, g.paced = at, at, at
+	g.pos, g.marked = at, at
 	return at, nil
 }
 
 // FadviseSequentialRead tells the kernel a whole file is about to be read
 // straight through, when the caller asked for gentle I/O.
-func FadviseSequentialRead(f *os.File, gentle bool) {
-	if gentle {
+func FadviseSequentialRead(f *os.File, gentle Gentle) {
+	if gentle.On() {
 		FadviseReadSequential(f)
 	}
 }
