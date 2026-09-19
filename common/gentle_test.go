@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -138,3 +139,111 @@ func TestGentleWriteReportsWhatItWroteBeforeFailing(t *testing.T) {
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, assert.AnError }
+
+// dropRequest is one range the transfer asked the kernel to drop.
+type dropRequest struct{ offset, length int64 }
+
+// withRecordedPacing swaps the sleep and the advice for recorders, since
+// neither is observable otherwise: the advice is a no-op on every platform but
+// linux, and a sleep leaves no trace. A gentle mode that paces nothing at all
+// is the defect these pin, and it has now been shipped twice.
+func withRecordedPacing(t *testing.T) (*[]time.Duration, *[]dropRequest) {
+	t.Helper()
+	var slept []time.Duration
+	var dropped []dropRequest
+	sleep, advise := gentleSleep, gentleAdviseDrop
+	gentleSleep = func(d time.Duration) { slept = append(slept, d) }
+	gentleAdviseDrop = func(_ *os.File, offset, length int64) {
+		dropped = append(dropped, dropRequest{offset, length})
+	}
+	t.Cleanup(func() { gentleSleep, gentleAdviseDrop = sleep, advise })
+	return &slept, &dropped
+}
+
+func gentleWriteOf(t *testing.T, size int, offset int64) (uint32, int64) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.WriteFile(path, make([]byte, offset+int64(size)), 0o644))
+	fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	defer func() { _ = fl.Close() }()
+	_, err = fl.Seek(offset, io.SeekStart)
+	require.NoError(t, err)
+	verifier, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = verifier.Close() }()
+
+	crc, n, werr := GentleWrite(fl, verifier, offset, bytes.NewReader(bytes.Repeat([]byte("z"), size)), nil)
+	require.NoError(t, werr)
+	return crc, n
+}
+
+// A call shorter than a window never completes one, so the loop's sleep never
+// fires and its single drop request only starts writeback. Left there, gentle
+// mode at a 1 MiB --chunk-size paces nothing and evicts nothing -- present,
+// and doing nothing.
+func TestGentleWriteShorterThanAWindowIsStillPaced(t *testing.T) {
+	slept, dropped := withRecordedPacing(t)
+	const size = 1 << 20
+	_, n := gentleWriteOf(t, size, 4096)
+	require.Equal(t, int64(size), n)
+
+	require.NotEmpty(t, *slept, "a chunk smaller than a window was not paced at all")
+	var total time.Duration
+	for _, d := range *slept {
+		total += d
+	}
+	assert.Equal(t, gentlePause*size/GentleWindow, total, "the rate must not depend on the chunk size")
+
+	// The window it wrote has to be asked for twice: once as the window, and
+	// once more by the request that closes the call, or the pages only ever
+	// start their writeback.
+	covered := 0
+	for _, d := range *dropped {
+		if d.offset <= 4096 && d.offset+d.length >= 4096+size {
+			covered++
+		}
+	}
+	assert.GreaterOrEqual(t, covered, 2, "the tail is asked for once and so is never dropped: %v", *dropped)
+}
+
+// The rate is the same however the caller cuts the transfer up: this is what
+// makes --chunk-size a size rather than a pacing knob.
+func TestGentleWritePacesAtTheSameRateWhateverTheChunkSize(t *testing.T) {
+	for _, size := range []int{1 << 20, GentleWindow, GentleWindow + 1, 3 * GentleWindow} {
+		slept, _ := withRecordedPacing(t)
+		_, n := gentleWriteOf(t, size, 0)
+		require.Equal(t, int64(size), n)
+
+		var total time.Duration
+		for _, d := range *slept {
+			total += d
+		}
+		assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total, "size %d", size)
+	}
+}
+
+// Every byte written has to be asked for at least twice, or some of it stays
+// in the page cache -- which is the whole point of the mode.
+func TestGentleWriteAsksForEveryByteTwice(t *testing.T) {
+	const size = 3*GentleWindow + 1234
+	const offset = 1 << 16
+	_, dropped := withRecordedPacing(t)
+	_, n := gentleWriteOf(t, size, offset)
+	require.Equal(t, int64(size), n)
+
+	asked := make([]int, size/(1<<20)+1)
+	for _, d := range *dropped {
+		require.GreaterOrEqual(t, d.offset, int64(offset), "a request reached outside the chunk: %+v", d)
+		require.LessOrEqual(t, d.offset+d.length, int64(offset+size), "a request reached past the chunk: %+v", d)
+		for mb := (d.offset - offset) >> 20; mb <= (d.offset-offset+d.length-1)>>20; mb++ {
+			asked[mb]++
+		}
+	}
+	// Including the last, which is the one with no window after it to ask
+	// again on its behalf -- so it is the byte range that stays cached when
+	// the call does not close itself out.
+	for mb, times := range asked {
+		assert.GreaterOrEqual(t, times, 2, "MB %d is asked for %d time(s), so it only starts writeback", mb, times)
+	}
+}

@@ -11,9 +11,18 @@ import (
 // and asks the kernel to drop it.
 const GentleWindow = 10 * 1024 * 1024
 
-// gentlePause is how long a gentle transfer stands aside at the end of each
-// window, so that whatever else is using the disk gets a turn.
+// gentlePause is how long a gentle transfer stands aside per window written,
+// so that whatever else is using the disk gets a turn.
 const gentlePause = 20 * time.Millisecond
+
+// Seams for the tests. The advice is a no-op on every platform but linux, and
+// a sleep is not observable, so a test has no other way to see that a transfer
+// was paced at all -- which is exactly the defect this pacing has had twice
+// now: present, and doing nothing.
+var (
+	gentleSleep      = time.Sleep
+	gentleAdviseDrop = FadviseWriteDontNeed
+)
 
 // adviseRange is what a gentle transfer asks the kernel to drop when it closes a
 // window: that window and the one before it. The request does not free dirty
@@ -52,7 +61,7 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 
 	buf := make([]byte, 1024*1024)
 	sum := crc32.New(Castagnoli)
-	var summed, previous int64
+	var summed, previous, paced int64
 
 	closeWindow := func() error {
 		windowStart, windowLen := summed, written-summed
@@ -64,7 +73,7 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 		}
 		summed = written
 		at, length := adviseRange(windowStart, windowLen, previous)
-		FadviseWriteDontNeed(dst, offset+at, length)
+		gentleAdviseDrop(dst, offset+at, length)
 		previous = windowLen
 		return nil
 	}
@@ -85,7 +94,8 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 				if cerr := closeWindow(); cerr != nil {
 					return 0, written, cerr
 				}
-				time.Sleep(gentlePause)
+				gentleSleep(gentlePause)
+				paced = written
 			}
 		}
 		if readErr == io.EOF {
@@ -98,6 +108,26 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 	// the last, partial window
 	if cerr := closeWindow(); cerr != nil {
 		return 0, written, cerr
+	}
+
+	// One more request over everything written. A drop request on dirty pages
+	// only starts their writeback, so a window can go no sooner than the next
+	// request covering it -- which every window gets from the window after it,
+	// except the last, which has none. Without this each call leaves its tail
+	// in the page cache, and a call shorter than a window leaves all of it:
+	// pacing that is present and does nothing, which is the shape of the
+	// defect twice over already.
+	if written > 0 {
+		gentleAdviseDrop(dst, offset, written)
+	}
+
+	// And pace what the loop did not. The sleep above fires only on a full
+	// window, so the remainder of any call -- or the whole of one shorter than
+	// a window, which is every chunk of a download at a 1 MiB --chunk-size --
+	// would otherwise cost nothing at all. Proportional, so the rate is the
+	// same whatever the caller's chunk size: gentlePause per GentleWindow.
+	if unpaced := written - paced; unpaced > 0 {
+		gentleSleep(time.Duration(int64(gentlePause) * unpaced / GentleWindow))
 	}
 	return sum.Sum32(), written, nil
 }
