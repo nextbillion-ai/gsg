@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -18,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 )
 
 func TestConfigPath(t *testing.T) {
@@ -279,6 +283,134 @@ func TestSweepLateParts(t *testing.T) {
 			assert.Equal(t, tt.waits, waits)
 		})
 	}
+}
+
+// With real generation-pinned handles the library takes the delete for
+// idempotent and would retry a 503 until its context ends -- forever, on
+// context.Background(). deleteParts has to own the retries: three, then report.
+func TestDeletePartGivesUpOnAServiceThatKeepsFailing(t *testing.T) {
+	var mu sync.Mutex
+	requests := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests[path.Base(r.URL.Path)]++
+		mu.Unlock()
+		http.Error(w, `{"error":{"code":503,"message":"backend error"}}`, http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+
+	partDeleteSleep = func(time.Duration) {}
+	defer func() { partDeleteSleep = time.Sleep }()
+
+	handles := []*storage.ObjectHandle{
+		client.Bucket("b").Object("o.gsg-part-x-00").Generation(11),
+		client.Bucket("b").Object("o.gsg-part-x-01").Generation(12),
+	}
+	done := make(chan []string, 1)
+	go func() { done <- deleteParts(handles, deletePart) }()
+	select {
+	case left := <-done:
+		assert.Equal(t, []string{"o.gsg-part-x-00", "o.gsg-part-x-01"}, left)
+	case <-time.After(20 * time.Second):
+		t.Fatal("deleteParts did not return: the library is retrying the delete on its own")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, partDeleteAttempts, requests["o.gsg-part-x-00"], "one request per attempt, no library retries in between")
+	assert.Equal(t, partDeleteAttempts, requests["o.gsg-part-x-01"])
+}
+
+// A connection that stops answering must not hold the upload either.
+func TestDeletePartHasADeadline(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+
+	restore := partDeleteTimeout
+	partDeleteTimeout = 200 * time.Millisecond
+	defer func() { partDeleteTimeout = restore }()
+
+	start := time.Now()
+	err = deletePart(client.Bucket("b").Object("hung").Generation(7))
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second)
+	assert.True(t, transientDeleteError(err), "a timeout is worth another attempt")
+}
+
+func TestLookupPart(t *testing.T) {
+	var mu sync.Mutex
+	requests := map[string]int{}
+	deletedGeneration := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := path.Base(r.URL.Path)
+		mu.Lock()
+		requests[name]++
+		mu.Unlock()
+		switch {
+		case name == "there" && r.Method == http.MethodDelete:
+			mu.Lock()
+			deletedGeneration = r.URL.Query().Get("generation")
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case name == "there":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"bucket":"b","name":"there","generation":"42"}`)
+		case name == "missing":
+			http.Error(w, `{"error":{"code":404,"message":"not found"}}`, http.StatusNotFound)
+		default:
+			http.Error(w, `{"error":{"code":503,"message":"backend error"}}`, http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	obj := func(name string) *storage.ObjectHandle { return client.Bucket("b").Object(name) }
+
+	restore := partLookupTimeout
+	partLookupTimeout = 2 * time.Second
+	defer func() { partLookupTimeout = restore }()
+
+	// a part that is there is deleted by the generation it was found at
+	pinned, err := lookupPart(obj("there"))
+	require.NoError(t, err)
+	require.NotNil(t, pinned)
+	require.NoError(t, deletePart(pinned))
+	assert.Equal(t, "42", deletedGeneration)
+
+	pinned, err = lookupPart(obj("missing"))
+	assert.NoError(t, err)
+	assert.Nil(t, pinned)
+
+	// the library retries a lookup, but only until its deadline
+	type result struct {
+		pinned *storage.ObjectHandle
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		pinned, err := lookupPart(obj("down"))
+		done <- result{pinned, err}
+	}()
+	select {
+	case r := <-done:
+		assert.Error(t, r.err)
+		assert.Nil(t, r.pinned)
+	case <-time.After(20 * time.Second):
+		t.Fatal("lookupPart did not return: the library is retrying the lookup without a deadline")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.GreaterOrEqual(t, requests["down"], 2, "the library retries within the deadline")
 }
 
 func TestSniffContentTypeMatchesTheServiceDetection(t *testing.T) {

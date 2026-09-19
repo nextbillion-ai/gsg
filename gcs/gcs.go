@@ -700,6 +700,14 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 const compositeMinSize = 256 << 20
 const compositeMaxParts = 32
 
+// Deadlines for the calls around the parts. The library retries a call it takes
+// for idempotent -- any lookup, and a delete pinned to a generation -- for as
+// long as its context lives, so on context.Background() a service that keeps
+// answering 503 would hold the upload forever.
+var partDeleteTimeout = 30 * time.Second
+var partLookupTimeout = 30 * time.Second
+var bucketAttrsTimeout = 30 * time.Second
+
 // bucketAllowsCompose is false when a retention policy would keep the parts from
 // being deleted afterwards. A bucket that cannot be inspected counts as allowed;
 // parts left behind are then reported by the upload.
@@ -710,7 +718,9 @@ func (g *GCS) bucketAllowsCompose(bucket string) bool {
 		return ok
 	}
 	ok := true
-	if attrs, err := g.client.Bucket(bucket).Attrs(context.Background()); err == nil && attrs.RetentionPolicy != nil {
+	attrsCtx, cancel := context.WithTimeout(context.Background(), bucketAttrsTimeout)
+	defer cancel()
+	if attrs, err := g.client.Bucket(bucket).Attrs(attrsCtx); err == nil && attrs.RetentionPolicy != nil {
 		logger.Info(module, "bucket %s has a retention policy, uploading %s as one stream", bucket, "large objects")
 		ok = false
 	}
@@ -773,11 +783,8 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		})
 	}
 	wg.Wait()
-	del := func(h *storage.ObjectHandle) error {
-		return h.Delete(context.Background())
-	}
 	cleanup := func() []string {
-		return deleteParts(handles, del)
+		return deleteParts(handles, deletePart)
 	}
 	if i, err := cause.get(); err != nil {
 		logger.Info(module, "upload object failed on part %d with %s, its parts are gs://%s/%s*", i, err, bucket, prefix)
@@ -790,18 +797,12 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		}
 		var refused error
 		late, unchecked := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
-			attrs, err := h.Attrs(context.Background())
-			if errors.Is(err, storage.ErrObjectNotExist) {
-				return nil, nil
+			pinned, err := lookupPart(h)
+			if err != nil && refused == nil {
+				refused = err
 			}
-			if err != nil {
-				if refused == nil {
-					refused = err
-				}
-				return nil, err
-			}
-			return h.Generation(attrs.Generation), nil
-		}, del)
+			return pinned, err
+		}, deletePart)
 		if left = append(left, late...); len(left) > 0 {
 			logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
 		}
@@ -861,8 +862,9 @@ var partSettlePoll = time.Second
 // committed all the same. Each is looked up by name until it shows or the window
 // closes, then deleted by the generation found: a delete by name would leave a
 // noncurrent copy in a versioned bucket. A lookup that fails is a refusal, the
-// library having retried the rest, and is not repeated. It returns the parts
-// that exist and could not be deleted, and the parts that could not be checked.
+// library having retried the rest until the lookup's deadline, and is not
+// repeated. It returns the parts that exist and could not be deleted, and the
+// parts that could not be checked.
 func sweepLateParts(unknown []*storage.ObjectHandle, lookup func(*storage.ObjectHandle) (*storage.ObjectHandle, error), del func(*storage.ObjectHandle) error) (left, unchecked []string) {
 	pending := unknown
 	for waited := time.Duration(0); len(pending) > 0; waited += partSettlePoll {
@@ -886,6 +888,30 @@ func sweepLateParts(unknown []*storage.ObjectHandle, lookup func(*storage.Object
 		partDeleteSleep(partSettlePoll)
 	}
 	return left, unchecked
+}
+
+// lookupPart returns h pinned to the generation the service has, or nil when
+// there is none.
+func lookupPart(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), partLookupTimeout)
+	defer cancel()
+	attrs, err := h.Attrs(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return h.Generation(attrs.Generation), nil
+}
+
+// deletePart makes one attempt, with a deadline. Left to the library, a delete
+// pinned to a generation is retried until the context ends and deleteParts'
+// attempt limit is never reached.
+func deletePart(h *storage.ObjectHandle) error {
+	ctx, cancel := context.WithTimeout(context.Background(), partDeleteTimeout)
+	defer cancel()
+	return h.Retryer(storage.WithPolicy(storage.RetryNever)).Delete(ctx)
 }
 
 // deleteParts deletes the parts concurrently and returns the names of those still
