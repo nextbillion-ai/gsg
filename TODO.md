@@ -2013,3 +2013,599 @@ failing -- see `TestRangeHeaderEndpointsAreInclusive` and the case in
 
 Noted while writing the `oci` chunk loop, from the model it was copied from.
 
+---
+
+Items 32 to 42 were found on 2026-09-19 by testing main at fbdc019 against
+`gs://gsg-uat`: `uat.sh gs` under the race detector (156 assertions, all
+passing), then supplementary cases for what it does not reach, some of them
+through `uat/faultproxy` and some repeated under Linux in the pipeline's
+`xsmtools` image, because the libraries retry differently there.
+
+Most items end with a case written for `uat.sh`: it runs in `do_test` from
+`uat_temp` with `../gsg`, `$remote_base` and the helpers already there, and it
+is meant to go in with the fix. Each was run against fbdc019: it fails there
+only on assertions about the item's own defect, and the assertions that guard
+what must keep working already pass (item 39's case passes except for its last
+assertion, which is item 40). Item 42 has no case. The fault-injection cases need the helpers given under item 35 and a
+running `uat/faultproxy`.
+
+## 32. A gs download can assemble a file from two versions of an object
+
+`gcs.Download` takes the size from one lookup (`gcs/gcs.go:360`) and then opens
+every chunk by name:
+
+```go
+rc, err := g.client.Bucket(bucket).Object(prefix).NewRangeReader(   // gcs/gcs.go:422
+```
+
+Nothing ties the chunks to the generation that lookup saw. A chunk opened after
+the object is replaced reads the new generation, and the pieces are written
+into one file. Without `-v` nothing checks the result: `MustEqualCRC32C` returns
+at once when `forceChecksum` is off, and the gentle path's `verifyGentleDownload`
+logs the mismatch and returns nil. Within one chunk it is safe: the storage
+reader pins the generation of its first response when it reopens.
+
+Measured: a 64 MiB object fetched with `--chunk-size 1048576` and no `-m`, so
+the chunks are read one after another, and replaced by a server-side copy 1.5 s
+in. Twice in a row `gsg cp` exited 0 with a file holding 7 MiB of the old
+version and 57 of the new, then 20 and 44. With `-v` the same race failed with
+exit 1. The pipeline's copies do not pass `-v` (foreman's
+`genCloudCopyCommandV2` emits `gsg -m cp` and `gsg -m rsync -r`).
+
+`-m` narrows the window only for small objects. The pool runs 64 chunks at once
+by default, so an object over 1 GiB has chunks that open well after the
+transfer began: a 14 GB `ssp.csv` has over 800 of them.
+
+This is the gs half of what item 29 records and fixed for oci, which pins every
+chunk with `IfMatch` and settles against the first lookup's checksum. s3 reads
+by key in the same way.
+
+**Fix:** open each chunk with `Object(prefix).Generation(attrs.Generation)`, so
+a chunk fails with 404 once the generation is gone instead of reading the new
+one, and verify against `attrs.CRC32C` from that same lookup rather than
+looking the name up again in `MustEqualCRC32C`. Otherwise an overwrite landing
+after the last chunk makes a correct copy of the old version read as corrupt.
+
+**Case for `uat.sh`:**
+
+```bash
+    start "regression: a download does not assemble two generations of an object"
+    # Chunks are separate range reads, and each must read the generation the
+    # first lookup saw. No -m and 1 MiB chunks make the reads sequential, so the
+    # overwrite reliably lands between two of them. Random content: a spliced
+    # file then matches neither version.
+    fspl="folder_splice"
+    mkdir -p $fspl
+    dd if=/dev/urandom of=$fspl/v1.bin bs=1048576 count=64 2>/dev/null
+    dd if=/dev/urandom of=$fspl/v2.bin bs=1048576 count=64 2>/dev/null
+    gsutil -q cp $fspl/v2.bin "$remote_base/$fspl/v2.bin"
+    gsutil -q cp $fspl/v1.bin "$remote_base/$fspl/target.bin"
+    ../gsg --chunk-size 1048576 cp "$remote_base/$fspl/target.bin" $fspl/out.bin >/dev/null 2>&1 &
+    spl=$!
+    sleep 1.5
+    gsutil -q cp "$remote_base/$fspl/v2.bin" "$remote_base/$fspl/target.bin"
+    if ! kill -0 $spl 2>/dev/null
+    then
+        echo "FATAL: the download ended before the overwrite landed, so this proved nothing -- use a larger object"
+        exit 1
+    fi
+    wait $spl && rc=0 || rc=$?
+    if [[ $rc -eq 0 ]]
+    then
+        assertOk "a download that exits 0 holds exactly one version" \
+            bash -c "cmp -s $fspl/out.bin $fspl/v1.bin || cmp -s $fspl/out.bin $fspl/v2.bin"
+    else
+        echo "OK: the download failed rather than splice (exit $rc)"
+    fi
+    rm -rf $fspl
+    finish
+```
+
+---
+
+## 33. An object name containing `..` is written outside the destination
+
+Listings return object names verbatim, and the local path is built with
+`filepath.Join` (`common.JoinPath`, `common/path.go:38`, called from
+`cmd/rsync.go:60` and through `GetDstPath` from `cmd/cp.go:81`). Join resolves
+`..`, and nothing checks that the result is still under the destination.
+
+GCS accepts `..` in a name, and so does `gsutil cp`. Measured: with
+`src/ok.txt`, `src/../esc/evil.txt` and `esc/evil.txt` under one prefix, both
+
+```
+gsg -m cp -r    gs://…/src dst/cp
+gsg -m rsync -r gs://…/src dst/rs
+```
+
+exited 0 and wrote `dst/esc/evil.txt`, with the object's content, outside the
+destination. The third object is there because the chunk reader goes through
+the XML API, whose URL path has its dot segments resolved, so it reads the name
+the `..` resolves to. Each extra `../` climbs one more directory, so whoever can
+write names into a bucket that gets synced can write files anywhere the syncing
+user can. Without that twin the read fails, but the pre-sized `<name>_.gstmp`
+has already been created outside the destination (`gcs/gcs.go:412-418`).
+
+**Fix:** for every remote-to-local transfer, require the joined path to stay
+under the destination (`filepath.Rel` not starting with `..`), and fail with an
+error naming the object. It belongs where `JoinPath` and `GetDstPath` are
+called for downloads, so it covers gs, s3 and oci at once.
+
+**Case for `uat.sh`:**
+
+```bash
+    start "regression: an object name cannot place a file outside the destination"
+    ftrv="folder_traversal"
+    mkdir -p ${ftrv}_jail/dst
+    echo fine > .ok
+    echo EVIL > .evil
+    gsutil -q cp .ok "$remote_base/$ftrv/src/ok.txt"
+    gsutil -q cp .evil "$remote_base/$ftrv/src/../esc/evil.txt"   # a name, stored verbatim
+    gsutil -q cp .evil "$remote_base/$ftrv/esc/evil.txt"          # what the XML reader resolves it to
+    ../gsg -m cp -r "$remote_base/$ftrv/src" ${ftrv}_jail/dst/cp >/dev/null 2>&1 || true
+    ../gsg -m rsync -r "$remote_base/$ftrv/src" ${ftrv}_jail/dst/rs >/dev/null 2>&1 || true
+    assertEq "nothing was written outside the two destinations" \
+        "$(find ${ftrv}_jail -type f ! -path '*/dst/cp/*' ! -path '*/dst/rs/*' | wc -l | tr -d ' ')" "0"
+    assertEq "the ordinary object still arrived" "$(cat ${ftrv}_jail/dst/cp/ok.txt 2>/dev/null)" "fine"
+    rm -rf ${ftrv}_jail .ok .evil
+    finish
+```
+
+---
+
+## 34. A `gs://` argument is parsed as a URL, so `%`, `?` and `#` pick another object
+
+`system.ParseFileObject` runs the argument through `url.Parse` and keeps
+`u.Path` (`system/system.go:180`, `:206`). An object name is not a URL:
+
+  - `%xx` is decoded: `gs://b/x%20y.txt` addresses `x y.txt`.
+  - `?` and `#` start the query and the fragment: `gs://b/q?x.txt` addresses `q`.
+  - A `%` that is not an escape fails to parse, `ParseFileObject` returns nil,
+    and the caller dereferences it: `gsg stat gs://b/100%.txt` exits 1 with
+    `[RECOVERED] with runtime error: invalid memory address or nil pointer
+    dereference`.
+
+Measured with both `x y.txt` and `x%20y.txt` in one prefix: `gsg rm
+gs://…/x%20y.txt` logged `Removing … prefix[…/x y.txt]`, exited 0 and deleted
+`x y.txt`, leaving `x%20y.txt` untouched. `cat` and `stat` of `q?x.txt` and
+`a#b.txt` report no such object. Recursive commands are not affected: they
+carry the names a listing returned, not a parsed argument, so `cp -r` and
+`rsync -r` round-trip all of these names.
+
+**Fix:** split `scheme://authority/rest` by hand and keep `rest` verbatim. The
+authority still has to accept oci's `bucket@namespace`, which is what `u.User`
+supplies today.
+
+**Case for `uat.sh`:**
+
+```bash
+    start "regression: an object argument is a name, not a URL"
+    furl="folder_urlname"
+    mkdir -p $furl
+    echo space > "$furl/x y.txt"
+    echo literal > "$furl/x%20y.txt"
+    echo query > "$furl/q?x.txt"
+    echo fragment > "$furl/a#b.txt"
+    # a recursive copy carries the names verbatim, so all four land intact
+    ../gsg -m cp -r $furl "$remote_base/$furl" >/dev/null 2>&1
+    assertEq "all four names landed" "$(remote_count $furl)" "4"
+    assertEq "cat of x%20y.txt reads that object" "$(../gsg cat "$remote_base/$furl/x%20y.txt" 2>/dev/null)" "literal"
+    assertEq "cat of q?x.txt" "$(../gsg cat "$remote_base/$furl/q?x.txt" 2>/dev/null)" "query"
+    assertEq "cat of a#b.txt" "$(../gsg cat "$remote_base/$furl/a#b.txt" 2>/dev/null)" "fragment"
+    assertNoCrash "a lone % is an error, not a crash" ../gsg stat "$remote_base/$furl/100%.txt"
+    ../gsg rm "$remote_base/$furl/x%20y.txt" >/dev/null 2>&1 || true
+    assertEq "rm of x%20y.txt removed exactly that object" \
+        "$(gsutil ls "$remote_base/$furl/" | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ',')" "a#b.txt,q?x.txt,x y.txt,"
+    rm -rf $furl
+    finish
+```
+
+---
+
+## 35. One dropped connection fails a `cp` upload
+
+`cp` sends each file once (`cmd/cp.go:43`, `:61`); `rsync` wraps the same call in
+`DoWithRetrySimple` (`cmd/rsync.go:102`). Below that the retries are the
+libraries', and storage v1.22.1 with google.golang.org/api v0.93.0 leave gaps:
+
+  - An object written without preconditions is not idempotent to storage
+    v1.22.1, so a single-request upload -- anything under the 16 MiB chunk,
+    which is most files -- is sent once.
+  - The chunks of a resumable upload go through gensupport's `shouldRetry`,
+    which in v0.93 counts `ECONNRESET` and `ECONNREFUSED` as transient only on
+    Linux (`retryable_linux.go`), and never `EPIPE` or a bare `EOF`.
+
+Measured through `uat/faultproxy`, resetting every open storage connection once,
+midway:
+
+| case | macOS | Linux (`xsmtools` image) |
+|---|---|---|
+| 60 MiB single-stream `cp` | exit 1, `connection reset by peer` | exit 1, `EOF` |
+| 100 MiB composite `cp -m` (5 parts, test build) | exit 1, `broken pipe` | exit 1, `EOF` |
+| `cp -m -r` of 150 files of 256 KiB | exit 1, 35 of 150 stored | exit 1, 57 of 150 stored |
+| `rsync -m -r` of the same | exit 0, 150 stored | exit 0, 150 stored |
+
+The Linux column saw `EOF` where a real network would more likely deliver
+`ECONNRESET`, which v0.93 does retry there (see the note in
+`uat/faultproxy/main.go`). `EPIPE` and `EOF` would still fail. The newest api
+(v0.269) retries `connection reset` and `broken pipe` on every platform, and
+`net.ErrClosed`, but still not a bare `EOF`.
+
+**Fix:** wrap `cp`'s `Upload` and `Download` in a retry, as `rsync` does. That
+covers every error class at the cost of restarting one file. Upgrading storage
+and api would add the finer-grained chunk retries, but v1.22.1 is from 2022,
+so that change is larger and should be measured before and after.
+
+**Helpers for the fault-injection cases (items 35, 36, 39)**, to be defined once
+in `uat.sh`:
+
+```bash
+    # Needs uat/faultproxy running:
+    #   go build -o /tmp/faultproxy ./uat/faultproxy && /tmp/faultproxy &
+    # It proxies on 127.0.0.1:18080 and takes commands on 127.0.0.1:18081.
+    fp_ctl=http://127.0.0.1:18081
+    fp_proxy=http://127.0.0.1:18080
+    fp() { curl -sf "$fp_ctl/$1"; }
+    fp_require() {
+        fp stats >/dev/null || { echo "FATAL: start uat/faultproxy first"; exit 1; }
+        fp reset >/dev/null
+        fp "mode?set=pass" >/dev/null
+    }
+    fp_bytes() { fp stats | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+    # fp_wait up|down <bytes>: wait for that much traffic through the proxy, 5 minutes at most
+    fp_wait() {
+        local t=0
+        while (( $(fp_bytes $1) < $2 && t < 1500 )); do sleep 0.2; t=$((t + 1)); done
+        (( $(fp_bytes $1) >= $2 )) || { echo "FATAL: only $(fp_bytes $1) bytes $1 after 5 minutes"; exit 1; }
+    }
+    # fp_blip: reset every open storage connection once, and insist something was hit
+    fp_blip() {
+        local n
+        n=$(fp "mode?set=blip" | awk '{print $3}')
+        [[ "$n" -gt 0 ]] || { echo "FATAL: the reset found no connection, so this proved nothing"; exit 1; }
+    }
+```
+
+**Case for `uat.sh`:**
+
+```bash
+    start "regression: one dropped connection does not fail a cp upload"
+    fp_require
+    fdrop="folder_drop"
+    mkdir -p $fdrop/many
+    dd if=/dev/urandom of=$fdrop/one.bin bs=1048576 count=60 2>/dev/null
+    for i in $(seq -w 1 150); do head -c 262144 /dev/urandom > $fdrop/many/f$i.bin; done
+
+    HTTPS_PROXY=$fp_proxy ../gsg cp $fdrop/one.bin "$remote_base/$fdrop/one.bin" >/dev/null 2>&1 &
+    pid=$!
+    fp_wait up $((30 << 20))
+    fp_blip
+    wait $pid && rc=0 || rc=$?
+    assertEq "a single-stream cp survives a reset" "$rc" "0"
+    gsutil -q cp "$remote_base/$fdrop/one.bin" $fdrop/one.back
+    assertOk "and stored the whole file" cmp $fdrop/one.bin $fdrop/one.back
+
+    fp reset >/dev/null
+    HTTPS_PROXY=$fp_proxy ../gsg -m cp -r $fdrop/many "$remote_base/$fdrop/many" >/dev/null 2>&1 &
+    pid=$!
+    fp_wait up $((15 << 20))
+    fp_blip
+    wait $pid && rc=0 || rc=$?
+    assertEq "cp -r of small files survives a reset" "$rc" "0"
+    assertEq "and stored all 150" "$(remote_count $fdrop/many)" "150"
+    rm -rf $fdrop
+    finish
+```
+
+---
+
+## 36. A gs download chunk that fails exits the process
+
+Item 29 notes this in passing; it has no item of its own. Every error inside a
+chunk calls `common.Exit()` (`gcs/gcs.go:427`, `:436`, `:451`, `:457`, `:467`,
+`:472`), so `Download` never returns an error that `rsync`'s
+`DoWithRetrySimple` could retry, and the `_.gstmp` stays behind.
+
+A dropped connection on its own is survived: the storage reader reopens at the
+offset it had reached. What ends the process is an error the reopen cannot get
+past. Measured with `uat/faultproxy` refusing storage connections for 5 s in the
+middle of a transfer, on macOS and on Linux alike:
+
+  - `gsg -m cp` of 120 MiB: exit 1 at the first refused reopen, with
+    `d4.bin_.gstmp` left behind. `cp` never removes temp files; only the next
+    `rsync` into the same directory does.
+  - `gsg -m rsync -r` of 31 objects: exit 1 with 1 of 31 files in place and 30
+    `_.gstmp`. A second run completed and removed them.
+
+One failed 16 MiB chunk costs the whole command -- for a 14 GB object,
+everything downloaded so far.
+
+**Fix:** have `Download` return the first chunk error: record it, cancel the
+other chunks, remove the temp file. `oci.Download` does this since #74. Retry
+the chunk itself before giving up on the file. Mind the schedule:
+`DoWithRetrySimple` waits 0, 100 and 200 ms, so it bridges one refused
+reconnect but not an outage of a few seconds, and the second half of the case
+below asks for that. s3 has the same `common.Exit()` calls.
+
+**Case for `uat.sh`** (helpers under item 35):
+
+```bash
+    start "regression: a download chunk that loses its connection is retried, not abandoned"
+    fp_require
+    fdl="folder_dlfault"
+    mkdir -p $fdl
+    dd if=/dev/urandom of=$fdl/obj.bin bs=1048576 count=120 2>/dev/null
+    gsutil -q cp $fdl/obj.bin "$remote_base/$fdl/src/obj.bin"
+
+    # every connection reset, and one reconnect refused: one chunk's reopen fails
+    HTTPS_PROXY=$fp_proxy ../gsg -m cp "$remote_base/$fdl/src/obj.bin" $fdl/a.bin >/dev/null 2>&1 &
+    pid=$!
+    fp_wait down $((40 << 20))
+    fp "resetrefuse?n=1" >/dev/null
+    wait $pid && rc=0 || rc=$?
+    assertEq "a refused reconnect costs a retry, not the download" "$rc" "0"
+    assertOk "and the file is whole" cmp $fdl/obj.bin $fdl/a.bin
+    assertEq "and no temp file is left" "$(ls $fdl | grep -c gstmp || true)" "0"
+
+    # storage unreachable for 5 s: what a retry schedule has to bridge
+    fp reset >/dev/null
+    HTTPS_PROXY=$fp_proxy ../gsg -m rsync -r "$remote_base/$fdl/src" $fdl/sync >/dev/null 2>&1 &
+    pid=$!
+    fp_wait down $((40 << 20))
+    fp "mode?set=refuse" >/dev/null
+    sleep 5
+    fp "mode?set=pass" >/dev/null
+    wait $pid && rc=0 || rc=$?
+    assertEq "rsync bridges a 5 s outage" "$rc" "0"
+    assertOk "and the file is whole" cmp $fdl/obj.bin $fdl/sync/obj.bin
+    rm -rf $fdl
+    finish
+```
+
+---
+
+## 37. A composite upload killed by a signal leaves its parts
+
+gsg installs no signal handler. A SIGTERM -- a pod eviction, `foremankill.sh`, a
+node drain -- ends the process where it stands, and the parts already committed
+stay beside the object as `<object>.gsg-part-<uid>-NN`, with nothing logged. The
+sweep from #75 and #77 runs only when an attempt fails inside the process.
+
+Measured on Linux in the `xsmtools` image, a 100 MiB file in 5 parts (test
+build): SIGTERM once the bucket showed committed parts (2 by then), exit 143,
+and 4 parts of 20 MiB left in the bucket. At the real threshold a part is up to 1/32 of the
+file -- about 440 MB each for a 14 GB `ssp.csv`.
+
+Storage is not the only cost. The parts are ordinary objects, so a later
+`rsync -r` of that directory downloads them, and anything reading the directory
+sees them.
+
+**Fix:** on SIGTERM and SIGINT, cancel the uploads and run the same sweep before
+exiting, inside the grace period (30 s by default in Kubernetes). Separately,
+`ls`, `cp -r` and `rsync -r` could skip names matching
+`*.gsg-part-<16 hex>-<2 digits>`, so that leftovers at least do not spread.
+Neither covers SIGKILL or an OOM kill; keeping the parts under a prefix that
+listings never return would.
+
+**Case for `uat.sh`:**
+
+```bash
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: a composite upload terminated by SIGTERM leaves no parts"
+    # 600 MiB is 3 parts at the 256 MiB threshold; -c 2 runs two at a time, so
+    # two are committed while the third is still going
+    fsig="folder_sigterm"
+    mkdir -p $fsig
+    dd if=/dev/urandom of=$fsig/big.bin bs=1048576 count=600 2>/dev/null
+    ../gsg -m -c 2 cp $fsig/big.bin "$remote_base/$fsig/big.bin" >/dev/null 2>&1 &
+    pid=$!
+    parts=0
+    while kill -0 $pid 2>/dev/null && [[ $parts -eq 0 ]]
+    do
+        sleep 1
+        parts=$(gsutil ls "$remote_base/$fsig/" 2>/dev/null | grep -c 'gsg-part-' || true)
+    done
+    if [[ $parts -eq 0 ]]
+    then
+        echo "FATAL: the upload ended before any part was committed, so this proved nothing"
+        exit 1
+    fi
+    kill -TERM $pid
+    wait $pid || true
+    sleep 10   # whatever cleanup the signal starts may still be finishing
+    assertEq "no part is left after SIGTERM" \
+        "$(gsutil ls "$remote_base/$fsig/" 2>/dev/null | grep -c 'gsg-part-' || true)" "0"
+    rm -rf $fsig
+    finish
+    fi
+```
+
+---
+
+## 38. `goog-reserved-file-mtime` is nanoseconds here and seconds everywhere else
+
+gsg writes `modTime.UnixNano()` (`gcs/gcs.go:654`, `:816`) and reads the value
+back as nanoseconds (`time.Unix(0, ts)`, `gcs/gcs.go:1092`). gsutil (`cp -P`,
+`rsync -P`) writes and reads the same key in seconds.
+
+Measured with a file whose mtime is 2023-01-02 03:04:05 (1672599845):
+
+  - uploaded with `gsutil cp -P`, which stored `1672599845`, then downloaded
+    with `gsg cp`: local mtime 1, that is 1970-01-01 00:00:01.
+  - uploaded with `gsg cp`, which stored `1672599845000000000`, then downloaded
+    with `gsutil cp -P`: local mtime 9223372036, that is the year 2262.
+
+`rsync` is not confused, because gsg reads its own value back consistently.
+The damage is the mtime on disk, which `make`, `find -newer` and anything else
+reading it then get wrong. It has been this way since the metadata was
+introduced (e3eb82e, 2023).
+
+**Fix:** write seconds, as the key's other writers do. Read a value below
+about 1e11 as seconds and anything larger as nanoseconds, so objects written by
+earlier gsg versions keep their mtime. With seconds on the object, `Attrs.Same`
+must compare mtimes at whole seconds too, or every file with a fractional
+mtime would look changed on every `rsync`; the last assertion guards that.
+
+**Case for `uat.sh`:**
+
+```bash
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: goog-reserved-file-mtime means seconds, as gsutil writes it"
+    fmt="folder_mtime"
+    mkdir -p $fmt ${fmt}_frac
+    echo hello > $fmt/a.txt
+    touch -t 202301020304.05 $fmt/a.txt
+    want=$(stat -f%m $fmt/a.txt)
+    gsutil -q cp -P $fmt/a.txt "$remote_base/$fmt/by_gsutil.txt"
+    ../gsg cp "$remote_base/$fmt/by_gsutil.txt" $fmt/from_gsutil.txt >/dev/null 2>&1
+    assertEq "gsg restores the mtime gsutil stored" "$(stat -f%m $fmt/from_gsutil.txt)" "$want"
+    ../gsg cp $fmt/a.txt "$remote_base/$fmt/by_gsg.txt" >/dev/null 2>&1
+    assertEq "gsg stores the mtime in seconds" \
+        "$(gsutil stat "$remote_base/$fmt/by_gsg.txt" | awk -F: '/goog-reserved-file-mtime/{gsub(/[[:space:]]/, "", $2); print $2}')" "$want"
+    # an object written by an earlier gsg carries nanoseconds and must still read back
+    gsutil -q setmeta -h "x-goog-meta-goog-reserved-file-mtime:${want}000000000" "$remote_base/$fmt/by_gsutil.txt"
+    ../gsg cp "$remote_base/$fmt/by_gsutil.txt" $fmt/old_style.txt >/dev/null 2>&1
+    assertEq "a nanosecond value from an earlier gsg still restores the mtime" "$(stat -f%m $fmt/old_style.txt)" "$want"
+    # a sub-second mtime must not make every rsync copy the file again
+    echo x > ${fmt}_frac/f.txt
+    python3 -c "import os; t = 1672599845123456789; os.utime('${fmt}_frac/f.txt', ns=(t, t))"
+    ../gsg rsync -r ${fmt}_frac "$remote_base/${fmt}_frac" >/dev/null 2>&1
+    assertEq "a sub-second mtime does not make the next rsync copy it again" \
+        "$(../gsg rsync -r ${fmt}_frac "$remote_base/${fmt}_frac" 2>&1 | grep -c 'No diff detected')" "1"
+    rm -rf $fmt ${fmt}_frac
+    finish
+    fi
+```
+
+---
+
+## 39. `uat.sh` never exercises the gs composite upload
+
+The large-upload case skips gs with "the gs writer already chunks internally;
+unchanged here" (`uat.sh:1121`). Since #68, a gs upload over 256 MiB with `-m`
+goes as parallel composed parts, and #75 and #77 rewrote how a failed attempt
+cleans up after them. So the gs upload code that changed most has no uat
+coverage: the 2026-09-19 run passed all 156 gs assertions without reaching it.
+
+Checked by hand on fbdc019, all passing:
+
+  - 300 MiB at the real threshold: 2 parts, CRC32C and
+    `goog-reserved-file-mtime` as sent, the same Content-Type as a single
+    stream, and a second `rsync` that is a no-op.
+  - With scratch builds that lower `compositeMinSize` (24 MiB keeps the parts
+    over the 16 MiB chunk, so they still go resumable, as real parts do):
+    exactly at the threshold (one stream), one byte over (2 parts), the 32-part
+    cap, and `cp -r` of three composite files with `-c 2` and `-c 3` without a
+    deadlock.
+  - The failure #75 was written for, reproduced with `uat/faultproxy`: the
+    final chunks reach the service, their answers are dropped, then a
+    reconnect is refused. The service had committed parts whose writers saw an
+    error. On macOS and on Linux, the bucket's soft-delete records showed all 4
+    such parts swept within 2 s of the failure.
+  - An outage long enough for the sweep's own requests to be refused left 2
+    parts behind, both named in the failure log.
+
+**Case for `uat.sh`**, the gs branch of that case. Its last assertion is
+item 40 and fails until that is fixed. The sweep assertion needs the helpers
+under item 35:
+
+```bash
+    if [[ "$mode" == "gs" ]]
+    then
+    # 300 MiB: over the 256 MiB threshold, so -m sends 2 composed parts.
+    # Random, for the reason given for the s3 and oci branch below.
+    fcomp="folder_composite"
+    mkdir -p $fcomp
+    dd if=/dev/urandom of=$fcomp/big.bin bs=1048576 count=300 2>/dev/null
+    ../gsg -m cp $fcomp/big.bin "$remote_base/$fcomp/big.bin" >/dev/null 2>&1
+    assertEq "the object stored the whole file" "$(remote_size $fcomp/big.bin)" "$(stat -f%z $fcomp/big.bin)"
+    assertEq "and it was composed from 2 parts" \
+        "$(gsutil stat "$remote_base/$fcomp/big.bin" | awk '/Component-Count:/{print $2}')" "2"
+    assertEq "and no part is left beside it" "$(gsutil ls "$remote_base/$fcomp/" | grep -c 'gsg-part-' || true)" "0"
+    assertEq "cp -v verifies the download" \
+        "$(../gsg -m cp -v "$remote_base/$fcomp/big.bin" ./comp_down.bin 2>&1 | grep -c 'CRC32C checking success')" "1"
+    assertOk "and the download matches byte for byte" cmp $fcomp/big.bin ./comp_down.bin
+    rm -rf ${fcomp}_sync && mkdir -p ${fcomp}_sync
+    ../gsg -m rsync -r "$remote_base/$fcomp" ${fcomp}_sync >/dev/null 2>&1
+    assertEq "a second rsync copies nothing" \
+        "$(../gsg -m rsync -r "$remote_base/$fcomp" ${fcomp}_sync 2>&1 | grep -c 'No diff detected')" "1"
+
+    # #75/#77: a part the service committed while its writer saw an error is
+    # still swept. 2 parts of 150 MiB go as 9 chunks of 16 MiB and a final
+    # 6 MiB each: drop the answers once the full chunks are out, so the final
+    # chunks are committed unheard, then refuse one reconnect.
+    fp_require
+    HTTPS_PROXY=$fp_proxy ../gsg -m cp $fcomp/big.bin "$remote_base/$fcomp/swept.bin" >/dev/null 2>&1 &
+    pid=$!
+    fp_wait up $((290 << 20))
+    fp "mode?set=dropdown" >/dev/null
+    sleep 20
+    fp "resetrefuse?n=1" >/dev/null
+    wait $pid || true
+    sleep 5
+    assertEq "a failed attempt leaves no part, even one committed unheard" \
+        "$(gsutil ls "$remote_base/$fcomp/" | grep -c 'gsg-part-' || true)" "0"
+
+    # item 40: a name the part suffix would push past 1024 bytes
+    long=$(printf 'n%.0s' $(seq 1 $((1000 - ${#testid} - ${#fcomp} - 2))))
+    assertOk "a 1000-byte name uploads with -m above the threshold" \
+        ../gsg -m cp $fcomp/big.bin "$remote_base/$fcomp/$long"
+    rm -rf $fcomp ${fcomp}_sync comp_down.bin
+    finish
+    else
+```
+
+---
+
+## 40. A composite part name can pass the 1024-byte limit
+
+Parts are named `<object>.gsg-part-<16 hex>-NN` (`gcs/gcs.go:747`), 29 bytes
+longer than the object. An object name over 995 bytes therefore uploads as a
+single stream but fails with `-m` above the threshold. Measured with a
+1000-byte name and a test build: `Error 400: The maximum object length is 1024
+characters, but got a name with 1030 characters`, exit 1, no part left.
+
+**Fix:** fall back to a single stream when the part names would not fit, or
+give the parts short names of their own -- the separate prefix item 37 wants
+would do both. The case is the last assertion of item 39's.
+
+## 41. `cp -` reads all of stdin into memory and leaves it in /tmp
+
+`parseStdIn` (`cmd/cp.go:308`) calls `io.ReadAll` on stdin, writes the result to
+`/tmp/<UnixNano>` and never removes it. So `gsg cp - dst` holds the whole input
+in memory, and every call leaves a copy in `/tmp`. Measured: each `cp -` of
+5 MB left a 5,000,000-byte file behind.
+
+**Fix:** stream stdin into `os.CreateTemp` and remove the file after the copy,
+as `oci/cat.go:207` already does for its own spool.
+
+**Case for `uat.sh`:**
+
+```bash
+    start "regression: cp - leaves nothing in /tmp"
+    snapshotTmp
+    head -c 5000000 /dev/urandom > .stdin.bin
+    ../gsg cp - "$remote_base/stdin.bin" < .stdin.bin >/dev/null 2>&1
+    ls /tmp > .tmp_after 2>/dev/null || true
+    assertEq "no spool file is left in /tmp" \
+        "$(comm -13 .tmp_before .tmp_after | grep -cE '^[0-9]{19}$' || true)" "0"
+    assertEq "and the object holds the input" "$(remote_size stdin.bin)" "5000000"
+    rm -f .stdin.bin
+    finish
+```
+
+## 42. On a bucket with soft delete, composite parts are billed a second time
+
+The parts of a composite upload are deleted once the object is composed. On a
+bucket with a soft-delete policy the deleted parts are kept, and billed, for the
+retention period, so an upload of N bytes also costs N bytes of soft-deleted
+storage for that long. `gs://gsg-uat` keeps them 7 days; `tomtom-transformer-bom`
+has soft delete off, so the pipeline is not affected today.
+
+Not a defect so much as a cost to know about before pointing `-m` uploads of
+large files at such a bucket. `bucketAllowsCompose` already looks at the bucket
+to rule out a retention policy; it could log the soft-delete retention the same
+way.
+
