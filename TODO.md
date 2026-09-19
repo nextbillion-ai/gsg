@@ -1581,6 +1581,40 @@ folding, since a wrong fold fails the commit outright -- and a new case rewrites
 a file under its own parts and requires the upload to be refused with nothing
 stored.
 
+### What actually happens to a file changed mid-upload
+
+Traced against the bucket afterwards, since the entry above reasons about it
+and reasoning is not evidence. A 200 MiB upload, mutated two seconds in:
+
+| the source is | outcome | what catches it |
+|---|---|---|
+| truncated to half | refused, nothing stored | the transport: `ContentLength=134217728 with Body length 104857600` |
+| appended to | refused, nothing stored | the size and mtime comparison, naming both sizes and times |
+| rewritten in place, mtime put back | refused, nothing stored | **the service**: 400 InvalidContentChecksum on a part |
+
+The third is the one worth understanding, because it is the case the size and
+mtime comparison is blind to by construction -- and it was still refused. Each
+part is read twice, once to checksum it and once to send it, and a rewrite that
+lands between those two reads for any part in flight makes that part fail its
+own `opc-content-crc32c`. With eight parts in flight there is a lot of window
+to land in.
+
+So the documented gap is narrower than "same size and mtime defeats it": the
+rewrite also has to miss every in-flight part's hash-to-send interval. That is
+possible -- a rewrite entirely between parts, with the mtime restored -- and
+would store an object holding a mix of two files. It was not reproduced, and is
+recorded as the residual rather than as something demonstrated.
+
+Tracing this also found a real gap and closed it: `io.Copy`'s byte count was
+discarded, so a section reader stopping early -- which is what a truncated file
+gives, with no error -- still recorded the length the part was *planned* for,
+and that length folds into the whole-object checksum. It would have described
+an object nobody uploaded. The count is now checked. It is not what usually
+reports a truncation, as the table shows, and the comment on it says so.
+
+No multipart upload was left dangling by any of the three: the deferred abort
+runs on every path out.
+
 ---
 
 ## 28. The oci backend ignores gentle I/O
