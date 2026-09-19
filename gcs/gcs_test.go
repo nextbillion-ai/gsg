@@ -2,6 +2,8 @@ package gcs
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -192,6 +194,71 @@ func TestDeletePartsRetriesOnlyTransientErrorsAndReportsWhatIsLeft(t *testing.T)
 	assert.Equal(t, 3, calls["down"])
 	// waits happen between attempts only: two parts made three attempts each
 	assert.Equal(t, map[time.Duration]int{partDeleteBackoff: 2, 2 * partDeleteBackoff: 2}, sleeps)
+}
+
+func TestFirstPartErrorPrefersTheCauseOverCancellations(t *testing.T) {
+	cause := &googleapi.Error{Code: 503}
+	tests := []struct {
+		name  string
+		errs  []error
+		index int
+		err   error
+	}{
+		{name: "no error", errs: []error{nil, nil}, index: -1, err: nil},
+		{name: "the cause comes after a cancelled part", errs: []error{nil, context.Canceled, nil, cause}, index: 3, err: cause},
+		{name: "a wrapped cancellation is still a cancellation", errs: []error{fmt.Errorf("copy: %w", context.Canceled), cause}, index: 1, err: cause},
+		{name: "only cancellations: the first one", errs: []error{nil, context.Canceled, context.Canceled}, index: 1, err: context.Canceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			i, err := firstPartError(tt.errs)
+			assert.Equal(t, tt.index, i)
+			assert.Equal(t, tt.err, err)
+		})
+	}
+}
+
+func TestSweepPartsDeletesAPartCommittedAfterTheFirstPass(t *testing.T) {
+	var mu sync.Mutex
+	settled := false
+	var waits []time.Duration
+	partDeleteSleep = func(d time.Duration) {
+		mu.Lock()
+		waits = append(waits, d)
+		settled = true
+		mu.Unlock()
+	}
+	defer func() { partDeleteSleep = time.Sleep }()
+
+	c := &storage.Client{}
+	there := c.Bucket("b").Object("there")     // committed before the attempt returned
+	late := c.Bucket("b").Object("late")       // committed by the service after the first pass
+	never := c.Bucket("b").Object("never")     // cancelled before anything was committed
+	refused := c.Bucket("b").Object("refused") // 403 on both passes
+	deleted := map[string]int{}
+	left := sweepParts([]*storage.ObjectHandle{there, late, never, refused}, func(h *storage.ObjectHandle) error {
+		mu.Lock()
+		defer mu.Unlock()
+		switch h.ObjectName() {
+		case "there":
+			if deleted["there"] > 0 {
+				return storage.ErrObjectNotExist
+			}
+		case "late":
+			if !settled {
+				return storage.ErrObjectNotExist
+			}
+		case "never":
+			return storage.ErrObjectNotExist
+		case "refused":
+			return &googleapi.Error{Code: 403}
+		}
+		deleted[h.ObjectName()]++
+		return nil
+	})
+	assert.Equal(t, []string{"refused"}, left)
+	assert.Equal(t, map[string]int{"there": 1, "late": 1}, deleted)
+	assert.Equal(t, []time.Duration{partSettleDelay}, waits)
 }
 
 func TestSniffContentTypeMatchesTheServiceDetection(t *testing.T) {

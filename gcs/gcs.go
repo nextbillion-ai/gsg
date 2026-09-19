@@ -832,19 +832,22 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		})
 	}
 	wg.Wait()
-	cleanup := func() []string {
-		return deleteParts(handles, func(h *storage.ObjectHandle) error {
-			return h.Delete(context.Background())
-		})
+	del := func(h *storage.ObjectHandle) error {
+		return h.Delete(context.Background())
 	}
-	for i, err := range errs {
-		if err != nil {
-			logger.Info(module, "upload object failed on part %d with %s", i, err)
-			if left := cleanup(); len(left) > 0 {
-				logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
-			}
-			return err
+	cleanup := func() []string {
+		return deleteParts(handles, del)
+	}
+	if i, err := firstPartError(errs); err != nil {
+		logger.Info(module, "upload object failed on part %d with %s", i, err)
+		byName := make([]*storage.ObjectHandle, parts)
+		for i := range byName {
+			byName[i] = bkt.Object(fmt.Sprintf("%s%02d", prefix, i))
 		}
+		if left := sweepParts(byName, del); len(left) > 0 {
+			logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
+		}
+		return err
 	}
 	composer := bkt.Object(object).ComposerFrom(handles...)
 	composer.Metadata = map[string]string{
@@ -867,6 +870,41 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		return err
 	}
 	return nil
+}
+
+// firstPartError is the error that stopped the attempt. abort() makes every other
+// part in flight fail with context.Canceled, which says nothing about the cause.
+func firstPartError(errs []error) (int, error) {
+	canceled := -1
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, context.Canceled) {
+			return i, err
+		}
+		if canceled < 0 {
+			canceled = i
+		}
+	}
+	if canceled < 0 {
+		return -1, nil
+	}
+	return canceled, errs[canceled]
+}
+
+// how long the service may still commit a part after its writer was cancelled;
+// parts have appeared 0.5 s after the failed attempt had returned
+var partSettleDelay = 3 * time.Second
+
+// sweepParts deletes the parts of a failed attempt by name. A part whose Close
+// failed may be committed all the same, and the commit can land after the first
+// pass, so the names are swept again once the service has settled. The names
+// carry the attempt's random id and belong to no other upload.
+func sweepParts(byName []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []string {
+	deleteParts(byName, del)
+	partDeleteSleep(partSettleDelay)
+	return deleteParts(byName, del)
 }
 
 // deleteParts deletes the parts concurrently and returns the names of those still
