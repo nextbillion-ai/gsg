@@ -67,7 +67,7 @@ func sourceMoved(before, after os.FileInfo) bool {
 // size the parts were planned for and the size they are checked against, and a
 // file that grew inside that gap would upload only its original prefix with
 // both stats agreeing that nothing had changed.
-func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object string, partSize, parts int64, pb *bar.ProgressBar) error {
+func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object string, partSize, parts int64, pb *bar.ProgressBar, gentle bool) error {
 	ref, err := o.resolve(spec)
 	if err != nil {
 		return err
@@ -146,6 +146,12 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 			// sent. A section reader per part means nothing is buffered and
 			// each part stays independently seekable, so the SDK can rewind
 			// and retry one part without the whole transfer restarting.
+			//
+			// This read is not paced even under --gentle-io, and that is the
+			// point of doing it here: it pulls the part into the page cache
+			// and the send that follows reads it back out again, so the part
+			// costs one trip to the disk rather than two. The send is what
+			// drops those pages afterwards.
 			ph := crc32.New(tbl)
 			read, cerr := io.Copy(ph, io.NewSectionReader(f, off, length))
 			if cerr != nil {
@@ -178,7 +184,7 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 				NamespaceName: &ns, BucketName: &bucket, ObjectName: &object,
 				UploadId: uploadID, UploadPartNum: &num,
 				ContentLength:        &length,
-				UploadPartBody:       io.NopCloser(io.NewSectionReader(f, off, length)),
+				UploadPartBody:       io.NopCloser(common.NewGentleSection(f, off, length, gentle, nil)),
 				OpcChecksumAlgorithm: objectstorage.UploadPartOpcChecksumAlgorithmCrc32c,
 				OpcContentCrc32c:     &partCRC64,
 			})

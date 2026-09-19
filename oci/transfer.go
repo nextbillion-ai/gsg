@@ -99,7 +99,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		if ctx.Bars != nil {
 			mpb = ctx.Bars.New(fileSize, fmt.Sprintf("Uploading [%s]:", object))
 		}
-		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb)
+		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb, ctx.GentleIO)
 	}
 
 	crc, size, err := crc32cOfReader(f)
@@ -108,13 +108,21 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	}
 	localCRC := crc32cToBase64(crc)
 
-	// The progress bar wraps the handle only now, after the checksum pass has
-	// rewound it: attaching it earlier would have counted the file twice.
-	var body io.Reader = f
+	// The body counts its own bytes, and under --gentle-io drops each window
+	// as it goes. It replaces an io.TeeReader, which was not only unpaced: the
+	// SDK reflects into the body looking for an io.Seeker so it can rewind and
+	// retry, and a TeeReader is not one -- so attaching a progress bar, which
+	// is what the CLI always does, turned the SDK's own retry off. A section
+	// reader seeks.
+	//
+	// It wraps the handle only now, after the checksum pass has rewound it:
+	// attaching it earlier would have counted the file twice.
+	var pb *bar.ProgressBar
 	if ctx.Bars != nil {
-		pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
-		body = io.TeeReader(f, pb)
+		pb = ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
 	}
+	body := common.NewGentleSection(f, 0, size, ctx.GentleIO, progressWriter(pb))
+	common.FadviseSequentialRead(f, ctx.GentleIO)
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,

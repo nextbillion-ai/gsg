@@ -64,3 +64,19 @@ func FadviseWriteDontNeed(file *os.File, offset, length int64) {
 }
 
 var _ = unsafe.Sizeof(0) // for unused import check
+
+// FadviseReadSequential hints the kernel that a file is about to be read
+// straight through.
+func FadviseReadSequential(file *os.File) {
+	fadviseSequential(file)
+}
+
+// FadviseReadDontNeed drops a range that has been read.
+//
+// The same syscall as FadviseWriteDontNeed, under the name that says what the
+// caller is doing, because the two behave differently in the way that matters:
+// pages being read are clean, so one request frees them, where dirty pages
+// only begin their writeback and need a later request to actually go.
+func FadviseReadDontNeed(file *os.File, offset, length int64) {
+	fadviseDontNeed(file, offset, length)
+}
