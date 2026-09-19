@@ -265,27 +265,3 @@ func TestVerifyGentleDownloadOfAnEmptyObject(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, nil, 0644))
 	assert.NoError(t, verifyGentleDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0}))
 }
-
-func TestAdviseRangeCoversEveryWindowTwiceAndNoMore(t *testing.T) {
-	const chunk = 95*1024*1024 + 123
-	asked := make([]int, chunk/(1<<20)+1)
-	var start, previous, total int64
-	for start < chunk {
-		length := int64(gentleWindow)
-		if start+length > chunk {
-			length = chunk - start
-		}
-		offset, n := adviseRange(start, length, previous)
-		require.True(t, n > 0 && offset >= 0 && offset+n == start+length, "window at %d: [%d,+%d)", start, offset, n)
-		for mb := offset >> 20; mb <= (offset+n-1)>>20; mb++ {
-			asked[mb]++
-		}
-		total += n
-		start, previous = start+length, length
-	}
-	assert.LessOrEqual(t, total, int64(2*chunk), "requests stay linear in the chunk")
-	for mb, times := range asked[:len(asked)-1] {
-		assert.GreaterOrEqual(t, times, 1, "MB %d is never asked for", mb)
-		assert.LessOrEqual(t, times, 3, "MB %d is asked for again and again", mb)
-	}
-}

@@ -441,70 +441,22 @@ func (g *GCS) Download(
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
 					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
-					common.FadviseWriteSequential(fl)
-
-					// Use throttled copy: write in small chunks with delays
-					buf := make([]byte, 1*1024*1024) // 1MB buffer
-					totalWritten := int64(0)
-
-					// Each window is summed from the file, at its offset, while its pages are
-					// still cached and right before the kernel is asked to drop them: what is
-					// verified is what landed in the file, and the whole file does not have to
-					// be read back from disk afterwards.
+					// The chunk is summed from the file as it is written, so the
+					// transfer can be settled without reading it back afterwards.
+					// That needs a second handle: fl is open for writing and its
+					// offset is in use.
 					verifier, verr := os.Open(dstFileTemp)
 					if verr != nil {
 						logger.Info(module, "download object failed when open for verify: %s", verr)
 						common.Exit()
 					}
 					defer func() { _ = verifier.Close() }()
-					sum := crc32.New(common.Castagnoli)
-					summed := int64(0)
-					previous := int64(0)
-					closeWindow := func() {
-						windowStart, windowLen := summed, totalWritten-summed
-						if windowLen == 0 {
-							return
-						}
-						if _, err := io.CopyBuffer(sum, io.NewSectionReader(verifier, startByte+windowStart, windowLen), buf); err != nil {
-							logger.Info(module, "download object failed when read back for verify: %s", err)
-							common.Exit()
-						}
-						summed = totalWritten
-						offset, length := adviseRange(windowStart, windowLen, previous)
-						common.FadviseWriteDontNeed(fl, startByte+offset, length)
-						previous = windowLen
+					sum, written, gerr := common.GentleWrite(fl, verifier, startByte, rc, pb)
+					if gerr != nil {
+						logger.Info(module, "download object failed in gentle mode with %s", gerr)
+						common.Exit()
 					}
-
-					for {
-						n, readErr := rc.Read(buf)
-						if n > 0 {
-							if _, writeErr := fl.Write(buf[:n]); writeErr != nil {
-								logger.Info(module, "download object failed when write: %s", writeErr)
-								common.Exit()
-							}
-							if _, writeErr := pb.Write(buf[:n]); writeErr != nil {
-								// Progress bar write error, non-fatal
-							}
-							totalWritten += int64(n)
-
-							// Every 10MB, pause and drop cache
-							if totalWritten-summed >= gentleWindow {
-								closeWindow()
-								time.Sleep(time.Millisecond * 20) // 20ms pause every 10MB
-							}
-						}
-						if readErr == io.EOF {
-							break
-						}
-						if readErr != nil {
-							logger.Info(module, "download object failed when read: %s", readErr)
-							common.Exit()
-						}
-					}
-
-					// the last, partial window
-					closeWindow()
-					chunkSums[i], chunkLens[i] = sum.Sum32(), totalWritten
+					chunkSums[i], chunkLens[i] = sum, written
 				} else {
 					// Fast mode: use buffered writer
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
@@ -548,31 +500,12 @@ func (g *GCS) Download(
 	return nil
 }
 
-// gentleWindow is how much a gentle download writes before it sums the window
-// and asks the kernel to drop it.
-const gentleWindow = 10 * 1024 * 1024
-
-// adviseRange is what a gentle download asks the kernel to drop when it closes a
-// window: that window and the one before it. The request does not free dirty
-// pages, it only starts their writeback, so a window can go no sooner than the
-// next request; asked for alone, the file stayed in the page cache whole. Two
-// windows keep the requests linear in the chunk, where a range from the start
-// of the chunk made every request longer than the last. A window is never
-// empty: to fadvise a zero length means up to the end of the file.
-func adviseRange(windowStart, windowLen, previousLen int64) (offset, length int64) {
-	return windowStart - previousLen, previousLen + windowLen
-}
-
 // verifyGentleDownload settles a gentle download from the sums its chunks took
 // while writing. The file is not read again: gentle mode has been asking the
 // kernel to drop it from the page cache all along, so that read would come from
 // disk, as large as the file, against whatever else is reading that disk.
 func verifyGentleDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) error {
-	crc, total := uint32(0), int64(0)
-	for i := range sums {
-		crc = common.CombineCRC32C(crc, sums[i], lens[i])
-		total += lens[i]
-	}
+	crc, total := common.FoldCRC32C(sums, lens)
 	if total != attrs.Size || crc != attrs.CRC32C {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
 			dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
