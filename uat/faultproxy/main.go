@@ -37,6 +37,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,8 +200,11 @@ func (c countingWriter) Write(p []byte) (int, error) {
 
 func control() *http.ServeMux {
 	m := http.NewServeMux()
+	// Replies are plain text built from constants and counters only: nothing a
+	// request carries is written back.
 	reply := func(w http.ResponseWriter, msg string) {
 		log.Print(msg)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, msg)
 	}
 	m.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -218,24 +222,30 @@ func control() *http.ServeMux {
 		reply(w, "counters zeroed")
 	})
 	m.HandleFunc("/mode", func(w http.ResponseWriter, r *http.Request) {
-		switch set := r.URL.Query().Get("set"); set {
-		case "pass", "dropdown":
-			setMode(set)
-			reply(w, "mode="+set)
+		switch r.URL.Query().Get("set") {
+		case "pass":
+			setMode("pass")
+			reply(w, "mode=pass")
+		case "dropdown":
+			setMode("dropdown")
+			reply(w, "mode=dropdown")
 		case "refuse":
-			setMode(set)
+			setMode("refuse")
 			reply(w, fmt.Sprintf("mode=refuse, reset %d tunnel(s)", resetFaulty()))
 		case "blip":
 			n := resetFaulty()
 			setMode("pass")
 			reply(w, fmt.Sprintf("blip: reset %d tunnel(s), mode=pass", n))
 		default:
-			http.Error(w, fmt.Sprintf("unknown mode %q", set), http.StatusBadRequest)
+			http.Error(w, "unknown mode: want pass, blip, refuse or dropdown", http.StatusBadRequest)
 		}
 	})
 	m.HandleFunc("/resetrefuse", func(w http.ResponseWriter, r *http.Request) {
-		var n int64
-		_, _ = fmt.Sscan(r.URL.Query().Get("n"), &n)
+		n, err := strconv.ParseInt(r.URL.Query().Get("n"), 10, 64)
+		if err != nil || n < 0 {
+			http.Error(w, "n must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
 		refuseNext.Store(n)
 		setMode("pass")
 		reply(w, fmt.Sprintf("resetrefuse: reset %d tunnel(s), refusing the next %d, mode=pass", resetFaulty(), n))
