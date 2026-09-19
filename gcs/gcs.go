@@ -663,6 +663,20 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
 	}
 
+	// A composite upload sums each part in the copy that sends it and folds the
+	// sums (item 27 in TODO.md); only the single stream needs the whole file's
+	// value before it starts, and pays a pass of its own for it.
+	if ctx.Concurrency > 1 && size > compositeMinSize && g.bucketAllowsCompose(bucket) {
+		abort()
+		// the stat the parts are cut from, and the file is compared with after them
+		before, serr := f.Stat()
+		if serr != nil {
+			logger.Info(module, "cannot measure %s: %s", srcFile, serr)
+			return serr
+		}
+		return g.uploadComposite(f, before, modTime, bucket, object, pb, ctx)
+	}
+
 	// Send the checksum, so the service checks the body it received against
 	// what was measured here and refuses the object if they differ.
 	//
@@ -680,10 +694,6 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	if cerr != nil {
 		logger.Info(module, "cannot measure %s, so the upload cannot be verified: %s", srcFile, cerr)
 		return cerr
-	}
-	if ctx.Concurrency > 1 && size > compositeMinSize && g.bucketAllowsCompose(bucket) {
-		abort()
-		return g.uploadComposite(f, size, crc, modTime, bucket, object, pb, ctx)
 	}
 	wc.CRC32C = crc
 	wc.SendCRC32C = true
@@ -740,7 +750,8 @@ func (g *GCS) bucketAllowsCompose(bucket string) bool {
 	return ok
 }
 
-func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.Time, bucket, object string, pb *bar.ProgressBar, ctx system.RunContext) error {
+func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time, bucket, object string, pb *bar.ProgressBar, ctx system.RunContext) error {
+	size := before.Size()
 	parts := int(math.Ceil(float64(size) / float64(compositeMinSize)))
 	if parts > compositeMaxParts {
 		parts = compositeMaxParts
@@ -760,6 +771,8 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 	handles := make([]*storage.ObjectHandle, parts)
 	// the service can only commit a part whose writer has been closed
 	closing := make([]bool, parts)
+	sums := make([]uint32, parts)
+	lens := make([]int64, parts)
 	var cause partFailure
 	uploadCtx, abort := context.WithCancel(context.Background())
 	defer abort()
@@ -778,8 +791,20 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 			if off+length > size {
 				length = size - off
 			}
+			pf := partFile(f)
+			if pf != f {
+				defer func() { _ = pf.Close() }()
+			}
 			wc := bkt.Object(partName(i)).NewWriter(uploadCtx)
-			if _, err := io.Copy(io.MultiWriter(wc, pb), io.NewSectionReader(f, off, length)); err != nil {
+			// the part's sum is taken in the copy that sends it, so the file is read once
+			sum := crc32.New(common.Castagnoli)
+			read, err := io.Copy(io.MultiWriter(wc, pb, sum), io.NewSectionReader(pf, off, length))
+			if err == nil && read != length {
+				// a section reader past a truncated end stops without an error;
+				// the planned length must not fold into the object's checksum
+				err = fmt.Errorf("part %d of %s is short: read %d of %d bytes, so the file was truncated while it was being uploaded", i, f.Name(), read, length)
+			}
+			if err != nil {
 				fail(i, err)
 				return
 			}
@@ -789,6 +814,7 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 				return
 			}
 			handles[i] = bkt.Object(partName(i)).Generation(wc.Attrs().Generation)
+			sums[i], lens[i] = sum.Sum32(), length
 		})
 	}
 	wg.Wait()
@@ -820,6 +846,25 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		}
 		return err
 	}
+	crc, total := common.FoldCRC32C(sums, lens)
+	// The fold is the checksum of exactly the bytes that were sent, so a file
+	// rewritten under the parts no longer disagrees with itself and would be
+	// composed, checksum and all, from two different files. The whole-file pass
+	// that used to notice is what this removes; the cheap version is asked
+	// instead, as oci does since #76, and before the compose, so nothing is
+	// published. A rewrite keeping both size and mtime is invisible to it.
+	after, err := f.Stat()
+	if err == nil && (total != size || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())) {
+		err = fmt.Errorf("%s changed while its parts were being uploaded (%d bytes at %s, now %d bytes at %s): not composing an object from two different files",
+			f.Name(), before.Size(), before.ModTime(), after.Size(), after.ModTime())
+	}
+	if err != nil {
+		logger.Info(module, "upload object failed: %s", err)
+		if left := cleanup(); len(left) > 0 {
+			logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
+		}
+		return err
+	}
 	composer := bkt.Object(object).ComposerFrom(handles...)
 	composer.Metadata = map[string]string{
 		"goog-reserved-file-mtime": strconv.FormatInt(modTime.UnixNano(), 10),
@@ -829,7 +874,7 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 	composer.ContentType = sniffContentType(f)
 	composer.CRC32C = crc
 	composer.SendCRC32C = true
-	_, err := composer.Run(context.Background())
+	_, err = composer.Run(context.Background())
 	left := cleanup()
 	if len(left) > 0 {
 		// the object is already committed and verified: a retry of the upload would
@@ -841,6 +886,31 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		return err
 	}
 	return nil
+}
+
+// partFile opens the file f has open once more, for one part to read through.
+// The kernel keeps readahead state per descriptor: parts interleaved on one
+// descriptor read as random to it and degrade to small synchronous reads.
+// /proc/self/fd reopens the very file f has open even after its path was
+// replaced, which is the file crc32cToSend describes; the path serves where
+// there is no /proc and it still names that file. Failing both, f itself is
+// shared: the same bytes, read slower.
+func partFile(f *os.File) *os.File {
+	want, err := f.Stat()
+	if err != nil {
+		return f
+	}
+	for _, name := range []string{fmt.Sprintf("/proc/self/fd/%d", f.Fd()), f.Name()} {
+		pf, err := os.Open(name)
+		if err != nil {
+			continue
+		}
+		if got, err := pf.Stat(); err == nil && os.SameFile(want, got) {
+			return pf
+		}
+		_ = pf.Close()
+	}
+	return f
 }
 
 // partFailure keeps the error of the part that stopped an attempt. The parts
