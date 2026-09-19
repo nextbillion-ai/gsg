@@ -163,7 +163,16 @@ mkdir -p $fmp
 # ... was sent".
 dd if=/dev/urandom of=$fmp/big.bin bs=1m count=130 2>/dev/null
 
-../gsg cp $fmp/big.bin "$remote_base/$fmp/big.bin" >/dev/null 2>&1
+# The exit code matters here and is the cheapest real check on the folding.
+# The whole-object checksum gsg sends is folded from the sums its parts took as
+# they were read, not from a second pass over the file, and the commit compares
+# it against the checksum the service computed over what it actually assembled.
+# So a fold that got the order, the lengths or the arithmetic wrong does not
+# produce a subtly wrong object -- it fails the upload outright, here.
+mpout=$(../gsg cp $fmp/big.bin "$remote_base/$fmp/big.bin" 2>&1) && mprc=0 || mprc=$?
+assertEq "a multipart upload succeeds, so the folded checksum is the file's" "$mprc" "0"
+assertEq "and nothing was assembled that disagreed with what was sent" \
+    "$(echo "$mpout" | grep -c 'assembled to checksum')" "0"
 head=$(oci os object head --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
     --name "$testid/$fmp/big.bin" 2>/dev/null)
 assertEq "the object stored the whole file" \
@@ -196,6 +205,44 @@ assertEq "cp -v verifies the download" \
 assertOk "and the downloaded file matches byte for byte" cmp $fmp/big.bin ./mp_down.bin
 
 rm -rf $fmp ${fmp}_sync mp_down.bin
+finish
+
+start "transfer: a file rewritten under its own parts is not committed"
+
+# Folding the part sums removed the pass that read the whole file before the
+# parts, and that pass was also the only thing that noticed a source being
+# rewritten mid-upload: every part still validates on arrival, so the object
+# would be published holding a mix of two files with a checksum that matches
+# the mixture. gsg now compares the file's size and modification time either
+# side of the parts instead, and refuses to commit when they moved.
+fmm="folder_mutate"
+mkdir -p $fmm
+dd if=/dev/urandom of=$fmm/moving.bin bs=1m count=130 2>/dev/null
+
+# set +e inside the subshell: uat.sh runs under set -e, which would kill the
+# subshell at the failing command and never record the exit code being checked.
+( set +e; ../gsg -m cp $fmm/moving.bin "$remote_base/$fmm/moving.bin" >mutate.log 2>&1; echo $? > mutate.rc ) &
+uppid=$!
+# Touched repeatedly rather than once. The window opens when the upload stats
+# the file, which is after it has resolved the bucket and opened the multipart
+# upload, so a single well-timed sleep would be guessing; touching every 200ms
+# for the whole transfer cannot miss it.
+while kill -0 $uppid 2>/dev/null
+do
+    touch $fmm/moving.bin 2>/dev/null || true
+    sleep 0.2
+done
+wait $uppid 2>/dev/null || true
+
+assertEq "the upload was refused" "$(cat mutate.rc)" "1"
+assertEq "and said what happened" \
+    "$(grep -c 'changed while its parts were being uploaded' mutate.log)" "1"
+# Refused before the commit, so there is no object to clean up -- unlike the
+# checksum mismatch below it, which can only be seen after the commit has
+# published one.
+assert_not $fmm/moving.bin remote
+
+rm -rf $fmm mutate.log mutate.rc
 finish
 
 start "transfer: -v verifies, and a repeated rsync is a no-op"

@@ -32,6 +32,17 @@ const (
 	ociMultipartThreshold int64 = 128 * 1024 * 1024
 )
 
+// sourceMoved reports whether the file changed while its parts were being read.
+//
+// Size or modification time, because the alternative is hashing the whole file
+// a second time and that read is exactly what folding the part sums exists to
+// remove. It cannot see a rewrite that preserves both, which is a real gap and
+// the reason this is a guard on an upload that has already verified itself
+// part by part rather than the verification itself.
+func sourceMoved(before, after os.FileInfo) bool {
+	return after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())
+}
+
 // uploadMultipart stores srcFile as one object assembled from parts.
 //
 // Unlike s3 there is no composite-checksum problem to avoid: OCI reports the
@@ -51,9 +62,13 @@ func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partS
 	c, ns, bucket := ref.c, ref.ns, ref.name
 	ctx := context.Background()
 
-	wholeCRC, _, err := crc32cOfReader(f)
+	// What the file looked like before its parts were read, to compare with
+	// after they have been. Nothing is hashed here: the whole-object checksum
+	// is folded from the parts' own sums rather than taken in a pass of its
+	// own, which is one cold read of the whole file that no longer happens.
+	before, err := f.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("oci: cannot measure %s: %w", f.Name(), err)
 	}
 
 	create, err := c.CreateMultipartUpload(ctx, objectstorage.CreateMultipartUploadRequest{
@@ -90,6 +105,12 @@ func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partS
 	}()
 
 	commit := make([]objectstorage.CommitMultipartUploadPartDetails, parts)
+	// Each part's own sum and length, kept in part order. Folded together
+	// afterwards they are the checksum of the whole object, so the value the
+	// service is asked to confirm costs nothing beyond the reads the parts
+	// were going to do anyway.
+	sums := make([]uint32, parts)
+	lens := make([]int64, parts)
 	errs := make([]error, parts)
 	sem := make(chan struct{}, common.PartConcurrency(parts))
 	var wg sync.WaitGroup
@@ -125,7 +146,9 @@ func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partS
 				errs[i] = fmt.Errorf("oci: cannot read part %d of %s: %w", num, f.Name(), cerr)
 				return
 			}
-			partCRC := crc32cToBase64(ph.Sum32())
+			partCRC := ph.Sum32()
+			sums[i], lens[i] = partCRC, length
+			partCRC64 := crc32cToBase64(partCRC)
 
 			out, perr := c.UploadPart(ctx, objectstorage.UploadPartRequest{
 				NamespaceName: &ns, BucketName: &bucket, ObjectName: &object,
@@ -133,7 +156,7 @@ func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partS
 				ContentLength:        &length,
 				UploadPartBody:       io.NopCloser(io.NewSectionReader(f, off, length)),
 				OpcChecksumAlgorithm: objectstorage.UploadPartOpcChecksumAlgorithmCrc32c,
-				OpcContentCrc32c:     &partCRC,
+				OpcContentCrc32c:     &partCRC64,
 			})
 			if perr != nil {
 				logger.Info(module, "part %d of oci://%s/%s failed: %s", num, bucket, object, perr)
@@ -158,6 +181,37 @@ func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partS
 	}
 	sort.Slice(commit, func(a, b int) bool { return *commit[a].PartNum < *commit[b].PartNum })
 
+	// The whole object's checksum, from the parts' sums laid end to end. The
+	// sums slice is in part order and is not what sort.Slice above touches.
+	wholeCRC, total := common.FoldCRC32C(sums, lens)
+	if total != size {
+		return fmt.Errorf("oci: the parts of %s add up to %d bytes, not %d", f.Name(), total, size)
+	}
+
+	// The source must not have moved under the parts. Folding gives the
+	// checksum of exactly the bytes that were sent, so a file rewritten
+	// part-way through no longer disagrees with itself -- the object would be
+	// stored, checksum and all, holding a mix of what the file was and what it
+	// became. Reading the whole file again to notice is what this change
+	// removed, so the cheap version is asked instead, and before the commit
+	// rather than after it: nothing has been published yet, so the deferred
+	// abort is the whole of the cleanup.
+	//
+	// Weaker than the hash it replaces, and deliberately so: a rewrite that
+	// preserves both the size and the modification time is invisible to it.
+	// That is the assumption the crc32c cache makes and that #57 and #60
+	// refused to make about the bytes being *sent* -- here it decides only
+	// whether to distrust an upload that has otherwise verified itself part by
+	// part, which is a much smaller thing to be wrong about.
+	after, serr := f.Stat()
+	if serr != nil {
+		return fmt.Errorf("oci: cannot measure %s after uploading its parts: %w", f.Name(), serr)
+	}
+	if sourceMoved(before, after) {
+		return fmt.Errorf("oci: %s changed while its parts were being uploaded (%d bytes at %s, now %d bytes at %s): not committing an object assembled from two different files",
+			f.Name(), before.Size(), before.ModTime(), after.Size(), after.ModTime())
+	}
+
 	cm, err := c.CommitMultipartUpload(ctx, objectstorage.CommitMultipartUploadRequest{
 		NamespaceName: &ns, BucketName: &bucket, ObjectName: &object, UploadId: uploadID,
 		CommitMultipartUploadDetails: objectstorage.CommitMultipartUploadDetails{PartsToCommit: commit},
@@ -178,9 +232,14 @@ func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partS
 	// merely reported, or a failed upload leaves a wrong object where callers
 	// will read it.
 	//
-	// Reachable without any corruption in transit: if the local file changes
-	// after the whole-file pass but before the parts are read, every part
-	// checksum still validates and only the whole-object one disagrees.
+	// The checksum sent is now folded from the parts rather than read from the
+	// file separately, so the two describe the same bytes by construction and
+	// a source that moved mid-upload can no longer be what this catches --
+	// that is the stat above, before anything is published. What is left is
+	// the service's side of it: a commit that reports no checksum at all, or
+	// one that disagrees because the assembly, or the response itself, was
+	// faulty. Rarer, and still published by the time it can be seen, so the
+	// removal stays.
 	want := crc32cToBase64(wholeCRC)
 	unusable := ""
 	switch {
