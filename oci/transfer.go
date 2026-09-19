@@ -99,7 +99,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		if ctx.Bars != nil {
 			mpb = ctx.Bars.New(fileSize, fmt.Sprintf("Uploading [%s]:", object))
 		}
-		return o.uploadMultipart(f, fileSize, bucket, object, partSize, parts, mpb)
+		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb)
 	}
 
 	crc, size, err := crc32cOfReader(f)

@@ -1516,6 +1516,105 @@ one, since the passes that remain after this item are unpaced too.
 Filed from jam-core's oci integration (nextbillion-ai/jam-core#104), where the
 upload path was the one place gentle I/O could not be preserved.
 
+**Fixed on oci in PR #76. `gcs` still reads its file twice** and this item
+stays open for it -- deliberately, because `gcs`'s half needs the hasher added
+to the composite path's `MultiWriter` at `gcs/gcs.go:763`, which is the same
+line item 28's upload half would touch. On `oci` the order is the other way
+round: 27 first, because pacing a pass that is about to be deleted makes the
+doomed pass slower and pollutes any measurement of what the pacing costs.
+
+`oci` now keeps each part's sum beside its length and folds them with
+`common.CombineCRC32C` once every part is done, so three passes over the file
+became two. `crc32cOfReader` stays for the single-request path, which genuinely
+needs the value before it starts.
+
+**The predicted free property arrived, and took a real check with it.** The
+whole-file sum and the part sums were taken at different times, so a file
+rewritten in between produced parts that each validated on arrival while only
+the whole-object sum disagreed -- detectable only *after*
+`CommitMultipartUpload` had published the object, which is why the backend
+deletes it afterwards. Folded, the checksum and the bytes are the same bytes by
+construction, so that cannot happen.
+
+But that pass was also the only thing that *noticed* a source rewritten
+mid-upload. Without it every part validates, and the object is published
+holding a mix of two files with a checksum matching the mixture. So the file's
+size and modification time are now compared either side of the parts, and the
+upload is refused when they moved -- before the commit, so nothing is published
+and the deferred abort is the whole of the cleanup, which is strictly better
+than the delete-after-publish it replaces.
+
+Weaker than the hash, and recorded as such: a rewrite preserving both size and
+mtime is invisible to it. That is the assumption the crc32c cache makes and
+that #57 and #60 refused to make about the bytes being *sent*; here it only
+decides whether to distrust an upload that has already verified itself part by
+part.
+
+Review found the gap that made this dangerous rather than merely weaker. The
+part geometry was computed from one stat in `Upload` and the baseline taken
+from a second one inside `uploadMultipart`, so a file appended to between them
+left both the baseline and the check describing the larger file while the parts
+still stopped at the old size -- a silently truncated object, committed
+successfully. The pass this change removed used to read the appended bytes and
+catch it. `Upload`'s stat is now passed in, so there is no second stat to
+disagree: the gap is closed by construction rather than checked for.
+
+**The post-commit response check and the delete stay,** as this entry said they
+must. What folding removes is one cause of a mismatch, not the need to handle
+one: a commit can report no checksum at all, or one that disagrees because the
+assembly or the response was faulty.
+
+**Measured: nothing, and that is the honest answer on this link.** Three
+interleaved 2 GiB uploads per binary spread 38.9-51.2 MB/s with the two fully
+overlapping. The upload is network-bound and the source was in page cache, so a
+laptop on a 40 MB/s link cannot show a read that is no longer there. The win is
+read amplification where the source does not fit in cache -- jam-core's 33GB
+`links.csv` goes from ~99GB of reads to ~66GB -- which is arithmetic, not
+something this measurement can confirm.
+
+Covered by `TestThePartSumsFoldToTheChecksumOfTheWholeFile`, which holds the
+fold against the whole file hashed in one go rather than against a second copy
+of the same arithmetic, and by `TestSourceMovedSeesASourceRewrittenUnderTheParts`,
+whose last assertion pins the gap rather than implying it. In the uat the
+multipart upload's exit code is now asserted -- the cheapest real check on the
+folding, since a wrong fold fails the commit outright -- and a new case rewrites
+a file under its own parts and requires the upload to be refused with nothing
+stored.
+
+### What actually happens to a file changed mid-upload
+
+Traced against the bucket afterwards, since the entry above reasons about it
+and reasoning is not evidence. A 200 MiB upload, mutated two seconds in:
+
+| the source is | outcome | what catches it |
+|---|---|---|
+| truncated to half | refused, nothing stored | the transport: `ContentLength=134217728 with Body length 104857600` |
+| appended to | refused, nothing stored | the size and mtime comparison, naming both sizes and times |
+| rewritten in place, mtime put back | refused, nothing stored | **the service**: 400 InvalidContentChecksum on a part |
+
+The third is the one worth understanding, because it is the case the size and
+mtime comparison is blind to by construction -- and it was still refused. Each
+part is read twice, once to checksum it and once to send it, and a rewrite that
+lands between those two reads for any part in flight makes that part fail its
+own `opc-content-crc32c`. With eight parts in flight there is a lot of window
+to land in.
+
+So the documented gap is narrower than "same size and mtime defeats it": the
+rewrite also has to miss every in-flight part's hash-to-send interval. That is
+possible -- a rewrite entirely between parts, with the mtime restored -- and
+would store an object holding a mix of two files. It was not reproduced, and is
+recorded as the residual rather than as something demonstrated.
+
+Tracing this also found a real gap and closed it: `io.Copy`'s byte count was
+discarded, so a section reader stopping early -- which is what a truncated file
+gives, with no error -- still recorded the length the part was *planned* for,
+and that length folds into the whole-object checksum. It would have described
+an object nobody uploaded. The count is now checked. It is not what usually
+reports a truncation, as the table shows, and the comment on it says so.
+
+No multipart upload was left dangling by any of the three: the deferred abort
+runs on every path out.
+
 ---
 
 ## 28. The oci backend ignores gentle I/O
