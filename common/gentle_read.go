@@ -2,6 +2,7 @@ package common
 
 import (
 	"io"
+	"math"
 	"os"
 	"time"
 )
@@ -62,6 +63,13 @@ type GentleSection struct {
 
 // NewGentleSection returns a reader over length bytes of f from off.
 //
+// A negative length means "to the end of the file", which is not the same as
+// passing the size a stat reported: a body capped at a stat cannot notice that
+// the file grew, and would upload the original prefix with a checksum that
+// matches it -- silently, since everything about that object is consistent.
+// Read to the end and a file that grew delivers more than the ContentLength
+// promised, which fails the request.
+//
 // With a zero Gentle it is an ordinary section reader that counts bytes: no
 // advice, no pauses. That is deliberate -- it means the upload path has one
 // body type rather than two, and the seekability that the SDK's retry depends
@@ -69,6 +77,12 @@ type GentleSection struct {
 //
 // progress may be nil.
 func NewGentleSection(f *os.File, off, length int64, gentle Gentle, progress io.Writer) *GentleSection {
+	if length < 0 {
+		// io.SectionReader wants a length; this is how it is told "whatever is
+		// there". The tail then arrives as io.EOF rather than as a known end,
+		// which is the one case the release below cannot anticipate.
+		length = math.MaxInt64 - off
+	}
 	return &GentleSection{
 		f:        f,
 		sr:       io.NewSectionReader(f, off, length),
@@ -147,6 +161,13 @@ func (g *GentleSection) Seek(offset int64, whence int) (int64, error) {
 	at, err := g.sr.Seek(offset, whence)
 	if err != nil {
 		return at, err
+	}
+	if at < g.pos && g.gentle.On() {
+		// A rewind is a retry, and the pages it is about to re-read were
+		// dropped on purpose by the pass that just failed -- so this one goes
+		// to the disk, where the first pass came off the cache that the
+		// checksum read had filled. Pacing follows the disk, so it moves here.
+		g.gentle.Pause = true
 	}
 	if g.progress != nil && at < g.pos {
 		if pw, ok := g.progress.(interface{ IncrBy(int64) }); ok {

@@ -261,3 +261,57 @@ func TestGentleSectionReleasesItsTailUnderARealRequest(t *testing.T) {
 		assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total, "size %d: paced at the usual rate", size)
 	}
 }
+
+// A body capped at a stat cannot tell a grown file from an unchanged one: it
+// sends the original prefix with a checksum that matches it, and every part of
+// that object agrees with every other. Read to the end and the extra bytes
+// arrive, which is what makes the request fail instead.
+func TestAnUnboundedSectionSeesAFileThatGrew(t *testing.T) {
+	f, content := sectionFixture(t, 4096)
+	grow := func() {
+		w, err := os.OpenFile(f.Name(), os.O_WRONLY|os.O_APPEND, 0o644)
+		require.NoError(t, err)
+		_, err = w.Write(bytes.Repeat([]byte("more"), 256))
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+	}
+
+	capped := NewGentleSection(f, 0, int64(len(content)), Gentle{}, nil)
+	grow()
+	got, err := io.ReadAll(capped)
+	require.NoError(t, err)
+	assert.Len(t, got, len(content), "a capped section cannot see past where it was told to stop")
+
+	unbounded := NewGentleSection(f, 0, -1, Gentle{}, nil)
+	got, err = io.ReadAll(unbounded)
+	require.NoError(t, err)
+	assert.Len(t, got, len(content)+1024, "an unbounded one delivers what is really there, so ContentLength no longer matches")
+}
+
+// The pages a retry re-reads were dropped by the attempt that failed, so the
+// second pass goes to the disk where the first came off the cache. Pacing
+// follows the disk.
+func TestARewoundBodyPacesItsColdReread(t *testing.T) {
+	const size = 2 * GentleWindow
+	slept, _ := withRecordedReadPacing(t)
+	f, _ := sectionFixture(t, size)
+
+	// How a body is configured: it drops, and does not pace, because the
+	// checksum read that filled these pages did the pacing.
+	g := NewGentleSection(f, 0, size, Gentle{Drop: true}, nil)
+	_, err := io.Copy(io.Discard, g)
+	require.NoError(t, err)
+	assert.Empty(t, *slept, "the first pass reads what the checksum pass left cached")
+
+	_, err = g.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, g)
+	require.NoError(t, err)
+
+	var total time.Duration
+	for _, d := range *slept {
+		total += d
+	}
+	assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total,
+		"a retry re-reads from disk and has to be paced like any other cold read")
+}

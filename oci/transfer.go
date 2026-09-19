@@ -22,24 +22,22 @@ import (
 // underneath it. Reading the cached checksum for the path would be cheaper and
 // occasionally wrong, and being wrong costs the whole upload.
 //
-// Both read the same section of the same handle, so the length cannot describe
-// one file while the checksum describes another -- and a file that shrank in
-// between gives a short read here, which is an error rather than a checksum of
-// less than was promised.
+// The byte count comes back with the checksum because both have to describe
+// the same bytes, and both come from reading to the end rather than from a
+// stat. A body capped at a stat cannot notice that the file grew: it would
+// send the original prefix with a checksum matching it, and every part of that
+// object would agree with every other. Read to the end and the body delivers
+// more than the ContentLength promised, which fails the request.
 //
 // Under gentle I/O this is the read that pauses. It is the one that goes to
 // the disk; the body that follows reads the pages it just filled, and drops
 // them.
-func crc32cOfReader(f *os.File, size int64, gentle bool) (crc uint32, n int64, err error) {
+func crc32cOfReader(f *os.File, gentle bool) (crc uint32, n int64, err error) {
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-	section := common.NewGentleSection(f, 0, size, common.Gentle{Pause: gentle}, nil)
 	common.FadviseSequentialRead(f, common.Gentle{Pause: gentle})
-	read, err := io.Copy(h, section)
+	read, err := io.Copy(h, common.NewGentleSection(f, 0, -1, common.Gentle{Pause: gentle}, nil))
 	if err != nil {
 		return 0, 0, fmt.Errorf("oci: cannot read %s to checksum it: %w", f.Name(), err)
-	}
-	if read != size {
-		return 0, 0, fmt.Errorf("oci: %s is %d bytes, not the %d it measured: it was truncated before its upload started", f.Name(), read, size)
 	}
 	return h.Sum32(), read, nil
 }
@@ -108,7 +106,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb, ctx.GentleIO)
 	}
 
-	crc, size, err := crc32cOfReader(f, fileSize, ctx.GentleIO)
+	crc, size, err := crc32cOfReader(f, ctx.GentleIO)
 	if err != nil {
 		return err
 	}
@@ -127,7 +125,10 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	if ctx.Bars != nil {
 		pb = ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
 	}
-	body := common.NewGentleSection(f, 0, size, common.Gentle{Drop: ctx.GentleIO}, progressWriter(pb))
+	// To the end, not to size: see crc32cOfReader. A body that stopped at the
+	// length already measured could not tell a grown file from an unchanged
+	// one.
+	body := common.NewGentleSection(f, 0, -1, common.Gentle{Drop: ctx.GentleIO}, progressWriter(pb))
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,
