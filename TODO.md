@@ -1626,9 +1626,14 @@ one read as random to the kernel -- jam-core hit exactly that when it did the
 same (jam-core#105). `/proc/self/fd` keeps the part on the file that was
 opened, which is the file `crc32cToSend` has always described.
 
-Measured: nothing yet. The saving is the whole-file cold read; at the 65 MB/s
-jam-core saw for a single-threaded cold read on a pd-ssd, that is ~30 s on a
-2 GB file and ~20 min on 85 GB.
+Measured: nothing yet. What it saves depends on where the pass read from. A
+file just written on a machine with the memory to hold it -- mojo's hourly
+outputs, say -- is in the page cache, and the pass cost seconds; the upload
+reads it from there again anyway. It is a cold read of the whole file only
+when the file is not cached: larger than memory, written with DONTNEED
+(gentle I/O), long since evicted. There it was the whole file at single-stream
+disk speed before the first part started (jam-core saw 65 MB/s on a contended
+pd-ssd: ~20 min for 85 GB).
 
 ---
 
