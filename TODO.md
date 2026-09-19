@@ -2409,8 +2409,10 @@ listings never return would.
     if [[ "$mode" == "gs" ]]
     then
     start "regression: a composite upload terminated by SIGTERM leaves no parts"
-    # 600 MiB is 3 parts at the 256 MiB threshold; -c 2 runs two at a time, so
-    # two are committed while the third is still going
+    # 600 MiB is 3 parts at the 256 MiB threshold. -c 2 is meant to run two at
+    # a time, so that two are committed while the third is still going; until
+    # item 43 is fixed it runs all three at once, the window before the compose
+    # is short, and the guard below may report that nothing was proved
     fsig="folder_sigterm"
     mkdir -p $fsig
     dd if=/dev/urandom of=$fsig/big.bin bs=1048576 count=600 2>/dev/null
@@ -2513,8 +2515,11 @@ Checked by hand on fbdc019, all passing:
   - With scratch builds that lower `compositeMinSize` (24 MiB keeps the parts
     over the 16 MiB chunk, so they still go resumable, as real parts do):
     exactly at the threshold (one stream), one byte over (2 parts), the 32-part
-    cap, and `cp -r` of three composite files with `-c 2` and `-c 3` without a
-    deadlock.
+    cap, and `cp -r` of three composite files at once without a deadlock. Those
+    runs passed `-c 2` and `-c 3`, but the pool had 64 workers all the same
+    (item 43), so a small pool was never exercised: that the file and part
+    tasks cannot starve each other rests on `worker.Pool` giving each depth
+    workers of its own.
   - The failure #75 was written for, reproduced with `uat/faultproxy`: the
     final chunks reach the service, their answers are dropped, then a
     reconnect is refused. The service had committed parts whose writers saw an
@@ -2626,3 +2631,154 @@ large files at such a bucket. `bucketAllowsCompose` already looks at the bucket
 to rule out a retention policy; it could log the soft-delete retention the same
 way.
 
+
+---
+
+Items 43 to 45 were found on 2026-09-19 retesting main at e8266db, after #80
+and #81, against v1.0.42. That run found no regression in speed or
+reliability; these three predate it.
+
+The cases for 43 and 45 were run against e8266db and fail there only on the
+assertion about the item's own defect. Run with one worker instead (no `-m`),
+the same measurements read 2 connections and 82 MiB and pass, so they can tell
+a fix from no fix.
+
+## 43. `-c N` does not size the worker pool
+
+`Execute` builds the pool before cobra has parsed a flag:
+
+```go
+initFlags()                                  // cmd/root.go: scans os.Args for -m, --debug, --mock-fail, --gentle-io
+...
+pool = worker.New(getMultiThread(), true)    // multiThread is still its default, 64
+```
+
+`initFlags` picks `-m` out of `os.Args` by hand but not `-c`, which only
+reaches `multiThread` when cobra runs later. So with `-m` the pool always has
+64 workers per depth, whatever `-c` says. `gsg -m -c 2 --debug ls` logs
+`multiThread=64, getMultiThread=64`. It has been this way since the first
+commit (1fde8bf).
+
+What it costs:
+
+  - `-c` can neither lower concurrency, to spare memory or a shared disk, nor
+    raise it past 64. Item 45 is one place where lowering it would have been
+    the workaround.
+  - `RunContext.Concurrency` is read after parsing and does say N, so the two
+    disagree: `-m -c 1` turns composite uploads off (they want
+    `Concurrency > 1`) while 64 transfers still run at once.
+  - It misled testing: items 37 and 39 used `-c 2` to space parts out, and the
+    parts ran all at once. A 200 MiB composite upload with `-m -c 2` read all
+    32 of its parts in the first second.
+
+No pipeline is affected today: nothing in foreman, devops, jam-core, mojo or
+tomtom-transformer-v2 passes `-c`.
+
+**Fix:** build the pool once flags are parsed -- in a `PersistentPreRun`, or
+by reading `-c` in `initFlags` the way `-m` is.
+
+**Case for `uat.sh`:**
+
+```bash
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: -c bounds how many transfers run at once"
+    # counted as storage connections open at the same time, through the proxy;
+    # an idle keep-alive connection stays open, so the peak is the concurrency
+    fp_start
+    fconc="folder_concurrency"
+    mkdir -p $fconc
+    for i in $(seq -w 1 40); do head -c 1048576 /dev/urandom > $fconc/f$i.bin; done
+    HTTPS_PROXY=$fp_proxy ../gsg -m -c 2 cp -r $fconc "$remote_base/$fconc" >/dev/null 2>&1 &
+    pid=$!
+    peak=0
+    while kill -0 $pid 2>/dev/null
+    do
+        a=$(fp stats | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"])')
+        (( a > peak )) && peak=$a
+        sleep 0.05
+    done
+    wait $pid && rc=0 || rc=$?
+    fp_stop
+    echo "peak connections: $peak"
+    assertEq "cp -r with -c 2 exits 0" "$rc" "0"
+    assertEq "and all 40 arrived" "$(remote_count $fconc)" "40"
+    # two transfers, and room for the token and a listing
+    assertEq "no more than 4 connections were open at once" "$(( peak <= 4 ? 1 : 0 ))" "1"
+    rm -rf $fconc
+    finish
+    fi
+```
+
+---
+
+## 44. A composite attempt's leftover parts go unnoticed once `cp` retries
+
+Since #81, `cp` retries a failed upload. A composite attempt whose sweep could
+not reach every part -- a lookup refused, a delete that failed -- names those
+parts in its log and returns the error. The retry then uploads under a new
+uid, succeeds, and the command exits 0. The first attempt's parts stay in the
+bucket, and the log is the only place that says so.
+
+Measured with `uat/faultproxy` on macOS, the F3 sequence from the 2026-09-19
+testing: 5 parts of 20 MiB, answers dropped while the final chunks went out,
+then every connection reset and the next one refused. Part 3 failed on the
+reset. The one refused connection happened to be the sweep's lookup of part
+00, which logged `could not check 1 part(s) ... [...-00]`. The retry succeeded
+and `cp` exited 0, with part 00, 20 MiB, left beside the object. Before #81 the
+same run exited 1, so someone would have read the log. Under Linux the same
+sequence swept cleanly: which request the refusal lands on is a race.
+
+No case: the race decides whether the refused connection hits a part's
+reconnect or the sweep.
+
+**Fix:** keep the names an attempt could not settle, and sweep them again
+after the retry. A lookup refused a moment ago usually goes through by then,
+and the sweep already knows how to find a part and delete it by generation.
+Whatever is still left can be said once more at the end, where it is seen.
+Item 37's suggestion, that listings skip `*.gsg-part-*` names, would also keep
+such parts from spreading.
+
+---
+
+## 45. Small uploads each hold a 16 MiB buffer, about 2 GB under `-m`
+
+gsg never sets `Writer.ChunkSize`, so every upload gets the default of
+`googleapi.DefaultUploadChunkSize`, 16 MiB. gensupport allocates a buffer of
+that capacity for each one (`NewMediaBuffer`: `make([]byte, 0, chunkSize)`),
+however small the file. With `-m`, 64 uploads run at once (item 43), which is
+1 GiB of buffers before the garbage collector's headroom.
+
+Measured, 1000 files of 10 KiB each, `gsg -m cp -r`, three runs per version:
+maximum resident set size 2089 to 2157 MB, the same on v1.0.42 and on
+e8266db. `gsg -m rsync -r` of the same objects down peaks at about 200 MB.
+
+It is bounded by the pool, not by the number of files, so about 2 GB is the
+ceiling. foreman's transfer jobs have 12 Gi (`getResourcesForDownloads`), so
+the pipeline is fine. A smaller container is not, and because of item 43,
+`-c` cannot bring it down.
+
+**Fix:** size the chunk to the file when the file is smaller than the default.
+`ChunkSize` rounds up to a multiple of 256 KiB, so a 10 KiB upload would hold
+256 KiB instead of 16 MiB and still go as one request. Leave larger files, and
+composite parts, at 16 MiB.
+
+**Case for `uat.sh`:**
+
+```bash
+    start "regression: small uploads do not each hold a 16 MiB buffer"
+    fsmall="folder_smallmem"
+    mkdir -p $fsmall
+    for i in $(seq -w 1 1000); do head -c 10240 /dev/urandom > $fsmall/f$i.bin; done
+    /usr/bin/time -l ../gsg -m cp -r $fsmall "$remote_base/$fsmall" > /dev/null 2> .time_small
+    rss=$(awk '/maximum resident set size/ {printf "%d", $1/1048576}' .time_small)
+    echo "maximum resident set size: ${rss} MiB"
+    assertEq "and all 1000 arrived" "$(remote_count $fsmall)" "1000"
+    # the race detector multiplies memory use, so the bound means nothing there
+    if [[ "${GSG_UAT_RACE:-}" != "1" ]]
+    then
+        assertEq "1000 files of 10 KiB upload in under 512 MiB" "$(( rss < 512 ? 1 : 0 ))" "1"
+    fi
+    rm -rf $fsmall .time_small
+    finish
+```
