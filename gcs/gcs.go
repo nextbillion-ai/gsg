@@ -384,6 +384,14 @@ func (g *GCS) Download(
 	logger.Debug(module, "Downloading [%s] with %d chunk(s), chunk size: %d bytes, total size: %d bytes", prefix, chunkNumber, chunkSize, attrs.Size)
 
 	// paralell copy by range
+	//
+	// Every chunk reads the generation the lookup above saw. The chunks are
+	// separate range reads, and by name each one would read whatever the object
+	// is when it opens: an overwrite landing mid-download spliced two versions
+	// into a file that never existed, and without -v nothing noticed. Pinned, a
+	// chunk opened after the overwrite still reads the old generation where
+	// versioning keeps it, and fails where it does not.
+	obj := g.client.Bucket(bucket).Object(prefix).Generation(attrs.Generation)
 	var pb *bar.ProgressBar
 	var wg sync.WaitGroup
 	var once sync.Once
@@ -419,9 +427,7 @@ func (g *GCS) Download(
 				})
 
 				// create reader with offset and length of object
-				rc, err := g.client.Bucket(bucket).Object(prefix).NewRangeReader(
-					context.Background(), startByte, length,
-				)
+				rc, err := obj.NewRangeReader(context.Background(), startByte, length)
 				if err != nil {
 					logger.Info(module, "download object failed when create reader with %s", err)
 					common.Exit()
@@ -494,10 +500,13 @@ func (g *GCS) Download(
 	if ctx.GentleIO {
 		return verifyGentleDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
 	}
-	if err = g.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
-		return err
+	// Settled against the generation the chunks read, not a fresh lookup by
+	// name: an overwrite landing after the last chunk would otherwise have a
+	// correct copy of the old generation reported as corrupt.
+	if !forceChecksum {
+		return nil
 	}
-	return nil
+	return mustMatchCRC32C(dstFile, bucket, prefix, attrs.CRC32C)
 }
 
 // verifyGentleDownload settles a gentle download from the sums its chunks took
@@ -1104,38 +1113,32 @@ func GetFileModificationTime(attrs *storage.ObjectAttrs) time.Time {
 	return mt
 }
 
-// equalCRC32C return true if CRC32C values are the same
-// - compare a local file with an object from gcp
-func (g *GCS) equalCRC32C(localPath, bucket, object string) (bool, error) {
-	localCRC32C := common.GetFileCRC32C(localPath)
-	gcpCRC32C := uint32(0)
-	var err error
-	var attr *storage.ObjectAttrs
-	if attr, err = g.GCSAttrs(bucket, object); err != nil {
-		return false, err
-	}
-	if attr != nil {
-		gcpCRC32C = attr.CRC32C
-	}
-	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
-		localPath, bucket, object, localCRC32C, gcpCRC32C)
-	return localCRC32C == gcpCRC32C, nil
-}
-
 // MustEqualCRC32C compare CRC32C values if flag is set
 // - compare a local file with an object from gcp
-// - exit process if values are different
+// - return an error if values are different
 func (g *GCS) MustEqualCRC32C(flag bool, localPath, bucket, object string) error {
 	if !flag {
 		return nil
 	}
 	var err error
-	var ok bool
-	if ok, err = g.equalCRC32C(localPath, bucket, object); err != nil {
+	var attr *storage.ObjectAttrs
+	if attr, err = g.GCSAttrs(bucket, object); err != nil {
 		return err
 	}
+	want := uint32(0)
+	if attr != nil {
+		want = attr.CRC32C
+	}
+	return mustMatchCRC32C(localPath, bucket, object, want)
+}
 
-	if !ok {
+// mustMatchCRC32C compares a local file against a checksum already in hand, so
+// a download can settle against the generation its chunks read.
+func mustMatchCRC32C(localPath, bucket, object string, want uint32) error {
+	local := common.GetFileCRC32C(localPath)
+	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
+		localPath, bucket, object, local, want)
+	if local != want {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 		logger.Info(module, log)
 		return fmt.Errorf(log)

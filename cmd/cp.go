@@ -25,6 +25,11 @@ func init() {
 	rootCmd.AddCommand(cpCmd)
 }
 
+// Every transfer below goes through DoWithRetrySimple, as rsync's always have.
+// cp used to send each file once, and one dropped connection failed the
+// command: underneath, storage v1.22.1 sends an upload smaller than a chunk
+// exactly once, and google.golang.org/api v0.93 retries a chunk after a reset
+// only on Linux, and never after a broken pipe or a bare EOF.
 func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 	var err error
 	switch src.FileType() {
@@ -40,7 +45,9 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 				wg.Add(1)
 				pool.Add(func() {
 					defer wg.Done()
-					if e := dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
+					if e := common.DoWithRetrySimple(func() error {
+						return dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+					}); e != nil {
 						common.ExitWith(e)
 					}
 				})
@@ -58,7 +65,9 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 		wg.Add(1)
 		pool.Add(func() {
 			defer wg.Done()
-			if e := dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
+			if e := common.DoWithRetrySimple(func() error {
+				return dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+			}); e != nil {
 				common.ExitWith(e)
 			}
 		})
@@ -77,8 +86,18 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 			if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
 				common.ExitWith(err)
 			}
-			for _, obj := range objs {
-				dstPath := common.GetDstPath(src.Prefix, obj.Prefix, dst.Prefix)
+			// Every destination is checked before anything is fetched, so a name
+			// that climbs out of dst refuses the copy rather than whatever share
+			// of it had started by the time the name was reached.
+			dstPaths := make([]string, len(objs))
+			for i, obj := range objs {
+				if dstPaths[i], err = common.GetLocalDstPath(src.Prefix, obj.Prefix, dst.Prefix); err != nil {
+					common.ExitWith(err)
+					return
+				}
+			}
+			for i, obj := range objs {
+				dstPath := dstPaths[i]
 				srcPath := obj.Prefix
 				wg.Add(1)
 				pool.Add(func() {
@@ -89,7 +108,9 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 					// writes err and then reads it back for the comparison, and
 					// another goroutine overwriting it in between let a
 					// goroutine miss its own failure and report nothing.
-					if e := src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); e != nil {
+					if e := common.DoWithRetrySimple(func() error {
+						return src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+					}); e != nil {
 						common.ExitWith(e)
 					}
 				})
@@ -102,9 +123,14 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 		dstPrefix := dst.Prefix
 		if dst.FileType() == system.FileType_Directory {
 			_, name := common.ParseFile(src.Prefix)
-			dstPrefix = common.JoinPath(dst.Prefix, name)
+			if dstPrefix, err = common.JoinLocalPath(dst.Prefix, name); err != nil {
+				common.ExitWith(err)
+				return
+			}
 		}
-		if err = src.System.Download(src.Bucket, src.Prefix, dstPrefix, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+		if err = common.DoWithRetrySimple(func() error {
+			return src.System.Download(src.Bucket, src.Prefix, dstPrefix, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+		}); err != nil {
 			common.ExitWith(err)
 		}
 	case system.FileType_Invalid:
@@ -148,15 +174,27 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			if objs, err = src.System.List(src.Bucket, src.Prefix, isRec); err != nil {
 				common.ExitWith(err)
 			}
-			for _, obj := range objs {
-				interPath := common.GetDstPath(src.Prefix, obj.Prefix, interChange.Prefix)
+			// the intermediate files are local, so their paths are checked as a
+			// download's are, all before anything is fetched
+			interPaths := make([]string, len(objs))
+			for i, obj := range objs {
+				if interPaths[i], err = common.GetLocalDstPath(src.Prefix, obj.Prefix, interChange.Prefix); err != nil {
+					removeWorkDir()
+					common.ExitWith(err)
+					return
+				}
+			}
+			for i, obj := range objs {
+				interPath := interPaths[i]
 				dstPath := common.GetDstPath(linux.GetRealPath(interChange.Prefix), obj.Prefix, dst.Prefix)
 				srcPath := obj.Prefix
 				wg.Add(1)
 				pool.Add(func() {
 					var err error
 					defer wg.Done()
-					if err = src.System.Download(src.Bucket, srcPath, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+					if err = common.DoWithRetrySimple(func() error {
+						return src.System.Download(src.Bucket, srcPath, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+					}); err != nil {
 						common.ExitWith(err)
 					}
 					interFile := system.ParseFileObject(interPath)
@@ -164,7 +202,9 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 						logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
 						common.Exit()
 					}
-					if err = dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+					if err = common.DoWithRetrySimple(func() error {
+						return dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+					}); err != nil {
 						logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPath, err)
 						common.Exit()
 					}
@@ -186,8 +226,15 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 		if dst.FileType() == system.FileType_Directory {
 			dstPrefix = common.JoinPath(dst.Prefix, name)
 		}
-		interPath := common.JoinPath(interChange.Prefix, name)
-		if err = src.System.Download(src.Bucket, src.Prefix, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+		var interPath string
+		if interPath, err = common.JoinLocalPath(interChange.Prefix, name); err != nil {
+			removeWorkDir()
+			common.ExitWith(err)
+			return
+		}
+		if err = common.DoWithRetrySimple(func() error {
+			return src.System.Download(src.Bucket, src.Prefix, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+		}); err != nil {
 			common.ExitWith(err)
 		}
 		interFile := system.ParseFileObject(interPath)
@@ -195,7 +242,9 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
 			common.Exit()
 		}
-		if err = dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO}); err != nil {
+		if err = common.DoWithRetrySimple(func() error {
+			return dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
+		}); err != nil {
 			logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPrefix, err)
 			common.Exit()
 		}

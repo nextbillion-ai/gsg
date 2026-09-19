@@ -2026,8 +2026,10 @@ Most items end with a case written for `uat.sh`: it runs in `do_test` from
 is meant to go in with the fix. Each was run against fbdc019: it fails there
 only on assertions about the item's own defect, and the assertions that guard
 what must keep working already pass (item 39's case passes except for its last
-assertion, which is item 40). Item 42 has no case. The fault-injection cases need the helpers given under item 35 and a
-running `uat/faultproxy`.
+assertion, which is item 40). Item 42 has no case. The fault-injection cases
+use the `fp_*` helpers `uat.sh` defines, which start `uat/faultproxy`
+themselves. Items 32, 33 and 35 are fixed, and their cases have moved into
+`uat.sh`.
 
 ## 32. A gs download can assemble a file from two versions of an object
 
@@ -2066,40 +2068,15 @@ one, and verify against `attrs.CRC32C` from that same lookup rather than
 looking the name up again in `MustEqualCRC32C`. Otherwise an overwrite landing
 after the last chunk makes a correct copy of the old version read as corrupt.
 
-**Case for `uat.sh`:**
-
-```bash
-    start "regression: a download does not assemble two generations of an object"
-    # Chunks are separate range reads, and each must read the generation the
-    # first lookup saw. No -m and 1 MiB chunks make the reads sequential, so the
-    # overwrite reliably lands between two of them. Random content: a spliced
-    # file then matches neither version.
-    fspl="folder_splice"
-    mkdir -p $fspl
-    dd if=/dev/urandom of=$fspl/v1.bin bs=1048576 count=64 2>/dev/null
-    dd if=/dev/urandom of=$fspl/v2.bin bs=1048576 count=64 2>/dev/null
-    gsutil -q cp $fspl/v2.bin "$remote_base/$fspl/v2.bin"
-    gsutil -q cp $fspl/v1.bin "$remote_base/$fspl/target.bin"
-    ../gsg --chunk-size 1048576 cp "$remote_base/$fspl/target.bin" $fspl/out.bin >/dev/null 2>&1 &
-    spl=$!
-    sleep 1.5
-    gsutil -q cp "$remote_base/$fspl/v2.bin" "$remote_base/$fspl/target.bin"
-    if ! kill -0 $spl 2>/dev/null
-    then
-        echo "FATAL: the download ended before the overwrite landed, so this proved nothing -- use a larger object"
-        exit 1
-    fi
-    wait $spl && rc=0 || rc=$?
-    if [[ $rc -eq 0 ]]
-    then
-        assertOk "a download that exits 0 holds exactly one version" \
-            bash -c "cmp -s $fspl/out.bin $fspl/v1.bin || cmp -s $fspl/out.bin $fspl/v2.bin"
-    else
-        echo "OK: the download failed rather than splice (exit $rc)"
-    fi
-    rm -rf $fspl
-    finish
-```
+**Fixed in PR #80.** Every chunk opens
+`Object(prefix).Generation(attrs.Generation)`, and `-v` settles against
+`attrs.CRC32C` from the same lookup instead of looking the name up again. A
+chunk that opens after an overwrite now fails -- unless versioning keeps the old
+generation, in which case it reads it. Pinned by
+`TestDownloadReadsEveryChunkFromTheGenerationItLookedUp`, which fails against
+the previous code with the replacement's bytes and no generation on any chunk.
+s3 still reads by key. The case is in `uat.sh`: "regression: a download does
+not assemble two generations of an object".
 
 ---
 
@@ -2131,25 +2108,16 @@ under the destination (`filepath.Rel` not starting with `..`), and fail with an
 error naming the object. It belongs where `JoinPath` and `GetDstPath` are
 called for downloads, so it covers gs, s3 and oci at once.
 
-**Case for `uat.sh`:**
-
-```bash
-    start "regression: an object name cannot place a file outside the destination"
-    ftrv="folder_traversal"
-    mkdir -p ${ftrv}_jail/dst
-    echo fine > .ok
-    echo EVIL > .evil
-    gsutil -q cp .ok "$remote_base/$ftrv/src/ok.txt"
-    gsutil -q cp .evil "$remote_base/$ftrv/src/../esc/evil.txt"   # a name, stored verbatim
-    gsutil -q cp .evil "$remote_base/$ftrv/esc/evil.txt"          # what the XML reader resolves it to
-    ../gsg -m cp -r "$remote_base/$ftrv/src" ${ftrv}_jail/dst/cp >/dev/null 2>&1 || true
-    ../gsg -m rsync -r "$remote_base/$ftrv/src" ${ftrv}_jail/dst/rs >/dev/null 2>&1 || true
-    assertEq "nothing was written outside the two destinations" \
-        "$(find ${ftrv}_jail -type f ! -path '*/dst/cp/*' ! -path '*/dst/rs/*' | wc -l | tr -d ' ')" "0"
-    assertEq "the ordinary object still arrived" "$(cat ${ftrv}_jail/dst/cp/ok.txt 2>/dev/null)" "fine"
-    rm -rf ${ftrv}_jail .ok .evil
-    finish
-```
+**Fixed in PR #80,** by refusing rather than skipping. `common.JoinLocalPath`
+and `GetLocalDstPath` join as before and return an error naming the object when
+the result would leave the directory. `cp` (both download branches and the
+intermediate files of an inter-cloud copy) and `rsync`'s download direction
+check every destination before fetching anything, so a bad name refuses the
+whole transfer instead of whatever share of it had started. Pinned by
+`TestJoinLocalPath`, `TestCpRefusesANameThatClimbsOutOfTheDestination` and
+`TestDownsyncRefusesANameThatClimbsOutOfTheDestination`. The case is in
+`uat.sh`: "regression: an object name cannot place a file outside the
+destination".
 
 ---
 
@@ -2236,66 +2204,17 @@ covers every error class at the cost of restarting one file. Upgrading storage
 and api would add the finer-grained chunk retries, but v1.22.1 is from 2022,
 so that change is larger and should be measured before and after.
 
-**Helpers for the fault-injection cases (items 35, 36, 39)**, to be defined once
-in `uat.sh`:
+**Fixed in PR #80.** `cp` wraps every `Upload` and `Download` -- both
+branches each way, and both halves of an inter-cloud copy -- in
+`DoWithRetrySimple`, as `rsync` does. Pinned by
+`TestCpUploadTriesAgainAfterAFailedAttempt` and
+`TestCpDownloadTriesAgainAfterAFailedAttempt`. For a gs download the retry
+only takes effect once item 36 is fixed, since a failed chunk still ends the
+process before `Download` can return. The library upgrade stays open.
 
-```bash
-    # Needs uat/faultproxy running:
-    #   go build -o /tmp/faultproxy ./uat/faultproxy && /tmp/faultproxy &
-    # It proxies on 127.0.0.1:18080 and takes commands on 127.0.0.1:18081.
-    fp_ctl=http://127.0.0.1:18081
-    fp_proxy=http://127.0.0.1:18080
-    fp() { curl -sf "$fp_ctl/$1"; }
-    fp_require() {
-        fp stats >/dev/null || { echo "FATAL: start uat/faultproxy first"; exit 1; }
-        fp reset >/dev/null
-        fp "mode?set=pass" >/dev/null
-    }
-    fp_bytes() { fp stats | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
-    # fp_wait up|down <bytes>: wait for that much traffic through the proxy, 5 minutes at most
-    fp_wait() {
-        local t=0
-        while (( $(fp_bytes $1) < $2 && t < 1500 )); do sleep 0.2; t=$((t + 1)); done
-        (( $(fp_bytes $1) >= $2 )) || { echo "FATAL: only $(fp_bytes $1) bytes $1 after 5 minutes"; exit 1; }
-    }
-    # fp_blip: reset every open storage connection once, and insist something was hit
-    fp_blip() {
-        local n
-        n=$(fp "mode?set=blip" | awk '{print $3}')
-        [[ "$n" -gt 0 ]] || { echo "FATAL: the reset found no connection, so this proved nothing"; exit 1; }
-    }
-```
-
-**Case for `uat.sh`:**
-
-```bash
-    start "regression: one dropped connection does not fail a cp upload"
-    fp_require
-    fdrop="folder_drop"
-    mkdir -p $fdrop/many
-    dd if=/dev/urandom of=$fdrop/one.bin bs=1048576 count=60 2>/dev/null
-    for i in $(seq -w 1 150); do head -c 262144 /dev/urandom > $fdrop/many/f$i.bin; done
-
-    HTTPS_PROXY=$fp_proxy ../gsg cp $fdrop/one.bin "$remote_base/$fdrop/one.bin" >/dev/null 2>&1 &
-    pid=$!
-    fp_wait up $((30 << 20))
-    fp_blip
-    wait $pid && rc=0 || rc=$?
-    assertEq "a single-stream cp survives a reset" "$rc" "0"
-    gsutil -q cp "$remote_base/$fdrop/one.bin" $fdrop/one.back
-    assertOk "and stored the whole file" cmp $fdrop/one.bin $fdrop/one.back
-
-    fp reset >/dev/null
-    HTTPS_PROXY=$fp_proxy ../gsg -m cp -r $fdrop/many "$remote_base/$fdrop/many" >/dev/null 2>&1 &
-    pid=$!
-    fp_wait up $((15 << 20))
-    fp_blip
-    wait $pid && rc=0 || rc=$?
-    assertEq "cp -r of small files survives a reset" "$rc" "0"
-    assertEq "and stored all 150" "$(remote_count $fdrop/many)" "150"
-    rm -rf $fdrop
-    finish
-```
+The case is in `uat.sh`: "regression: one dropped connection does not fail a cp
+upload". The `fp_*` helpers the fault-injection cases use are there too;
+`fp_start` builds and starts `uat/faultproxy` and `fp_stop` ends it.
 
 ---
 
@@ -2327,11 +2246,11 @@ the chunk itself before giving up on the file. Mind the schedule:
 reconnect but not an outage of a few seconds, and the second half of the case
 below asks for that. s3 has the same `common.Exit()` calls.
 
-**Case for `uat.sh`** (helpers under item 35):
+**Case for `uat.sh`** (the `fp_*` helpers in `uat.sh`):
 
 ```bash
     start "regression: a download chunk that loses its connection is retried, not abandoned"
-    fp_require
+    fp_start
     fdl="folder_dlfault"
     mkdir -p $fdl
     dd if=/dev/urandom of=$fdl/obj.bin bs=1048576 count=120 2>/dev/null
@@ -2358,6 +2277,7 @@ below asks for that. s3 has the same `common.Exit()` calls.
     wait $pid && rc=0 || rc=$?
     assertEq "rsync bridges a 5 s outage" "$rc" "0"
     assertOk "and the file is whole" cmp $fdl/obj.bin $fdl/sync/obj.bin
+    fp_stop
     rm -rf $fdl
     finish
 ```
@@ -2508,8 +2428,8 @@ Checked by hand on fbdc019, all passing:
     parts behind, both named in the failure log.
 
 **Case for `uat.sh`**, the gs branch of that case. Its last assertion is
-item 40 and fails until that is fixed. The sweep assertion needs the helpers
-under item 35:
+item 40 and fails until that is fixed. The sweep assertion uses the `fp_*`
+helpers in `uat.sh`:
 
 ```bash
     if [[ "$mode" == "gs" ]]
@@ -2536,7 +2456,7 @@ under item 35:
     # still swept. 2 parts of 150 MiB go as 9 chunks of 16 MiB and a final
     # 6 MiB each: drop the answers once the full chunks are out, so the final
     # chunks are committed unheard, then refuse one reconnect.
-    fp_require
+    fp_start
     HTTPS_PROXY=$fp_proxy ../gsg -m cp $fcomp/big.bin "$remote_base/$fcomp/swept.bin" >/dev/null 2>&1 &
     pid=$!
     fp_wait up $((290 << 20))
@@ -2548,6 +2468,7 @@ under item 35:
     assertEq "a failed attempt leaves no part, even one committed unheard" \
         "$(gsutil ls "$remote_base/$fcomp/" | grep -c 'gsg-part-' || true)" "0"
 
+    fp_stop
     # item 40: a name the part suffix would push past 1024 bytes
     long=$(printf 'n%.0s' $(seq 1 $((1000 - ${#testid} - ${#fcomp} - 2))))
     assertOk "a 1000-byte name uploads with -m above the threshold" \

@@ -1,6 +1,7 @@
 package common
 
 import (
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,27 @@ func GetDstPath(srcPrefix, srcPath, dstPrefix string) string {
 	relativePath := GetRelativePath(srcPrefix, srcPath)
 	dstPath := JoinPath(dstPrefix, relativePath)
 	return dstPath
+}
+
+// GetLocalDstPath is GetDstPath for a file written from an object: the result
+// has to stay inside dstPrefix. See JoinLocalPath.
+func GetLocalDstPath(srcPrefix, srcPath, dstPrefix string) (string, error) {
+	return JoinLocalPath(dstPrefix, GetRelativePath(srcPrefix, srcPath))
+}
+
+// JoinLocalPath joins a path taken from an object name onto a local directory,
+// and refuses it when the result would not be inside that directory.
+//
+// A listing returns object names verbatim and a service accepts ".." in them,
+// so "src/../esc/f" copied from "src" into "dst" would otherwise be written to
+// "dst/../esc/f" -- wherever the name points, as far up as it cares to climb.
+func JoinLocalPath(dir, rel string) (string, error) {
+	joined := JoinPath(dir, rel)
+	inside, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(joined))
+	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("refusing to write %q: it would land outside %s", rel, dir)
+	}
+	return joined, nil
 }
 
 // IsSubPath checks if a path is under another one in directory manner
