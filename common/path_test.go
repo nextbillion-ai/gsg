@@ -357,3 +357,44 @@ func TestIsSubPath(t *testing.T) {
 		assert.Equal(t, test.expected, IsSubPath(test.subPath, test.path), fmt.Sprintf("test case %d", i))
 	}
 }
+
+// Object names are joined onto a local directory, and a name may climb out of
+// it with "..": that has to be refused, and nothing else may be.
+func TestJoinLocalPath(t *testing.T) {
+	tests := []struct {
+		dir, rel string
+		want     string // "" when it must be refused
+	}{
+		{dir: "dst", rel: "a/b.txt", want: "dst/a/b.txt"},
+		{dir: "dst/", rel: "a.txt", want: "dst/a.txt"},
+		{dir: "/abs/dst", rel: "a/./b.txt", want: "/abs/dst/a/b.txt"},
+		{dir: "dst", rel: "a/../b.txt", want: "dst/b.txt"}, // climbs, but not out
+		{dir: "dst", rel: "..a/b..txt", want: "dst/..a/b..txt"},
+		{dir: "dst", rel: "/a.txt", want: "dst/a.txt"}, // a leading slash is just a separator
+		{dir: ".", rel: "a.txt", want: "a.txt"},
+		{dir: "", rel: "a.txt", want: "a.txt"},
+		{dir: "dst", rel: "../esc/evil.txt"},
+		{dir: "dst/rs", rel: "../esc/evil.txt"},
+		{dir: "dst", rel: "a/../../evil.txt"},
+		{dir: "dst", rel: ".."},
+		{dir: "/abs/dst", rel: "../../../../etc/cron.d/x"},
+		{dir: ".", rel: "../x"},
+	}
+	for _, tt := range tests {
+		got, err := JoinLocalPath(tt.dir, tt.rel)
+		if tt.want == "" {
+			assert.Error(t, err, "%q onto %q must be refused", tt.rel, tt.dir)
+			continue
+		}
+		assert.NoError(t, err, "%q onto %q", tt.rel, tt.dir)
+		assert.Equal(t, tt.want, got, "%q onto %q", tt.rel, tt.dir)
+	}
+}
+
+func TestGetLocalDstPathRefusesANameThatClimbsOut(t *testing.T) {
+	got, err := GetLocalDstPath("p/src", "p/src/a/b.txt", "dst")
+	assert.NoError(t, err)
+	assert.Equal(t, "dst/a/b.txt", got)
+	_, err = GetLocalDstPath("p/src", "p/src/../esc/evil.txt", "dst")
+	assert.Error(t, err)
+}

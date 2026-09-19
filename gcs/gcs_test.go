@@ -3,6 +3,8 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -16,7 +18,10 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/nextbillion-ai/gsg/bar"
 	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/system"
+	"github.com/nextbillion-ai/gsg/worker"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,17 +33,6 @@ func TestConfigPath(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "test_path")
 	assert.Equal(t, "test_path", ConfigPath())
 }
-
-/*
-func TestEuqalCRC32C(t *testing.T) {
-	g := GCS{}
-
-	assert.True(t, g.equalCRC32C("invalid", "invalid", "invalid"))
-	assert.False(t, g.equalCRC32C("gcs.go", "invalid", "invalid"))
-	// assert.True(t, equalCRC32C("usa.geojson", "maaas", "borders/usa.geojson"))
-	// assert.False(t, equalCRC32C("invalid", "maaas", "borders/usa.geojson"))
-}
-*/
 
 // A lock cache left short by a run that died mid-write used to panic here with
 // "index out of range" when decoded as a uint64. There is no generation to
@@ -483,4 +477,71 @@ func TestVerifyGentleDownloadOfAnEmptyObject(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty")
 	require.NoError(t, os.WriteFile(path, nil, 0644))
 	assert.NoError(t, verifyGentleDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0}))
+}
+
+// Chunks are separate range reads, and each must ask for the generation the
+// first lookup saw. Here the object is replaced right after that lookup: by
+// name every chunk would read the replacement, and the lookups that follow
+// describe it too, so -v looking the object up again would pass the wrong file.
+func TestDownloadReadsEveryChunkFromTheGenerationItLookedUp(t *testing.T) {
+	old := []byte("0123456789abcdefghij")
+	replacement := []byte("ABCDEFGHIJKLMNOPQRST")
+	sum := func(b []byte) string {
+		var c [4]byte
+		binary.BigEndian.PutUint32(c[:], crc32.Checksum(b, crc32.MakeTable(crc32.Castagnoli)))
+		return base64.StdEncoding.EncodeToString(c[:])
+	}
+	var mu sync.Mutex
+	lookups := 0
+	var generations []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Query().Get("alt") == "json" { // the JSON API: a lookup
+			lookups++
+			crc := sum(old)
+			if lookups > 1 {
+				crc = sum(replacement)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"bucket":"b","name":"o","size":"%d","generation":"7","crc32c":"%s","updated":"2026-01-02T03:04:05Z"}`, len(old), crc)
+			return
+		}
+		generation := r.URL.Query().Get("generation")
+		generations = append(generations, generation)
+		body := replacement
+		if generation == "7" {
+			body = old
+		}
+		var start, end int
+		_, _ = fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[start : end+1])
+	}))
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+
+	pool := worker.New(2, false)
+	pool.Run()
+	defer pool.Close()
+	bars, err := bar.New()
+	require.NoError(t, err)
+
+	dst := filepath.Join(t.TempDir(), "o")
+	g := &GCS{client: client}
+	err = g.Download("b", "o", dst, true, system.RunContext{Pool: pool, Concurrency: 2, Bars: bars, ChunkSize: 4})
+	require.NoError(t, err, "the file matches the generation it was read from")
+	got, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	assert.Equal(t, string(old), string(got))
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, generations, 5, "20 bytes in chunks of 4")
+	for _, generation := range generations {
+		assert.Equal(t, "7", generation, "every chunk pinned to the generation looked up")
+	}
+	assert.Equal(t, 1, lookups, "the checksum is settled against the first lookup, not a second one")
 }

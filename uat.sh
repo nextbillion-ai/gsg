@@ -397,6 +397,48 @@ poisonNewTmp() {
     echo "$n"
 }
 
+# Fault injection, for the cases that need a connection broken on cue.
+# fp_start builds uat/faultproxy and starts it on 127.0.0.1:18080, taking
+# commands on 127.0.0.1:18081; fp_stop ends it, and do_test's exit trap calls
+# it too, so a failing case does not leave the proxy behind.
+fp_ctl=http://127.0.0.1:18081
+fp_proxy=http://127.0.0.1:18080
+fp() { curl -sf "$fp_ctl/$1"; }
+fp_bytes() { fp stats | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+# fp_wait up|down <bytes>: wait for that much traffic through the proxy, 5 minutes at most
+fp_wait() {
+    local t=0
+    while (( $(fp_bytes $1) < $2 && t < 1500 )); do sleep 0.2; t=$((t + 1)); done
+    (( $(fp_bytes $1) >= $2 )) || { echo "FATAL: only $(fp_bytes $1) bytes $1 after 5 minutes"; exit 1; }
+}
+# fp_blip: reset every open storage connection once, and insist something was hit
+fp_blip() {
+    local n
+    n=$(fp "mode?set=blip" | awk '{print $3}')
+    [[ "$n" -gt 0 ]] || { echo "FATAL: the reset found no connection, so this proved nothing"; exit 1; }
+}
+fp_start() {
+    local bin="$PWD/faultproxy"
+    (cd "$repoRoot" && go build -o "$bin" ./uat/faultproxy) || { echo "FATAL: cannot build uat/faultproxy"; exit 1; }
+    "$bin" > faultproxy.log 2>&1 &
+    fp_pid=$!
+    local t=0
+    until fp stats >/dev/null 2>&1
+    do
+        sleep 0.2; t=$((t + 1))
+        (( t < 50 )) || { echo "FATAL: uat/faultproxy did not start, see faultproxy.log"; exit 1; }
+    done
+    fp reset >/dev/null
+}
+fp_stop() {
+    if [[ -n "${fp_pid:-}" ]]
+    then
+        kill "$fp_pid" 2>/dev/null || true
+        wait "$fp_pid" 2>/dev/null || true
+        fp_pid=""
+    fi
+}
+
 do_test() {
     mode=$1
     remote_base="$1$remote_base_template"
@@ -404,7 +446,7 @@ do_test() {
         # A failing assertion exits immediately, which skips the cleanup below and
     # is usually what you want -- the remote state is what you need to look at.
     # Say where it is, since the prefix is timestamped.
-    trap 'code=$?; if [[ $code -ne 0 ]]; then
+    trap 'code=$?; fp_stop; if [[ $code -ne 0 ]]; then
         echo
         echo "test data left behind for inspection at: $remote_base"
         case $mode in
@@ -1672,6 +1714,98 @@ GOHELPER
     fi
 
     rm -f .lsout .rsout
+    finish
+    fi
+
+    # TODO 32. gs only: the fixture is made and replaced with gsutil.
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: a download does not assemble two generations of an object"
+    # Chunks are separate range reads, and each must read the generation the
+    # first lookup saw. No -m and 1 MiB chunks make the reads sequential, so the
+    # overwrite reliably lands between two of them. Random content: a spliced
+    # file then matches neither version.
+    fspl="folder_splice"
+    mkdir -p $fspl
+    dd if=/dev/urandom of=$fspl/v1.bin bs=1048576 count=64 2>/dev/null
+    dd if=/dev/urandom of=$fspl/v2.bin bs=1048576 count=64 2>/dev/null
+    gsutil -q cp $fspl/v2.bin "$remote_base/$fspl/v2.bin"
+    gsutil -q cp $fspl/v1.bin "$remote_base/$fspl/target.bin"
+    ../gsg --chunk-size 1048576 cp "$remote_base/$fspl/target.bin" $fspl/out.bin >/dev/null 2>&1 &
+    spl=$!
+    sleep 1.5
+    # Checked before the overwrite, not after: a pinned download fails at the
+    # first chunk after the overwrite, which can be before gsutil returns.
+    if ! kill -0 $spl 2>/dev/null
+    then
+        echo "FATAL: the download ended before the overwrite began, so this proved nothing -- use a larger object"
+        exit 1
+    fi
+    gsutil -q cp "$remote_base/$fspl/v2.bin" "$remote_base/$fspl/target.bin"
+    wait $spl && rc=0 || rc=$?
+    if [[ $rc -eq 0 ]]
+    then
+        assertOk "a download that exits 0 holds exactly one version" \
+            bash -c "cmp -s $fspl/out.bin $fspl/v1.bin || cmp -s $fspl/out.bin $fspl/v2.bin"
+    else
+        echo "OK: the download failed rather than splice (exit $rc)"
+    fi
+    rm -rf $fspl
+    finish
+    fi
+
+    # TODO 33. gs only: gsutil is what stores a name with .. verbatim; the check
+    # itself is in cmd/ and covers every backend.
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: an object name cannot place a file outside the destination"
+    ftrv="folder_traversal"
+    mkdir -p ${ftrv}_jail/dst
+    echo fine > .ok
+    echo EVIL > .evil
+    gsutil -q cp .ok "$remote_base/$ftrv/src/ok.txt"
+    gsutil -q cp .evil "$remote_base/$ftrv/src/../esc/evil.txt"   # a name, stored verbatim
+    gsutil -q cp .evil "$remote_base/$ftrv/esc/evil.txt"          # what the XML reader resolves it to
+    # the copy is refused as a whole, before anything is fetched
+    ../gsg -m cp -r "$remote_base/$ftrv/src" ${ftrv}_jail/dst/cp >/dev/null 2>&1 && rc=0 || rc=$?
+    assertEq "cp -r refuses the copy" "$([[ $rc -ne 0 ]] && echo refused || echo 'exit 0')" "refused"
+    ../gsg -m rsync -r "$remote_base/$ftrv/src" ${ftrv}_jail/dst/rs >/dev/null 2>&1 && rc=0 || rc=$?
+    assertEq "rsync -r refuses the sync" "$([[ $rc -ne 0 ]] && echo refused || echo 'exit 0')" "refused"
+    assertEq "and nothing was written, inside the destinations or out" \
+        "$(find ${ftrv}_jail -type f | wc -l | tr -d ' ')" "0"
+    rm -rf ${ftrv}_jail .ok .evil
+    finish
+    fi
+
+    # TODO 35. gs only: uat/faultproxy injects faults on storage.googleapis.com.
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: one dropped connection does not fail a cp upload"
+    fp_start
+    fdrop="folder_drop"
+    mkdir -p $fdrop/many
+    dd if=/dev/urandom of=$fdrop/one.bin bs=1048576 count=60 2>/dev/null
+    for i in $(seq -w 1 150); do head -c 262144 /dev/urandom > $fdrop/many/f$i.bin; done
+
+    HTTPS_PROXY=$fp_proxy ../gsg cp $fdrop/one.bin "$remote_base/$fdrop/one.bin" >/dev/null 2>&1 &
+    pid=$!
+    fp_wait up $((30 << 20))
+    fp_blip
+    wait $pid && rc=0 || rc=$?
+    assertEq "a single-stream cp survives a reset" "$rc" "0"
+    gsutil -q cp "$remote_base/$fdrop/one.bin" $fdrop/one.back
+    assertOk "and stored the whole file" cmp $fdrop/one.bin $fdrop/one.back
+
+    fp reset >/dev/null
+    HTTPS_PROXY=$fp_proxy ../gsg -m cp -r $fdrop/many "$remote_base/$fdrop/many" >/dev/null 2>&1 &
+    pid=$!
+    fp_wait up $((15 << 20))
+    fp_blip
+    wait $pid && rc=0 || rc=$?
+    assertEq "cp -r of small files survives a reset" "$rc" "0"
+    assertEq "and stored all 150" "$(remote_count $fdrop/many)" "150"
+    fp_stop
+    rm -rf $fdrop
     finish
     fi
 

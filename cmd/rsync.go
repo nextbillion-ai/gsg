@@ -52,12 +52,23 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		logger.Info(module, "No diff detected")
 		return
 	}
+	// Every destination is checked before anything is fetched, so an object
+	// whose name climbs out of dst refuses the sync rather than whatever share
+	// of it had started by the time the name was reached.
+	dstPaths := make([]string, len(copyList))
+	for i, fo := range copyList {
+		var err error
+		if dstPaths[i], err = common.JoinLocalPath(dst.Prefix, fo.Attributes.RelativePath); err != nil {
+			common.ExitWith(err)
+			return
+		}
+	}
 	logger.Info(module, "Starting synchronization...")
-	for _, fo := range copyList {
+	for i, fo := range copyList {
 		sys := fo.System
 		bucket := fo.Bucket
 		prefix := fo.Prefix
-		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
+		dstPath := dstPaths[i]
 		pool.Add(func() {
 			if e := common.DoWithRetrySimple(func() error {
 				return sys.Download(bucket, prefix, dstPath, forceChecksum, system.RunContext{Pool: pool, Concurrency: getMultiThread(), Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})

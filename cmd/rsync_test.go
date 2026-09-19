@@ -93,3 +93,17 @@ func TestDownsyncStaysSequentialWithOneWorker(t *testing.T) {
 	sys := runDownsync(t, 1, 3, 2)
 	assert.Equal(t, 1, sys.maxSeen)
 }
+
+// An object name that climbs out of the destination refuses the sync before
+// anything is fetched, including the objects listed ahead of it.
+func TestDownsyncRefusesANameThatClimbsOutOfTheDestination(t *testing.T) {
+	sys := &fakeDownSystem{gather: 1, gathered: make(chan struct{}), names: []string{"a.sst", "../esc/evil.txt", "b.sst"}}
+	saved := pool
+	defer func() { pool = saved }()
+	pool = worker.New(2, false)
+	pool.Run()
+	src := &system.FileObject{System: sys, Bucket: "bucket", Prefix: "out/cache", Remote: true}
+	downsync(src, system.ParseFileObject(t.TempDir()), true, false, false)
+	pool.Close() // waits for anything that was queued
+	assert.Equal(t, 0, sys.maxSeen, "nothing was downloaded")
+}
