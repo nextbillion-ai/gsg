@@ -855,12 +855,16 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 				unknown = append(unknown, bkt.Object(partName(i)))
 			}
 		}
+		var refused error
 		late, unchecked := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
 			attrs, err := h.Attrs(context.Background())
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				return nil, nil
 			}
 			if err != nil {
+				if refused == nil {
+					refused = err
+				}
 				return nil, err
 			}
 			return h.Generation(attrs.Generation), nil
@@ -869,7 +873,7 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 			logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
 		}
 		if len(unchecked) > 0 {
-			logger.Info(module, "could not check %d part(s) of %s: %v", len(unchecked), object, unchecked)
+			logger.Info(module, "could not check %d part(s) of %s with %s: %v", len(unchecked), object, refused, unchecked)
 		}
 		return err
 	}
