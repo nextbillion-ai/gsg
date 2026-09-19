@@ -1764,6 +1764,64 @@ nothing to follow and is unchanged by this.
 
 **The s3 defect this entry describes is now item 30,** as it said it deserved.
 
+**The upload half is fixed on oci in PR #78, and this item is now closed
+for oci.** `gcs` and `s3` still pace no upload at all, and the item stays open
+for them.
+
+`common.GentleSection` is the read-side counterpart of `GentleWrite`, and a
+simpler one: the pages it drops are clean, so a single request frees them,
+where the write side needs a second over the same range because a drop on
+dirty pages only starts their writeback. Both oci upload paths read their
+bodies through it -- the single `PutObject` and each multipart part.
+
+**Pausing and dropping had to be separated, and where each goes took three
+attempts.** An upload reads every range twice: once to checksum it, because
+the checksum is a request header that has to be known before the body is sent,
+and once to send it. The first version paced the send, which was backwards --
+that read comes off the cache the checksum read just filled, so it was
+throttling the cheap read while the cold one ran flat out, eight parts at a
+time. The second paced the checksum read only, which is right until the range
+does not stay resident, and eight 128 MiB parts in flight is a gigabyte
+competing for whatever cache the machine has -- under exactly the memory
+pressure this flag exists to be considerate of. Both pause now; only the send
+drops, being the last read of those bytes.
+
+So the unit is a byte *read*, not a byte uploaded. A cached send pauses for
+reads that cost the disk nothing, which is the price of not having to know
+which ones those are, and gentle mode is a request to go slower.
+
+**It also closes something item 19 recorded and left.** The progress bar was
+attached with an `io.TeeReader`, and the SDK reflects into the body looking for
+an `io.Seeker` so it can rewind and retry -- a `TeeReader` is not one, so
+attaching a bar, which is what the CLI always does, turned the SDK's own retry
+off on precisely the path everybody uses. A section reader seeks, so the
+counting moved somewhere that does. Pinned by asking the SDK's own
+`Seekable()`, with a `TeeReader` asked the same question so the test says what
+it fixed.
+
+**Measured: nothing, again.** 2 GiB to ap-singapore-1, gentle 34.7s and 31.5s
+against plain 35.5s and 35.6s. The pauses come to 20ms per 10MiB read, but
+they are spread across the parts in flight and the others keep the socket busy
+while one sleeps, so none of it reaches the wall clock. What the pacing buys
+still cannot be measured on macOS, where the fadvise calls are no-ops.
+
+**Two review findings were checked and rejected,** which is worth recording
+because both sounded right. Both held that `net/http` stops at `ContentLength`
+and never reads far enough to notice a file that grew or to deliver the
+`io.EOF` a gentle read finishes on -- the second time citing go 1.22
+specifically, which `go.mod` and `docker/Dockerfile` pin. The go1.22.0 source
+copies through an `io.LimitReader` and then runs
+`t.doBodyCopy(io.Discard, body)` to account for extra bytes, and so does the
+1.24 that ran the tests. `TestNetHTTPNoticesABodyLongerThanItsContentLength`
+now pins it, so a future Go dropping that read is a test failure rather than
+silent prefixes in a bucket.
+
+One regression came out of that exchange and is worth knowing about: capping
+the single-request body at the size a stat reported *would* have uploaded the
+prefix of a file that grew, silently, since the checksum matched the prefix and
+the length matched the checksum. The body reads to the end instead, as it did
+before.
+
 ---
 
 ## 29. An oci download is a single unranged stream
