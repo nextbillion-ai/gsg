@@ -81,6 +81,11 @@ func GetLocalDstPath(srcPrefix, srcPath, dstPrefix string) (string, error) {
 // A listing returns object names verbatim and a service accepts ".." in them,
 // so "src/../esc/f" copied from "src" into "dst" would otherwise be written to
 // "dst/../esc/f" -- wherever the name points, as far up as it cares to climb.
+//
+// The check is lexical and does not resolve symlinks. One already under dir is
+// followed when the file is written, so a name through it lands wherever it
+// points. gsg never creates a symlink, so a name alone cannot plant one; what
+// closing that would take is recorded under TODO 33.
 func JoinLocalPath(dir, rel string) (string, error) {
 	joined := JoinPath(dir, rel)
 	inside, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(joined))

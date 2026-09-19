@@ -2108,16 +2108,34 @@ under the destination (`filepath.Rel` not starting with `..`), and fail with an
 error naming the object. It belongs where `JoinPath` and `GetDstPath` are
 called for downloads, so it covers gs, s3 and oci at once.
 
-**Fixed in PR #81,** by refusing rather than skipping. `common.JoinLocalPath`
-and `GetLocalDstPath` join as before and return an error naming the object when
-the result would leave the directory. `cp` (both download branches and the
-intermediate files of an inter-cloud copy) and `rsync`'s download direction
-check every destination before fetching anything, so a bad name refuses the
-whole transfer instead of whatever share of it had started. Pinned by
+**Fixed in PR #81 for `..`,** by refusing rather than skipping.
+`common.JoinLocalPath` and `GetLocalDstPath` join as before and return an error
+naming the object when the joined path, taken lexically, would leave the
+directory. `cp` (both download branches and the intermediate files of an
+inter-cloud copy) and `rsync`'s download direction check every destination
+before fetching anything, so a bad name refuses the whole transfer instead of
+whatever share of it had started. Pinned by
 `TestJoinLocalPath`, `TestCpRefusesANameThatClimbsOutOfTheDestination` and
 `TestDownsyncRefusesANameThatClimbsOutOfTheDestination`. The case is in
 `uat.sh`: "regression: an object name cannot place a file outside the
 destination".
+
+**Still open: a symlink already under the destination.** The check does not
+resolve symlinks. If `dst/link` points at `/tmp/outside`, an object named
+`src/link/pwned` joins to `dst/link/pwned`, passes, and is written to
+`/tmp/outside/pwned` when `Download` creates its folder and temp file. gsg never
+creates a symlink, so an object name cannot plant one: the link has to be there
+already, put there by something on the machine. The same goes for a directory
+swapped for a symlink between the check and the write.
+
+Closing both means creating the file beneath a handle on the destination that
+refuses to leave it, in every backend's `Download`, since each creates its own
+folder and temp file and renames it into place. `os.Root` does that, but in Go
+1.24 it has no `MkdirAll` or `Rename`, and go.mod still says 1.22; on Linux
+alone, `openat2` with `RESOLVE_BENEATH` would. Refusing any symlink below the
+destination would be simpler, but it would break a destination that links a
+subdirectory to another disk on purpose, and would leave the race. Raised in
+review of #81.
 
 ---
 
