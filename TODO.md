@@ -2068,7 +2068,7 @@ one, and verify against `attrs.CRC32C` from that same lookup rather than
 looking the name up again in `MustEqualCRC32C`. Otherwise an overwrite landing
 after the last chunk makes a correct copy of the old version read as corrupt.
 
-**Fixed in PR #80.** Every chunk opens
+**Fixed in PR #81.** Every chunk opens
 `Object(prefix).Generation(attrs.Generation)`, and `-v` settles against
 `attrs.CRC32C` from the same lookup instead of looking the name up again. A
 chunk that opens after an overwrite now fails -- unless versioning keeps the old
@@ -2108,7 +2108,7 @@ under the destination (`filepath.Rel` not starting with `..`), and fail with an
 error naming the object. It belongs where `JoinPath` and `GetDstPath` are
 called for downloads, so it covers gs, s3 and oci at once.
 
-**Fixed in PR #80,** by refusing rather than skipping. `common.JoinLocalPath`
+**Fixed in PR #81,** by refusing rather than skipping. `common.JoinLocalPath`
 and `GetLocalDstPath` join as before and return an error naming the object when
 the result would leave the directory. `cp` (both download branches and the
 intermediate files of an inter-cloud copy) and `rsync`'s download direction
@@ -2204,7 +2204,7 @@ covers every error class at the cost of restarting one file. Upgrading storage
 and api would add the finer-grained chunk retries, but v1.22.1 is from 2022,
 so that change is larger and should be measured before and after.
 
-**Fixed in PR #80.** `cp` wraps every `Upload` and `Download` -- both
+**Fixed in PR #81.** `cp` wraps every `Upload` and `Download` -- both
 branches each way, and both halves of an inter-cloud copy -- in
 `DoWithRetrySimple`, as `rsync` does. Pinned by
 `TestCpUploadTriesAgainAfterAFailedAttempt` and
