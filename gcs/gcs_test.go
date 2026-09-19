@@ -221,6 +221,7 @@ func TestSweepLateParts(t *testing.T) {
 		showsAt   map[string]int
 		refuseDel map[string]bool
 		left      []string
+		unchecked []string
 		deleted   []string
 		waits     int
 	}{
@@ -229,7 +230,7 @@ func TestSweepLateParts(t *testing.T) {
 		{name: "a part committed after the attempt returned is found on a later round", showsAt: map[string]int{"late": 2}, deleted: []string{"late"}, waits: 2},
 		{name: "a part that was never committed is looked for until the window closes", showsAt: map[string]int{"never": -1}, waits: int(partSettleWindow / partSettlePoll)},
 		{name: "a part that exists and cannot be deleted is reported", showsAt: map[string]int{"refused": 0}, refuseDel: map[string]bool{"refused": true}, left: []string{"refused"}, waits: 0},
-		{name: "a part that cannot be looked up is not reported as left", showsAt: map[string]int{"blind": -2}, waits: int(partSettleWindow / partSettlePoll)},
+		{name: "a part whose lookup is refused is not asked again and not reported as left", showsAt: map[string]int{"blind": -2}, unchecked: []string{"blind"}, waits: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -252,7 +253,7 @@ func TestSweepLateParts(t *testing.T) {
 				}
 			}
 			var deleted []string
-			left := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
+			left, unchecked := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
 				mu.Lock()
 				defer mu.Unlock()
 				at := tt.showsAt[h.ObjectName()]
@@ -273,6 +274,7 @@ func TestSweepLateParts(t *testing.T) {
 				return nil
 			})
 			assert.Equal(t, tt.left, left)
+			assert.Equal(t, tt.unchecked, unchecked)
 			assert.Equal(t, tt.deleted, deleted)
 			assert.Equal(t, tt.waits, waits)
 		})

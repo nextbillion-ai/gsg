@@ -855,7 +855,7 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 				unknown = append(unknown, bkt.Object(partName(i)))
 			}
 		}
-		late := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
+		late, unchecked := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
 			attrs, err := h.Attrs(context.Background())
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				return nil, nil
@@ -867,6 +867,9 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		}, del)
 		if left = append(left, late...); len(left) > 0 {
 			logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
+		}
+		if len(unchecked) > 0 {
+			logger.Info(module, "could not check %d part(s) of %s: %v", len(unchecked), object, unchecked)
 		}
 		return err
 	}
@@ -920,18 +923,22 @@ var partSettlePoll = time.Second
 // sweepLateParts removes the parts whose Close failed and that the service
 // committed all the same. Each is looked up by name until it shows or the window
 // closes, then deleted by the generation found: a delete by name would leave a
-// noncurrent copy in a versioned bucket. It returns the parts that exist and
-// could not be deleted.
-func sweepLateParts(unknown []*storage.ObjectHandle, lookup func(*storage.ObjectHandle) (*storage.ObjectHandle, error), del func(*storage.ObjectHandle) error) []string {
-	var left []string
+// noncurrent copy in a versioned bucket. A lookup that fails is a refusal, the
+// library having retried the rest, and is not repeated. It returns the parts
+// that exist and could not be deleted, and the parts that could not be checked.
+func sweepLateParts(unknown []*storage.ObjectHandle, lookup func(*storage.ObjectHandle) (*storage.ObjectHandle, error), del func(*storage.ObjectHandle) error) (left, unchecked []string) {
 	pending := unknown
 	for waited := time.Duration(0); len(pending) > 0; waited += partSettlePoll {
 		var found, missing []*storage.ObjectHandle
 		for _, h := range pending {
-			if pinned, err := lookup(h); err == nil && pinned != nil {
-				found = append(found, pinned)
-			} else {
+			pinned, err := lookup(h)
+			switch {
+			case err != nil:
+				unchecked = append(unchecked, h.ObjectName())
+			case pinned == nil:
 				missing = append(missing, h)
+			default:
+				found = append(found, pinned)
 			}
 		}
 		left = append(left, deleteParts(found, del)...)
@@ -941,7 +948,7 @@ func sweepLateParts(unknown []*storage.ObjectHandle, lookup func(*storage.Object
 		}
 		partDeleteSleep(partSettlePoll)
 	}
-	return left
+	return left, unchecked
 }
 
 // deleteParts deletes the parts concurrently and returns the names of those still
