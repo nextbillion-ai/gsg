@@ -315,3 +315,44 @@ func TestARewoundBodyPacesItsColdReread(t *testing.T) {
 	assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total,
 		"a retry re-reads from disk and has to be paced like any other cold read")
 }
+
+// An unbounded body is how a file that grew during its upload is noticed: it
+// delivers more than the ContentLength promised, and the request fails rather
+// than storing the original prefix with a checksum that matches it.
+//
+// That rests on net/http reading past ContentLength to check for extra bytes,
+// which review twice suggested it does not -- the second time specifically for
+// go 1.22, which is what go.mod and docker/Dockerfile pin. Checked against the
+// go1.22.0 source, which copies through an io.LimitReader and then does
+// `t.doBodyCopy(io.Discard, body)`, and measured here on whatever version is
+// running the tests. Pinned so that a future Go dropping it is a failure here
+// rather than silent prefixes in a bucket.
+func TestNetHTTPNoticesABodyLongerThanItsContentLength(t *testing.T) {
+	f, content := sectionFixture(t, 4096)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	w, err := os.OpenFile(f.Name(), os.O_WRONLY|os.O_APPEND, 0o644)
+	require.NoError(t, err)
+	_, err = w.Write(bytes.Repeat([]byte("grown"), 200))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	body := NewGentleSection(f, 0, -1, Gentle{Drop: true}, nil)
+	req, err := http.NewRequest(http.MethodPut, srv.URL, io.NopCloser(body))
+	require.NoError(t, err)
+	req.ContentLength = int64(len(content)) // what the checksum pass measured
+
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err, "a file that grew after it was checksummed must not upload its prefix in silence")
+	assert.Contains(t, err.Error(), "ContentLength",
+		"the failure has to be the length disagreeing, not something incidental: %v", err)
+}
