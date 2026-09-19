@@ -13,18 +13,32 @@ import (
 var gentleAdviseDropRead = FadviseReadDontNeed
 
 // Gentle says what a gentle read should do. They are separate because an
-// upload wants them in different places.
+// upload does not want both everywhere.
 //
-// Pause leaves the disk to whatever else is using it, and belongs on the read
-// that actually goes to the disk. Drop leaves the page cache to whatever else
-// is using it, and belongs on the last read of those bytes.
+// Pause leaves the disk to whatever else is using it. Drop leaves the page
+// cache to whatever else is using it, and belongs on the *last* read of a
+// range -- dropping earlier would send a later read back to the disk for bytes
+// that were just there.
 //
-// An upload reads each range twice -- once to checksum it, because the
-// checksum is a request header and has to be known before the body is sent,
-// and once to send it. The first is the cold one, so it pauses; the second
-// comes off the cache the first one filled, so it drops. Pausing both would
-// pace at twice the intended rate, and dropping on the first would send the
-// second back to the disk for bytes that were just read.
+// An upload reads each range twice: once to checksum it, because the checksum
+// is a request header and has to be known before the body is sent, and once to
+// send it. So the send drops and the checksum pass does not, while both pause.
+//
+// Pausing both is deliberate, and was not the first answer here. The first
+// paced only the checksum read, on the reasoning that the send reads the pages
+// that read had just filled and so costs the disk nothing. That holds only
+// while the range stays resident: eight 128 MiB parts in flight is a gigabyte
+// competing for whatever cache the machine has, and the memory pressure this
+// flag exists to be considerate of is exactly when it will not. When the send
+// does go to the disk, the pacing has to be there.
+//
+// The unit is therefore a byte *read*, not a byte uploaded. A cached send
+// pauses for reads that cost the disk nothing, which is the price of not
+// having to know which ones those are -- and gentle mode is a request to go
+// slower, so erring that way is the safe direction. Measured, it costs
+// nothing anyway: 2 GiB to oci ran 34.7s and 31.5s gentle against 35.5s and
+// 35.6s plain, because the pauses are spread across the parts in flight and
+// the others keep the socket busy while one sleeps.
 type Gentle struct {
 	Pause bool
 	Drop  bool
@@ -164,9 +178,11 @@ func (g *GentleSection) Seek(offset int64, whence int) (int64, error) {
 	}
 	if at < g.pos && g.gentle.On() {
 		// A rewind is a retry, and the pages it is about to re-read were
-		// dropped on purpose by the pass that just failed -- so this one goes
-		// to the disk, where the first pass came off the cache that the
-		// checksum read had filled. Pacing follows the disk, so it moves here.
+		// dropped on purpose by the pass that just failed, so this one
+		// certainly goes to the disk. Both upload paths already pause, so this
+		// changes nothing for them; it is here for a caller that asked only to
+		// drop, so that such a reader cannot re-read a file from disk at full
+		// speed after having evicted it.
 		g.gentle.Pause = true
 	}
 	if g.progress != nil && at < g.pos {

@@ -29,9 +29,9 @@ import (
 // object would agree with every other. Read to the end and the body delivers
 // more than the ContentLength promised, which fails the request.
 //
-// Under gentle I/O this is the read that pauses. It is the one that goes to
-// the disk; the body that follows reads the pages it just filled, and drops
-// them.
+// Under gentle I/O this read pauses, and so does the body that follows it:
+// the body reads the pages this one filled only while they stay resident.
+// Only the body drops them, being the last read of those bytes.
 func crc32cOfReader(f *os.File, gentle bool) (crc uint32, n int64, err error) {
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	common.FadviseSequentialRead(f, common.Gentle{Pause: gentle})
@@ -128,7 +128,7 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	// To the end, not to size: see crc32cOfReader. A body that stopped at the
 	// length already measured could not tell a grown file from an unchanged
 	// one.
-	body := common.NewGentleSection(f, 0, -1, common.Gentle{Drop: ctx.GentleIO}, progressWriter(pb))
+	body := common.NewGentleSection(f, 0, -1, common.Gentle{Pause: ctx.GentleIO, Drop: ctx.GentleIO}, progressWriter(pb))
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,
