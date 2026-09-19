@@ -1615,6 +1615,26 @@ reports a truncation, as the table shows, and the comment on it says so.
 No multipart upload was left dangling by any of the three: the deferred abort
 runs on every path out.
 
+**Fixed on gcs in PR #80,** the same way. The composite branch leaves `Upload`
+before `crc32cToSend`; each part is summed in the `MultiWriter` that sends it,
+its byte count is checked, and the sums are folded with `common.FoldCRC32C`, so
+a composite upload reads the file once. The size and mtime comparison runs
+before the compose, against the stat the parts were cut from, and a refusal
+deletes the parts. Each part also reads through a descriptor of its own
+(`partFile`): readahead state is per descriptor, and 32 parts interleaved on
+one read as random to the kernel -- jam-core hit exactly that when it did the
+same (jam-core#105). `/proc/self/fd` keeps the part on the file that was
+opened, which is the file `crc32cToSend` has always described.
+
+Measured: nothing yet. What it saves depends on where the pass read from. A
+file just written on a machine with the memory to hold it -- mojo's hourly
+outputs, say -- is in the page cache, and the pass cost seconds; the upload
+reads it from there again anyway. It is a cold read of the whole file only
+when the file is not cached: larger than memory, written with DONTNEED
+(gentle I/O), long since evicted. There it was the whole file at single-stream
+disk speed before the first part started (jam-core saw 65 MB/s on a contended
+pd-ssd: ~20 min for 85 GB).
+
 ---
 
 ## 28. The oci backend ignores gentle I/O

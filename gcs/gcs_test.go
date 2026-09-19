@@ -5,14 +5,20 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -544,4 +550,225 @@ func TestDownloadReadsEveryChunkFromTheGenerationItLookedUp(t *testing.T) {
 		assert.Equal(t, "7", generation, "every chunk pinned to the generation looked up")
 	}
 	assert.Equal(t, 1, lookups, "the checksum is settled against the first lookup, not a second one")
+}
+
+// Each part reads through a descriptor of its own, and that descriptor must be
+// on the file crc32cToSend describes -- the one that is open -- even once the
+// path names another.
+func TestPartFileReadsTheFileThatIsOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.bin")
+	require.NoError(t, os.WriteFile(path, []byte("the bytes that were opened\n"), 0600))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	pf := partFile(f)
+	assert.NotSame(t, f, pf, "a descriptor of its own")
+	_ = pf.Close()
+
+	replacement := filepath.Join(dir, "replacement.bin")
+	require.NoError(t, os.WriteFile(replacement, []byte("completely different bytes\n"), 0600))
+	require.NoError(t, os.Rename(replacement, path))
+
+	pf = partFile(f)
+	if pf != f {
+		defer func() { _ = pf.Close() }()
+	}
+	if runtime.GOOS == "linux" {
+		assert.NotSame(t, f, pf, "/proc/self/fd reopens the file that is open")
+	}
+	body, err := io.ReadAll(io.NewSectionReader(pf, 0, 1<<10))
+	require.NoError(t, err)
+	assert.Equal(t, "the bytes that were opened\n", string(body))
+}
+
+// fakeComposite is enough of the JSON API for uploadComposite: resumable part
+// uploads, the compose, and part deletes. onLast runs as a part's last request
+// arrives, before it is answered.
+type fakeComposite struct {
+	mu       sync.Mutex
+	sessions map[string]string
+	composed []string // the crc32c each compose was asked to confirm
+	deleted  []string
+	mtimes   []string // the goog-reserved-file-mtime of each single-stream upload
+	onLast   func(part string)
+}
+
+func (fc *fakeComposite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	q := r.URL.Query()
+	switch {
+	case q.Get("uploadType") == "resumable":
+		var meta struct {
+			Name string `json:"name"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&meta)
+		fc.mu.Lock()
+		id := strconv.Itoa(len(fc.sessions))
+		fc.sessions[id] = meta.Name
+		fc.mu.Unlock()
+		w.Header().Set("Location", "http://"+r.Host+"/session?id="+id)
+	case q.Get("uploadType") == "multipart":
+		_, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		part, err := multipart.NewReader(r.Body, params["boundary"]).NextPart()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var meta struct {
+			Name     string            `json:"name"`
+			Metadata map[string]string `json:"metadata"`
+		}
+		_ = json.NewDecoder(part).Decode(&meta)
+		fc.mu.Lock()
+		fc.mtimes = append(fc.mtimes, meta.Metadata["goog-reserved-file-mtime"])
+		fc.mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"bucket":"b","name":%q,"generation":"1"}`, meta.Name)
+	case r.URL.Path == "/session":
+		_, _ = io.Copy(io.Discard, r.Body)
+		fc.mu.Lock()
+		name := fc.sessions[q.Get("id")]
+		fc.mu.Unlock()
+		cr := r.Header.Get("Content-Range")
+		if strings.HasSuffix(cr, "/*") {
+			// "resume incomplete", as a 200 with this header: the client asks for it
+			w.Header().Set("X-Http-Status-Code-Override", "308")
+			w.Header().Set("Range", "bytes=0-"+cr[strings.Index(cr, "-")+1:strings.Index(cr, "/")])
+			return
+		}
+		if fc.onLast != nil {
+			fc.onLast(name)
+		}
+		_, _ = fmt.Fprintf(w, `{"bucket":"b","name":%q,"generation":"7"}`, name)
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/compose"):
+		var req struct {
+			Destination struct {
+				Crc32c string `json:"crc32c"`
+			} `json:"destination"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		fc.mu.Lock()
+		fc.composed = append(fc.composed, req.Destination.Crc32c)
+		fc.mu.Unlock()
+		_, _ = w.Write([]byte(`{"bucket":"b","name":"o","generation":"9"}`))
+	case r.Method == http.MethodDelete:
+		fc.mu.Lock()
+		fc.deleted = append(fc.deleted, path.Base(r.URL.Path)+"@"+q.Get("generation"))
+		fc.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusBadRequest)
+	}
+}
+
+// A file of two parts, neither a whole number of the library's chunks, with a
+// few bytes set around the part boundary so that folding the sums in the wrong
+// order, or with the wrong lengths, gives a different checksum.
+func compositeSource(t *testing.T) (*os.File, os.FileInfo) {
+	p := filepath.Join(t.TempDir(), "big.csv")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0600)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+	size := int64(compositeMinSize + 3)
+	require.NoError(t, f.Truncate(size))
+	half := (size + 1) / 2
+	for i, off := range []int64{0, half - 1, half, size - 1} {
+		_, err := f.WriteAt([]byte{byte('a' + i)}, off)
+		require.NoError(t, err)
+	}
+	fi, err := f.Stat()
+	require.NoError(t, err)
+	return f, fi
+}
+
+func runComposite(t *testing.T, fc *fakeComposite, f *os.File, before os.FileInfo) error {
+	fc.sessions = map[string]string{}
+	srv := httptest.NewServer(fc)
+	t.Cleanup(srv.Close)
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	pool := worker.New(4, false)
+	pool.Run()
+	defer pool.Close()
+	g := &GCS{client: client}
+	return g.uploadComposite(f, before, before.ModTime(), "b", "o", &bar.ProgressBar{Total: before.Size()},
+		system.RunContext{Pool: pool, Concurrency: 4})
+}
+
+// The compose is asked to confirm the fold of the parts' sums; that has to be
+// the checksum of the whole file, hashed here in one go.
+func TestUploadCompositeComposesWithTheChecksumOfTheWholeFile(t *testing.T) {
+	f, before := compositeSource(t)
+	whole := crc32.New(common.Castagnoli)
+	_, err := io.Copy(whole, io.NewSectionReader(f, 0, before.Size()))
+	require.NoError(t, err)
+	want := make([]byte, 4)
+	binary.BigEndian.PutUint32(want, whole.Sum32())
+
+	fc := &fakeComposite{}
+	require.NoError(t, runComposite(t, fc, f, before))
+	assert.Equal(t, []string{base64.StdEncoding.EncodeToString(want)}, fc.composed)
+	assert.Len(t, fc.deleted, 2, "both parts are deleted after the compose")
+}
+
+// Folded, the checksum describes the bytes sent, so a file rewritten under the
+// parts would compose without complaint. The size and mtime comparison has to
+// refuse it before the compose, and the parts go.
+func TestUploadCompositeRefusesAFileRewrittenUnderItsParts(t *testing.T) {
+	f, before := compositeSource(t)
+	var once sync.Once
+	fc := &fakeComposite{onLast: func(string) {
+		once.Do(func() {
+			later := before.ModTime().Add(time.Second)
+			assert.NoError(t, os.Chtimes(f.Name(), later, later))
+		})
+	}}
+	err := runComposite(t, fc, f, before)
+	assert.ErrorContains(t, err, "changed while its parts were being uploaded")
+	assert.Empty(t, fc.composed, "nothing is composed")
+	assert.Len(t, fc.deleted, 2, "both parts are deleted")
+}
+
+// Upload reads the handle it opened, so everything it decides has to come from
+// that handle too. Here the path is replaced the moment it is opened: an empty
+// file by one large enough for parts. Stats of the path sent the empty handle
+// down the composite branch, where it made zero parts and the compose failed,
+// and would have labelled its bytes with the replacement's mtime.
+func TestUploadDecidesFromTheFileItOpened(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.csv")
+	require.NoError(t, os.WriteFile(src, nil, 0600))
+	opened := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	require.NoError(t, os.Chtimes(src, opened, opened))
+
+	openSource = func(name string) (*os.File, error) {
+		f, err := os.Open(name)
+		if err != nil {
+			return nil, err
+		}
+		big := filepath.Join(dir, "big.csv")
+		require.NoError(t, os.WriteFile(big, nil, 0600))
+		require.NoError(t, os.Truncate(big, compositeMinSize+1))
+		require.NoError(t, os.Rename(big, name))
+		return f, nil
+	}
+	defer func() { openSource = os.Open }()
+
+	fc := &fakeComposite{sessions: map[string]string{}}
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	pool := worker.New(4, false)
+	pool.Run()
+	defer pool.Close()
+	bars, err := bar.New()
+	require.NoError(t, err)
+
+	g := &GCS{client: client}
+	require.NoError(t, g.Upload(src, "b", "o", system.RunContext{Pool: pool, Concurrency: 4, Bars: bars}),
+		"the opened file is empty: one stream")
+	assert.Empty(t, fc.composed)
+	assert.Equal(t, []string{strconv.FormatInt(opened.UnixNano(), 10)}, fc.mtimes, "the opened file's mtime")
 }
