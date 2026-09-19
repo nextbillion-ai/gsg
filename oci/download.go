@@ -281,7 +281,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	case ctx.GentleIO:
 		local, _ = common.FoldCRC32C(sums, lens)
 		computed = true
-	case forceChecksum:
+	case readBackToVerify(forceChecksum, stored):
 		local, computed = common.GetFileCRC32C(dstFile), true
 	}
 	return settleDownload(forceChecksum, dstFile, ref.name, prefix, local, computed, want, stored)
@@ -358,21 +358,39 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 	return sum, written, nil
 }
 
+// readBackToVerify says whether settling the download means reading the file
+// again.
+//
+// Only when the caller asked to verify AND there is something to verify
+// against. OCI records a CRC32C only when the uploader asked for one, so an
+// object written by another tool has none -- and hashing 80 GiB to compare it
+// against nothing is a whole pass over the disk spent to print "skipped".
+//
+// Gentle mode does not consult this: it has the sums already, from the windows
+// its chunks summed while writing, so there is nothing to spend.
+func readBackToVerify(forceChecksum, stored bool) bool {
+	return forceChecksum && stored
+}
+
 // settleDownload reports on the transfer, and fails it when asked to.
 //
 // want is what the HEAD that started the download reported, and stored says
 // whether it reported one at all: OCI records a CRC32C only when the uploader
 // asked for one, and a missing checksum is not a checksum of zero.
 func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, computed bool, want uint32, stored bool) error {
-	if !computed {
-		// Nothing was asked for, so nothing was measured.
-		return nil
-	}
 	if !stored {
 		// Nothing to check against. Saying so is the honest outcome: failing
 		// would reject every object written without a CRC32C, and passing in
-		// silence is what makes a -v flag worthless.
-		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
+		// silence is what makes a -v flag worthless. Said only when the caller
+		// asked, since a gentle download measures itself either way and has no
+		// reason to report on a check nobody wanted.
+		if forceChecksum {
+			logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
+		}
+		return nil
+	}
+	if !computed {
+		// Nothing was asked for, so nothing was measured.
 		return nil
 	}
 	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",

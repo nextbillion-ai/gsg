@@ -38,7 +38,19 @@ func (o *OCI) equalCRC32C(localPath, bucket, object string) (equal, comparable b
 	return local == remote, true, nil
 }
 
-// MustEqualCRC32C verifies the downloaded file when the flag is set.
+// MustEqualCRC32C verifies a local file against the object, when the flag is
+// set.
+//
+// Download does NOT use this, and putting it back would reintroduce a defect.
+// It looks the object up afresh, so an overwrite landing between the last
+// chunk and this call has a correctly assembled copy of what was downloaded
+// compared against the replacement's checksum and reported corrupt. Download
+// pins the checksum the HEAD that started it returned, and settles against
+// that -- see settleDownload in download.go.
+//
+// Kept because it is exported and the other two backends offer the same, and
+// because a caller holding a file and a name, with no download in progress,
+// has nothing to pin and wants exactly this.
 func (o *OCI) MustEqualCRC32C(flag bool, localPath, bucket, object string) error {
 	if !flag {
 		return nil

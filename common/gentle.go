@@ -110,24 +110,30 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 		return 0, written, cerr
 	}
 
-	// One more request over everything written. A drop request on dirty pages
-	// only starts their writeback, so a window can go no sooner than the next
-	// request covering it -- which every window gets from the window after it,
-	// except the last, which has none. Without this each call leaves its tail
-	// in the page cache, and a call shorter than a window leaves all of it:
-	// pacing that is present and does nothing, which is the shape of the
-	// defect twice over already.
-	if written > 0 {
-		gentleAdviseDrop(dst, offset, written)
-	}
-
-	// And pace what the loop did not. The sleep above fires only on a full
+	// Pace what the loop did not. The sleep in the loop fires only on a full
 	// window, so the remainder of any call -- or the whole of one shorter than
 	// a window, which is every chunk of a download at a 1 MiB --chunk-size --
 	// would otherwise cost nothing at all. Proportional, so the rate is the
 	// same whatever the caller's chunk size: gentlePause per GentleWindow.
 	if unpaced := written - paced; unpaced > 0 {
 		gentleSleep(time.Duration(int64(gentlePause) * unpaced / GentleWindow))
+	}
+
+	// Then one more request over everything written. A drop request on dirty
+	// pages only starts their writeback, so a window can go no sooner than the
+	// next request covering it -- which every window gets from the window
+	// after it, except the last, which has none. Without this each call leaves
+	// its tail in the page cache, and a call shorter than a window leaves all
+	// of it: pacing that is present and does nothing.
+	//
+	// It comes after the pause on purpose. Two requests in immediate
+	// succession can both find the same pages still dirty, and then neither
+	// drops anything; the pause is time the writeback already had. Waiting for
+	// it outright means sync_file_range, which is linux-only and not what this
+	// package does today -- so this is the cheap version of the same idea, and
+	// on a busy enough disk the tail can still survive it.
+	if written > 0 {
+		gentleAdviseDrop(dst, offset, written)
 	}
 	return sum.Sum32(), written, nil
 }

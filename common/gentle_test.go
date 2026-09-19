@@ -147,17 +147,22 @@ type dropRequest struct{ offset, length int64 }
 // neither is observable otherwise: the advice is a no-op on every platform but
 // linux, and a sleep leaves no trace. A gentle mode that paces nothing at all
 // is the defect these pin, and it has now been shipped twice.
-func withRecordedPacing(t *testing.T) (*[]time.Duration, *[]dropRequest) {
+func withRecordedPacing(t *testing.T) (*[]time.Duration, *[]dropRequest, *[]string) {
 	t.Helper()
 	var slept []time.Duration
 	var dropped []dropRequest
+	var order []string
 	sleep, advise := gentleSleep, gentleAdviseDrop
-	gentleSleep = func(d time.Duration) { slept = append(slept, d) }
+	gentleSleep = func(d time.Duration) {
+		slept = append(slept, d)
+		order = append(order, "sleep")
+	}
 	gentleAdviseDrop = func(_ *os.File, offset, length int64) {
 		dropped = append(dropped, dropRequest{offset, length})
+		order = append(order, "drop")
 	}
 	t.Cleanup(func() { gentleSleep, gentleAdviseDrop = sleep, advise })
-	return &slept, &dropped
+	return &slept, &dropped, &order
 }
 
 func gentleWriteOf(t *testing.T, size int, offset int64) (uint32, int64) {
@@ -183,7 +188,7 @@ func gentleWriteOf(t *testing.T, size int, offset int64) (uint32, int64) {
 // mode at a 1 MiB --chunk-size paces nothing and evicts nothing -- present,
 // and doing nothing.
 func TestGentleWriteShorterThanAWindowIsStillPaced(t *testing.T) {
-	slept, dropped := withRecordedPacing(t)
+	slept, dropped, order := withRecordedPacing(t)
 	const size = 1 << 20
 	_, n := gentleWriteOf(t, size, 4096)
 	require.Equal(t, int64(size), n)
@@ -205,13 +210,20 @@ func TestGentleWriteShorterThanAWindowIsStillPaced(t *testing.T) {
 		}
 	}
 	assert.GreaterOrEqual(t, covered, 2, "the tail is asked for once and so is never dropped: %v", *dropped)
+
+	// And the closing request comes after the pause, not straight after the
+	// one closeWindow just made. Two requests in immediate succession can both
+	// find the same pages still dirty, and then neither drops anything.
+	require.NotEmpty(t, *order)
+	assert.Equal(t, "drop", (*order)[len(*order)-1], "the call must end on a drop request: %v", *order)
+	assert.Equal(t, "sleep", (*order)[len(*order)-2], "the closing drop request follows the pause: %v", *order)
 }
 
 // The rate is the same however the caller cuts the transfer up: this is what
 // makes --chunk-size a size rather than a pacing knob.
 func TestGentleWritePacesAtTheSameRateWhateverTheChunkSize(t *testing.T) {
 	for _, size := range []int{1 << 20, GentleWindow, GentleWindow + 1, 3 * GentleWindow} {
-		slept, _ := withRecordedPacing(t)
+		slept, _, _ := withRecordedPacing(t)
 		_, n := gentleWriteOf(t, size, 0)
 		require.Equal(t, int64(size), n)
 
@@ -228,7 +240,7 @@ func TestGentleWritePacesAtTheSameRateWhateverTheChunkSize(t *testing.T) {
 func TestGentleWriteAsksForEveryByteTwice(t *testing.T) {
 	const size = 3*GentleWindow + 1234
 	const offset = 1 << 16
-	_, dropped := withRecordedPacing(t)
+	_, dropped, _ := withRecordedPacing(t)
 	_, n := gentleWriteOf(t, size, offset)
 	require.Equal(t, int64(size), n)
 

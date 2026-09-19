@@ -313,3 +313,13 @@ func TestAGentleChunkWithNoProgressBarDoesNotPanic(t *testing.T) {
 		_, _, _ = common.GentleWrite(again, verifier, 0, bytes.NewReader(content), absent)
 	}, "if this stops panicking, bar.IncrBy nil-checks and progressWriter is no longer load-bearing")
 }
+
+// Verifying an object that carries no checksum means hashing the whole file to
+// compare it against nothing, and then printing "skipped". On an 80 GiB object
+// written by another tool that is a full pass over the disk for no answer.
+func TestAVerifiedDownloadOnlyReadsBackWhenThereIsSomethingToCompare(t *testing.T) {
+	assert.True(t, readBackToVerify(true, true), "-v against an object that has a checksum")
+	assert.False(t, readBackToVerify(true, false), "-v against an object that has none")
+	assert.False(t, readBackToVerify(false, true), "no -v was asked for")
+	assert.False(t, readBackToVerify(false, false))
+}
