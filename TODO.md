@@ -1604,6 +1604,67 @@ item is what paces the ones that remain. Neither subsumes the other.
 This overlaps 29. The chunk loop that item adds is where the download pacing
 belongs, so those two are cheaper done together than apart.
 
+**Fixed on the download side in PR #74,** which is the half that shares its
+loop with 29. The upload half is not done and this item stays open for it.
+
+`oci.Download` now paces exactly the way `gcs` does, because it is now the same
+code: the window loop, the fadvise calls and the in-flight sums moved to
+`common.GentleWrite`, and `gcs` calls that rather than its own copy. Two
+backends reading `GentleIO` became three, and a correction to any of it lands
+in one place instead of two -- which is what item 13 is about, and this loop is
+subtler than the atomic write that item concerns.
+
+The part not to miss was the verification, and it was there: `oci.Download`
+ended at `MustEqualCRC32C`, which reads the whole file back. Under gentle mode
+those pages have just been dropped on purpose, so that read comes off the disk,
+as large as the file, against whatever the pacing was protecting. It now folds
+the per-chunk sums `GentleWrite` took while writing -- `common.FoldCRC32C`,
+over `common.CombineCRC32C` (#68) -- and compares that, so a gentle download
+reads the file exactly once.
+
+Verified against the bucket rather than argued: `uat/oci/45-download.sh` runs a
+20 MiB object of random bytes through `--gentle-io -v` in twenty chunks and
+requires both `cmp` and the checksum to agree. Those two catch different
+things. A fold that got the order or the lengths wrong gives a wrong checksum
+on a file `cmp` is perfectly happy with, so it is `-v` passing on a file that
+also compares equal that says the fold is right. The empty object and the
+library caller's shape -- no pool, no progress bar -- go through the same case.
+
+Measured, gentle mode costs nothing worth reporting: six interleaved runs of
+the same 1 GiB object landed between 54 and 66 MB/s with gentle and plain on
+both ends of that spread, so the pacing is below the noise of the link. What it
+buys cannot be measured on macOS at all, where the fadvise calls are no-ops;
+the eviction is real only on linux, which is true of `gcs`'s gentle mode too.
+
+Review caught a defect in the pacing that `gcs` has had all along, and that
+this change would have made much worse. A drop request on dirty pages only
+starts their writeback, so a window can go no sooner than the next request
+covering it -- which every window got from the window after it, except the
+last. And the pause fired only on a *full* window. Per whole-file chunk in
+`gcs` that left a tail; per `--chunk-size` piece here it would have left
+everything, since a chunk of 1 MiB never completes a 10 MiB window: gentle mode
+present and doing nothing, which is exactly item 30. Each call now pauses for
+the remainder it did not pace, in proportion -- so the rate no longer depends on
+how the caller cut the transfer up -- and then makes one more drop request over
+everything it wrote. The pause comes first on purpose: two requests in
+immediate succession can both find the same pages still dirty, and then neither
+drops anything. Waiting for the writeback outright means `sync_file_range`,
+which is linux-only and not what `common` does today, so on a busy enough disk
+the tail can still survive. `gcs` gets all of it by sharing the code.
+
+Neither the sleep nor the advice is observable -- the advice is a no-op off
+linux, a sleep leaves no trace -- which is how it survived review twice. Both
+are swappable now, and `common/gentle_test.go` asserts the rate and that every
+byte written is asked for at least twice.
+
+**Still open: the upload half.** `GentleIO` is read by the download path on all
+three backends now and by no upload path on any of them, so the 33GB
+`links.csv` above is still unpaced -- and item 27's first pass, the one that
+reads the whole file just to checksum it, is still unpaced too. That work has
+nothing to follow and is unchanged by this.
+
+**The s3 defect this entry describes is now item 30,** as it said it deserved.
+
 ---
 
 ## 29. An oci download is a single unranged stream
@@ -1709,4 +1770,147 @@ Doing this alongside 28 is what makes both worth having: the chunk loop is
 where the pacing lives in `gcs`, and once `oci` has both, jam-core can delete
 the download it hand-wrote precisely because this backend had neither
 (nextbillion-ai/jam-core#104, `pkg/cloud/oci_object_storage.go`).
+
+**Fixed in PR #74.**
+
+`oci.Download` fetches the object as parallel ranged chunks: geometry from
+`ctx.ChunkSize` with the same reading of the flag the other two give it
+(negative is the 16 MiB default, zero means do not chunk), one `GetObject` per
+chunk with `Range`, written at its own offset into the pre-allocated temporary
+file. `GetObjectRangeReader` offers the same to a library caller, which could
+not assemble it from outside before.
+
+Three things were done differently from the backends it follows, each because
+following them would have shipped a known defect:
+
+  - **The range endpoints are inclusive.** `s3` asks for
+    `bytes=startByte-(startByte+length)`, so every chunk there fetches one byte
+    more than it needs. That is now item 31. Here each chunk also checks what
+    it was given against what it asked for, so an overshoot -- or a service
+    that ignored the range and answered with the whole object, which would
+    otherwise have each chunk write the whole object at its own offset -- is an
+    error rather than something that assembles quietly.
+  - **Every chunk is pinned.** `IfMatch` carries the ETag the first HEAD saw,
+    so independent ranged GETs cannot land either side of an overwrite and
+    assemble a file that never existed. `gcs` and `s3` read by name and can.
+    The verification is pinned to that same HEAD's checksum rather than a fresh
+    lookup, or an overwrite landing after the last chunk would have a correctly
+    assembled copy of the pinned version reported as corrupt.
+  - **A failed chunk is retried, not fatal.** `gcs` and `s3` call
+    `common.Exit()` on a chunk failure, so a blip 79 GiB into an 80 GiB object
+    costs the whole transfer. Per-chunk `common.DoWithRetrySimple` costs one
+    chunk. The progress bar has to be wound back by hand when an attempt is
+    abandoned, or a retried chunk counts its bytes twice.
+
+An empty object is fetched without a range at all: the geometry floors at one
+chunk, so it would otherwise ask for `bytes=0--1`, which is not a range.
+
+**Measured, and less than the entry above assumed.** A 1 GiB object from
+ap-singapore-1, same session, `--chunk-size 0` being the single stream this
+replaced:
+
+| shape | |
+|---|---|
+| single stream | 16.4s, 17.5s -- 62.5, 58.5 MB/s |
+| chunked, 16 MiB, `-m` | 15.2s, 15.2s -- 67.5, 67.2 MB/s |
+| chunked, no `-m` | 17.3s, 17.2s -- 59.2, 59.5 MB/s |
+
+About 10%, not the multiple #68 saw on gs, and the reason is visible in the
+numbers: one connection already reaches 58-62 MB/s on this link and everything
+in flight together reaches 67, so there is almost no headroom to take. Shape
+makes no difference within that -- 4 MiB x 256, 64 MiB x 16 and `-c 8` all
+landed between 63.7 and 65.3 MB/s. The case for this is therefore the
+recoverability and the pacing, not the throughput, on *this* link; the
+throughput argument is for a host whose bandwidth one connection cannot fill,
+which is the case jam-core fetches its 80GB crates on.
+
+Note the third row. Chunks go to the shared pool, so without `-m` the pool has
+one worker and the chunks run one after another -- marginally slower than the
+single stream it replaced, since it is the same bytes in more requests. That is
+what `gcs` and `s3` do too.
+
+**`ctx.Pool` being nil is handled by running the chunks under a local bound
+instead.** The alternative the entry above offered -- run them inline -- would
+have left the one caller this change is for, which passes `ChunkSize` and
+nothing else, with a serial download and no benefit at all.
+`uat/oci/45-download.sh` drives `Download` from a Go program with that exact
+RunContext, plain and gentle, because the cli always supplies a pool and a
+progress bar and so cannot reach either absence. Both are hazards rather than
+defaults: a nil pool dereferences, and a nil `*bar.ProgressBar` passed as an
+`io.Writer` is not a nil `io.Writer`, so writing to it dereferences the nil
+receiver inside `IncrBy`.
+
+**What was NOT done.** The upload's part concurrency still comes from
+`common.PartConcurrency` rather than the pool. Moving it would make a default
+upload -- no `-m`, one pool worker -- send its parts one at a time, where today
+it sends eight, so the second bullet above resolves the other way than that
+note assumed: two knobs, and the reason for each written down, rather than one
+knob that costs the default case its parallelism.
+
+---
+
+## 30. The s3 gentle throttle fires on a boundary it can step over
+
+`s3.Download` has the fadvise calls gentle mode is made of, but reaches the one
+inside the loop only on an exact multiple of 10 MiB:
+
+```go
+if totalWritten%(10*1024*1024) == 0 {      // s3/s3.go:805
+```
+
+`Read` into the 1 MiB buffer at `s3/s3.go:789` returns whatever the socket has,
+not a full buffer, so `totalWritten` advances by arbitrary amounts and can step
+over every exact multiple without ever landing on one. When it does, neither
+the drop nor the 20ms pause happens at all during the transfer, and the only
+fadvise that runs is the one after the loop -- the whole file at once, which is
+the opposite of pacing.
+
+So `gsg cp --gentle-io` from `s3://` may pace nothing, depending on how the
+socket happens to deliver. It is not inert the way `oci` was before item 28,
+which would at least be predictable; it is a coin toss.
+
+`gcs` and `oci` use a `>=` watermark, which cannot be stepped over:
+
+```go
+if written-summed >= GentleWindow {        // common/gentle.go
+```
+
+**Fix:** `s3` should call `common.GentleWrite`, which is what `gcs` and `oci`
+already do -- the window loop, the fadvise calls and the in-flight sums live
+there since PR #74. It is close to a deletion: the s3 branch becomes the
+same half-dozen lines the other two have.
+
+That also settles the other half, which is the same defect item 28 found on
+`oci`: `s3.Download` ends at `MustEqualCRC32C`, reading the whole file back
+after gentle mode has spent the transfer dropping it -- so the verification
+comes off the disk, as large as the file. `GentleWrite` returns the sums to
+settle it from instead.
+
+Found while giving `oci` a gentle download, by reading `s3` as a second model
+and finding it was not one.
+
+## 31. An s3 ranged GET asks for one byte too many
+
+`s3.Download` builds each chunk's range as
+
+```go
+Range: aws.String(fmt.Sprintf("bytes=%d-%d", startByte, startByte+length)),  // s3/s3.go:762
+```
+
+RFC 7233 range endpoints are inclusive, so that asks for `length+1` bytes:
+neighbouring chunks overlap by one and the final chunk asks for one byte past
+the end of the object. The correct endpoint is `startByte+length-1`.
+
+Nothing is corrupted, which is why it has gone unnoticed -- each worker seeks
+to its own `startByte`, so the shared byte is written twice with the same
+value, and the service clamps the overshoot. It costs one extra byte per chunk
+on the wire, and it is wrong in a way that would matter the moment anything
+downstream started trusting the byte count.
+
+**Fix:** subtract the one. `oci` does, and checks the byte count it got against
+the count it asked for, so the mistake cannot be made there without a test
+failing -- see `TestRangeHeaderEndpointsAreInclusive` and the case in
+`uat/oci/45-download.sh`.
+
+Noted while writing the `oci` chunk loop, from the model it was copied from.
 
