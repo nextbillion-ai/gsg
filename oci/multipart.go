@@ -54,22 +54,27 @@ func sourceMoved(before, after os.FileInfo) bool {
 //
 // The service is asked to verify each part against a checksum computed here,
 // so a part corrupted in transit is rejected rather than assembled.
-func (o *OCI) uploadMultipart(f *os.File, size int64, spec, object string, partSize, parts int64, pb *bar.ProgressBar) error {
+//
+// The whole-object checksum is folded from those same part sums rather than
+// taken in a pass of its own. That pass used to run to completion before any
+// part was sent, so by the time the parts were read its pages had been
+// evicted: a cold read of the whole file whose only purpose was to know the
+// value the service would later be asked to confirm.
+//
+// before is the stat the part geometry was computed from, and is what the file
+// is compared against once its parts have been read. It is passed in rather
+// than taken here on purpose: a stat of its own would leave a gap between the
+// size the parts were planned for and the size they are checked against, and a
+// file that grew inside that gap would upload only its original prefix with
+// both stats agreeing that nothing had changed.
+func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object string, partSize, parts int64, pb *bar.ProgressBar) error {
 	ref, err := o.resolve(spec)
 	if err != nil {
 		return err
 	}
 	c, ns, bucket := ref.c, ref.ns, ref.name
 	ctx := context.Background()
-
-	// What the file looked like before its parts were read, to compare with
-	// after they have been. Nothing is hashed here: the whole-object checksum
-	// is folded from the parts' own sums rather than taken in a pass of its
-	// own, which is one cold read of the whole file that no longer happens.
-	before, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("oci: cannot measure %s: %w", f.Name(), err)
-	}
+	size := before.Size()
 
 	create, err := c.CreateMultipartUpload(ctx, objectstorage.CreateMultipartUploadRequest{
 		NamespaceName: &ns, BucketName: &bucket,
