@@ -196,69 +196,87 @@ func TestDeletePartsRetriesOnlyTransientErrorsAndReportsWhatIsLeft(t *testing.T)
 	assert.Equal(t, map[time.Duration]int{partDeleteBackoff: 2, 2 * partDeleteBackoff: 2}, sleeps)
 }
 
-func TestFirstPartErrorPrefersTheCauseOverCancellations(t *testing.T) {
+func TestPartFailureKeepsThePartThatFailedFirst(t *testing.T) {
+	var none partFailure
+	_, err := none.get()
+	assert.NoError(t, err)
+
 	cause := &googleapi.Error{Code: 503}
+	var p partFailure
+	p.record(9, cause)
+	// the parts cancelled along report later, and not always as context.Canceled
+	p.record(3, context.Canceled)
+	p.record(0, fmt.Errorf("io: read/write on closed pipe"))
+	i, err := p.get()
+	assert.Equal(t, 9, i)
+	assert.Equal(t, cause, err)
+}
+
+func TestSweepLateParts(t *testing.T) {
+	c := &storage.Client{}
+	obj := func(name string) *storage.ObjectHandle { return c.Bucket("b").Object(name) }
 	tests := []struct {
-		name  string
-		errs  []error
-		index int
-		err   error
+		name string
+		// lookup round (0 is at once) from which the part exists; -1 never, -2 lookup refused
+		showsAt   map[string]int
+		refuseDel map[string]bool
+		left      []string
+		deleted   []string
+		waits     int
 	}{
-		{name: "no error", errs: []error{nil, nil}, index: -1, err: nil},
-		{name: "the cause comes after a cancelled part", errs: []error{nil, context.Canceled, nil, cause}, index: 3, err: cause},
-		{name: "a wrapped cancellation is still a cancellation", errs: []error{fmt.Errorf("copy: %w", context.Canceled), cause}, index: 1, err: cause},
-		{name: "only cancellations: the first one", errs: []error{nil, context.Canceled, context.Canceled}, index: 1, err: context.Canceled},
+		{name: "nothing reached Close: no lookup and no wait", showsAt: map[string]int{}, waits: 0},
+		{name: "a part that is there is deleted at once, without a wait", showsAt: map[string]int{"there": 0}, deleted: []string{"there"}, waits: 0},
+		{name: "a part committed after the attempt returned is found on a later round", showsAt: map[string]int{"late": 2}, deleted: []string{"late"}, waits: 2},
+		{name: "a part that was never committed is looked for until the window closes", showsAt: map[string]int{"never": -1}, waits: int(partSettleWindow / partSettlePoll)},
+		{name: "a part that exists and cannot be deleted is reported", showsAt: map[string]int{"refused": 0}, refuseDel: map[string]bool{"refused": true}, left: []string{"refused"}, waits: 0},
+		{name: "a part that cannot be looked up is not reported as left", showsAt: map[string]int{"blind": -2}, waits: int(partSettleWindow / partSettlePoll)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			i, err := firstPartError(tt.errs)
-			assert.Equal(t, tt.index, i)
-			assert.Equal(t, tt.err, err)
+			var mu sync.Mutex
+			round, waits := 0, 0
+			partDeleteSleep = func(d time.Duration) {
+				mu.Lock()
+				defer mu.Unlock()
+				if d == partSettlePoll {
+					waits++
+					round++
+				}
+			}
+			defer func() { partDeleteSleep = time.Sleep }()
+
+			var unknown []*storage.ObjectHandle
+			for _, name := range []string{"there", "late", "never", "refused", "blind"} {
+				if _, ok := tt.showsAt[name]; ok {
+					unknown = append(unknown, obj(name))
+				}
+			}
+			var deleted []string
+			left := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				at := tt.showsAt[h.ObjectName()]
+				if at == -2 {
+					return nil, &googleapi.Error{Code: 403}
+				}
+				if at < 0 || round < at {
+					return nil, nil
+				}
+				return h.Generation(7), nil
+			}, func(h *storage.ObjectHandle) error {
+				mu.Lock()
+				defer mu.Unlock()
+				if tt.refuseDel[h.ObjectName()] {
+					return &googleapi.Error{Code: 403}
+				}
+				deleted = append(deleted, h.ObjectName())
+				return nil
+			})
+			assert.Equal(t, tt.left, left)
+			assert.Equal(t, tt.deleted, deleted)
+			assert.Equal(t, tt.waits, waits)
 		})
 	}
-}
-
-func TestSweepPartsDeletesAPartCommittedAfterTheFirstPass(t *testing.T) {
-	var mu sync.Mutex
-	settled := false
-	var waits []time.Duration
-	partDeleteSleep = func(d time.Duration) {
-		mu.Lock()
-		waits = append(waits, d)
-		settled = true
-		mu.Unlock()
-	}
-	defer func() { partDeleteSleep = time.Sleep }()
-
-	c := &storage.Client{}
-	there := c.Bucket("b").Object("there")     // committed before the attempt returned
-	late := c.Bucket("b").Object("late")       // committed by the service after the first pass
-	never := c.Bucket("b").Object("never")     // cancelled before anything was committed
-	refused := c.Bucket("b").Object("refused") // 403 on both passes
-	deleted := map[string]int{}
-	left := sweepParts([]*storage.ObjectHandle{there, late, never, refused}, func(h *storage.ObjectHandle) error {
-		mu.Lock()
-		defer mu.Unlock()
-		switch h.ObjectName() {
-		case "there":
-			if deleted["there"] > 0 {
-				return storage.ErrObjectNotExist
-			}
-		case "late":
-			if !settled {
-				return storage.ErrObjectNotExist
-			}
-		case "never":
-			return storage.ErrObjectNotExist
-		case "refused":
-			return &googleapi.Error{Code: 403}
-		}
-		deleted[h.ObjectName()]++
-		return nil
-	})
-	assert.Equal(t, []string{"refused"}, left)
-	assert.Equal(t, map[string]int{"there": 1, "late": 1}, deleted)
-	assert.Equal(t, []time.Duration{partSettleDelay}, waits)
 }
 
 func TestSniffContentTypeMatchesTheServiceDetection(t *testing.T) {

@@ -802,10 +802,19 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 		return err
 	}
 	prefix := fmt.Sprintf("%s.gsg-part-%s-", object, hex.EncodeToString(uid[:]))
+	partName := func(i int) string {
+		return fmt.Sprintf("%s%02d", prefix, i)
+	}
 	handles := make([]*storage.ObjectHandle, parts)
-	errs := make([]error, parts)
+	// the service can only commit a part whose writer has been closed
+	closing := make([]bool, parts)
+	var cause partFailure
 	uploadCtx, abort := context.WithCancel(context.Background())
 	defer abort()
+	fail := func(i int, err error) {
+		cause.record(i, err)
+		abort()
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < parts; i++ {
 		i := i
@@ -817,18 +826,17 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 			if off+length > size {
 				length = size - off
 			}
-			name := fmt.Sprintf("%s%02d", prefix, i)
-			wc := bkt.Object(name).NewWriter(uploadCtx)
+			wc := bkt.Object(partName(i)).NewWriter(uploadCtx)
 			if _, err := io.Copy(io.MultiWriter(wc, pb), io.NewSectionReader(f, off, length)); err != nil {
-				errs[i] = err
-				abort()
+				fail(i, err)
 				return
 			}
+			closing[i] = true
 			if err := wc.Close(); err != nil {
-				errs[i] = err
+				fail(i, err)
 				return
 			}
-			handles[i] = bkt.Object(name).Generation(wc.Attrs().Generation)
+			handles[i] = bkt.Object(partName(i)).Generation(wc.Attrs().Generation)
 		})
 	}
 	wg.Wait()
@@ -838,13 +846,26 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 	cleanup := func() []string {
 		return deleteParts(handles, del)
 	}
-	if i, err := firstPartError(errs); err != nil {
-		logger.Info(module, "upload object failed on part %d with %s", i, err)
-		byName := make([]*storage.ObjectHandle, parts)
-		for i := range byName {
-			byName[i] = bkt.Object(fmt.Sprintf("%s%02d", prefix, i))
+	if i, err := cause.get(); err != nil {
+		logger.Info(module, "upload object failed on part %d with %s, its parts are gs://%s/%s*", i, err, bucket, prefix)
+		left := cleanup()
+		var unknown []*storage.ObjectHandle
+		for i := range handles {
+			if closing[i] && handles[i] == nil {
+				unknown = append(unknown, bkt.Object(partName(i)))
+			}
 		}
-		if left := sweepParts(byName, del); len(left) > 0 {
+		late := sweepLateParts(unknown, func(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
+			attrs, err := h.Attrs(context.Background())
+			if errors.Is(err, storage.ErrObjectNotExist) {
+				return nil, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			return h.Generation(attrs.Generation), nil
+		}, del)
+		if left = append(left, late...); len(left) > 0 {
 			logger.Info(module, "upload parts of %s could not be deleted: %v", object, left)
 		}
 		return err
@@ -872,39 +893,55 @@ func (g *GCS) uploadComposite(f *os.File, size int64, crc uint32, modTime time.T
 	return nil
 }
 
-// firstPartError is the error that stopped the attempt. abort() makes every other
-// part in flight fail with context.Canceled, which says nothing about the cause.
-func firstPartError(errs []error) (int, error) {
-	canceled := -1
-	for i, err := range errs {
-		if err == nil {
-			continue
-		}
-		if !errors.Is(err, context.Canceled) {
-			return i, err
-		}
-		if canceled < 0 {
-			canceled = i
-		}
-	}
-	if canceled < 0 {
-		return -1, nil
-	}
-	return canceled, errs[canceled]
+// partFailure keeps the error of the part that stopped an attempt. The parts
+// cancelled along fail after it, and not always with context.Canceled.
+type partFailure struct {
+	once sync.Once
+	part int
+	err  error
 }
 
-// how long the service may still commit a part after its writer was cancelled;
-// parts have appeared 0.5 s after the failed attempt had returned
-var partSettleDelay = 3 * time.Second
+func (p *partFailure) record(part int, err error) {
+	p.once.Do(func() {
+		p.part, p.err = part, err
+	})
+}
 
-// sweepParts deletes the parts of a failed attempt by name. A part whose Close
-// failed may be committed all the same, and the commit can land after the first
-// pass, so the names are swept again once the service has settled. The names
-// carry the attempt's random id and belong to no other upload.
-func sweepParts(byName []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []string {
-	deleteParts(byName, del)
-	partDeleteSleep(partSettleDelay)
-	return deleteParts(byName, del)
+// get is for after the parts have returned
+func (p *partFailure) get() (int, error) {
+	return p.part, p.err
+}
+
+// how long a part whose Close failed is looked for, and how often: the service
+// can commit it after the attempt has returned, 0.5 s later in the case seen
+var partSettleWindow = 5 * time.Second
+var partSettlePoll = time.Second
+
+// sweepLateParts removes the parts whose Close failed and that the service
+// committed all the same. Each is looked up by name until it shows or the window
+// closes, then deleted by the generation found: a delete by name would leave a
+// noncurrent copy in a versioned bucket. It returns the parts that exist and
+// could not be deleted.
+func sweepLateParts(unknown []*storage.ObjectHandle, lookup func(*storage.ObjectHandle) (*storage.ObjectHandle, error), del func(*storage.ObjectHandle) error) []string {
+	var left []string
+	pending := unknown
+	for waited := time.Duration(0); len(pending) > 0; waited += partSettlePoll {
+		var found, missing []*storage.ObjectHandle
+		for _, h := range pending {
+			if pinned, err := lookup(h); err == nil && pinned != nil {
+				found = append(found, pinned)
+			} else {
+				missing = append(missing, h)
+			}
+		}
+		left = append(left, deleteParts(found, del)...)
+		pending = missing
+		if len(pending) == 0 || waited >= partSettleWindow {
+			break
+		}
+		partDeleteSleep(partSettlePoll)
+	}
+	return left
 }
 
 // deleteParts deletes the parts concurrently and returns the names of those still
