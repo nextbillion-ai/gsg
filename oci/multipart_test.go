@@ -11,6 +11,8 @@ import (
 
 	"github.com/nextbillion-ai/gsg/common"
 
+	ocicommon "github.com/oracle/oci-go-sdk/v65/common"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -101,4 +103,31 @@ func TestSourceMovedSeesASourceRewrittenUnderTheParts(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, sourceMoved(first, restored),
 		"a rewrite preserving size and mtime is invisible to this check -- if that ever stops being true, the comment on sourceMoved is wrong")
+}
+
+// The SDK turns its own retry off for a body it cannot rewind, and it decides
+// that by unwrapping io.NopCloser and looking for an io.Seeker. An
+// io.TeeReader -- which is how a progress bar used to be attached, on the path
+// the CLI always takes -- is not one, so every upload the CLI made was
+// uploading without the SDK's retry.
+//
+// Asked through the SDK's own check rather than asserted about it, and the
+// shape it replaced is asked the same question so the test says what it fixed.
+func TestTheUploadBodyStaysSeekableForTheSdksRetry(t *testing.T) {
+	content := bytes.Repeat([]byte("payload"), 1024)
+	path := filepath.Join(t.TempDir(), "body.bin")
+	require.NoError(t, os.WriteFile(path, content, 0o644))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	for _, gentle := range []common.Gentle{{}, {Pause: true, Drop: true}} {
+		body := common.NewGentleSection(f, 0, int64(len(content)), gentle, nil)
+		rsc := ocicommon.NewOCIReadSeekCloser(io.NopCloser(body))
+		assert.True(t, rsc.Seekable(), "gentle=%+v: the SDK must be able to rewind the body to retry it", gentle)
+	}
+
+	tee := ocicommon.NewOCIReadSeekCloser(io.NopCloser(io.TeeReader(f, io.Discard)))
+	assert.False(t, tee.Seekable(),
+		"if a TeeReader ever becomes seekable this test has stopped saying anything")
 }

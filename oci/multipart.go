@@ -67,7 +67,7 @@ func sourceMoved(before, after os.FileInfo) bool {
 // size the parts were planned for and the size they are checked against, and a
 // file that grew inside that gap would upload only its original prefix with
 // both stats agreeing that nothing had changed.
-func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object string, partSize, parts int64, pb *bar.ProgressBar) error {
+func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object string, partSize, parts int64, pb *bar.ProgressBar, gentle bool) error {
 	ref, err := o.resolve(spec)
 	if err != nil {
 		return err
@@ -146,8 +146,14 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 			// sent. A section reader per part means nothing is buffered and
 			// each part stays independently seekable, so the SDK can rewind
 			// and retry one part without the whole transfer restarting.
+			//
+			// This is the read that certainly goes to the disk. It pulls the
+			// part in, and the send that follows reads it back out of the
+			// cache -- when there is room, which with eight 128 MiB parts in
+			// flight is not something to count on. Both pause for that reason;
+			// only the send drops, because it is the last read of these bytes.
 			ph := crc32.New(tbl)
-			read, cerr := io.Copy(ph, io.NewSectionReader(f, off, length))
+			read, cerr := io.Copy(ph, common.NewGentleSection(f, off, length, common.Gentle{Pause: gentle}, nil))
 			if cerr != nil {
 				errs[i] = fmt.Errorf("oci: cannot read part %d of %s: %w", num, f.Name(), cerr)
 				return
@@ -178,7 +184,7 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 				NamespaceName: &ns, BucketName: &bucket, ObjectName: &object,
 				UploadId: uploadID, UploadPartNum: &num,
 				ContentLength:        &length,
-				UploadPartBody:       io.NopCloser(io.NewSectionReader(f, off, length)),
+				UploadPartBody:       io.NopCloser(common.NewGentleSection(f, off, length, common.Gentle{Pause: gentle, Drop: gentle}, nil)),
 				OpcChecksumAlgorithm: objectstorage.UploadPartOpcChecksumAlgorithmCrc32c,
 				OpcContentCrc32c:     &partCRC64,
 			})

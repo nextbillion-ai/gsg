@@ -120,7 +120,7 @@ assertEq "and stores the new content" \
 # an overlay so the source tree is untouched -- a gsg whose checksum is one off
 # from its body must have the object rejected, and must leave nothing behind.
 ovdir=$(mktemp -d)
-sed 's/return h.Sum32(), n, nil/return h.Sum32() + 1, n, nil/' ../oci/transfer.go > "$ovdir/transfer.go"
+sed 's/return h.Sum32(), read, nil/return h.Sum32() + 1, read, nil/' ../oci/transfer.go > "$ovdir/transfer.go"
 assertEq "the overlay actually changed the checksum" \
     "$(diff ../oci/transfer.go "$ovdir/transfer.go" | grep -c '^>')" "1"
 printf '{"Replace":{"%s/oci/transfer.go":"%s/transfer.go"}}' "$repoRoot" "$ovdir" > "$ovdir/overlay.json"
@@ -205,6 +205,49 @@ assertEq "cp -v verifies the download" \
 assertOk "and the downloaded file matches byte for byte" cmp $fmp/big.bin ./mp_down.bin
 
 rm -rf $fmp ${fmp}_sync mp_down.bin
+finish
+
+start "transfer: --gentle-io reaches the upload path, both shapes"
+
+# Until this landed GentleIO was read by the download path and by nothing on
+# the way up, so `gsg cp --gentle-io <file> oci://...` was accepted and paced
+# nothing -- worse than not offering it, since the caller believes the transfer
+# is paced. What has to hold is that pacing changes nothing about the object:
+# the bytes, the length and the checksum are what an unpaced upload would have
+# stored, or the mode is not usable for the large objects it exists for.
+fgu="folder_gentle_up"
+mkdir -p $fgu
+# One either side of the multipart threshold, so both the single PutObject and
+# the per-part bodies go through the paced reader.
+head -c 5000000 /dev/urandom > $fgu/small.bin
+dd if=/dev/urandom of=$fgu/big.bin bs=1m count=130 2>/dev/null
+
+guout=$(../gsg -m --gentle-io cp $fgu/small.bin "$remote_base/$fgu/small.bin" 2>&1) && gurc=0 || gurc=$?
+assertEq "a gentle single-request upload succeeds" "$gurc" "0"
+assertEq "and stored the whole thing" "$(remote_size $fgu/small.bin)" "5000000"
+
+guout=$(../gsg -m --gentle-io cp $fgu/big.bin "$remote_base/$fgu/big.bin" 2>&1) && gurc=0 || gurc=$?
+assertEq "a gentle multipart upload succeeds" "$gurc" "0"
+assertEq "and it really went up in parts" "$(is_multipart $fgu/big.bin)" "yes"
+assertEq "and stored the whole thing" "$(remote_size $fgu/big.bin)" "$((130 * 1024 * 1024))"
+
+# The checksum still describes the file. A paced body that dropped, repeated or
+# reordered anything would be rejected on arrival -- the service compares
+# against the checksum gsg sent -- so these succeeding is the real assertion,
+# and -v reading them back confirms it from the other end.
+assertEq "both verify on the way back down" \
+    "$(../gsg -m cp -r -v "$remote_base/$fgu" ${fgu}_down 2>&1 | grep -c 'CRC32C checking success')" "2"
+assertOk "the small one is byte for byte the original" cmp $fgu/small.bin ${fgu}_down/small.bin
+assertOk "and so is the multipart one" cmp $fgu/big.bin ${fgu}_down/big.bin
+
+# Gentle both ways, which is how jam-core runs: nothing may differ.
+rm -rf ${fgu}_sync && mkdir -p ${fgu}_sync
+../gsg -m --gentle-io rsync -r "$remote_base/$fgu" ${fgu}_sync >/dev/null 2>&1
+assertEq "a second gentle rsync copies nothing" \
+    "$(../gsg -m --gentle-io rsync -r "$remote_base/$fgu" ${fgu}_sync 2>&1 | grep -c 'No diff detected')" "1"
+assertOk "and the synced tree matches" cmp $fgu/big.bin ${fgu}_sync/big.bin
+
+rm -rf $fgu ${fgu}_down ${fgu}_sync
 finish
 
 start "transfer: a file rewritten under its own parts is not committed"

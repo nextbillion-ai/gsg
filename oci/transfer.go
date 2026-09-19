@@ -15,27 +15,31 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 )
 
-// crc32cOfReader hashes everything f holds and rewinds it.
+// crc32cOfReader hashes the bytes the upload is about to send.
 //
 // The point is that the checksum and the body describe the same bytes: this
 // reads the very handle the upload will read, so nothing can be substituted
 // underneath it. Reading the cached checksum for the path would be cheaper and
 // occasionally wrong, and being wrong costs the whole upload.
-func crc32cOfReader(f *os.File) (crc uint32, size int64, err error) {
+//
+// The byte count comes back with the checksum because both have to describe
+// the same bytes, and both come from reading to the end rather than from a
+// stat. A body capped at a stat cannot notice that the file grew: it would
+// send the original prefix with a checksum matching it, and every part of that
+// object would agree with every other. Read to the end and the body delivers
+// more than the ContentLength promised, which fails the request.
+//
+// Under gentle I/O this read pauses, and so does the body that follows it:
+// the body reads the pages this one filled only while they stay resident.
+// Only the body drops them, being the last read of those bytes.
+func crc32cOfReader(f *os.File, gentle bool) (crc uint32, n int64, err error) {
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-	// The byte count comes back with the checksum because both have to
-	// describe the same bytes. Taking the length from a stat of the path
-	// instead would let ContentLength describe one file while the body and
-	// the checksum describe another, if the path is replaced in between --
-	// the mismatch this function exists to rule out.
-	n, err := io.Copy(h, f)
+	common.FadviseSequentialRead(f, common.Gentle{Pause: gentle})
+	read, err := io.Copy(h, common.NewGentleSection(f, 0, -1, common.Gentle{Pause: gentle}, nil))
 	if err != nil {
 		return 0, 0, fmt.Errorf("oci: cannot read %s to checksum it: %w", f.Name(), err)
 	}
-	if _, err = f.Seek(0, io.SeekStart); err != nil {
-		return 0, 0, fmt.Errorf("oci: cannot rewind %s after checksumming it: %w", f.Name(), err)
-	}
-	return h.Sum32(), n, nil
+	return h.Sum32(), read, nil
 }
 
 // Upload stores srcFile as an object.
@@ -99,22 +103,32 @@ func (o *OCI) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 		if ctx.Bars != nil {
 			mpb = ctx.Bars.New(fileSize, fmt.Sprintf("Uploading [%s]:", object))
 		}
-		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb)
+		return o.uploadMultipart(f, fi, bucket, object, partSize, parts, mpb, ctx.GentleIO)
 	}
 
-	crc, size, err := crc32cOfReader(f)
+	crc, size, err := crc32cOfReader(f, ctx.GentleIO)
 	if err != nil {
 		return err
 	}
 	localCRC := crc32cToBase64(crc)
 
-	// The progress bar wraps the handle only now, after the checksum pass has
-	// rewound it: attaching it earlier would have counted the file twice.
-	var body io.Reader = f
+	// The body counts its own bytes, and under --gentle-io drops each window
+	// as it goes. It replaces an io.TeeReader, which was not only unpaced: the
+	// SDK reflects into the body looking for an io.Seeker so it can rewind and
+	// retry, and a TeeReader is not one -- so attaching a progress bar, which
+	// is what the CLI always does, turned the SDK's own retry off. A section
+	// reader seeks.
+	//
+	// It wraps the handle only now, after the checksum pass has rewound it:
+	// attaching it earlier would have counted the file twice.
+	var pb *bar.ProgressBar
 	if ctx.Bars != nil {
-		pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
-		body = io.TeeReader(f, pb)
+		pb = ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", object))
 	}
+	// To the end, not to size: see crc32cOfReader. A body that stopped at the
+	// length already measured could not tell a grown file from an unchanged
+	// one.
+	body := common.NewGentleSection(f, 0, -1, common.Gentle{Pause: ctx.GentleIO, Drop: ctx.GentleIO}, progressWriter(pb))
 	if _, err = c.PutObject(context.Background(), objectstorage.PutObjectRequest{
 		NamespaceName:        &ns,
 		BucketName:           &name,

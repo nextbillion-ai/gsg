@@ -24,3 +24,13 @@ func FadviseWriteSequential(file *os.File) {
 func FadviseWriteDontNeed(file *os.File, offset, length int64) {
 	// Not supported on this platform
 }
+
+// FadviseReadSequential is a no-op off linux.
+func FadviseReadSequential(file *os.File) {
+	fadviseSequential(file)
+}
+
+// FadviseReadDontNeed is a no-op off linux.
+func FadviseReadDontNeed(file *os.File, offset, length int64) {
+	fadviseDontNeed(file, offset, length)
+}
