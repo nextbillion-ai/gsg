@@ -112,7 +112,43 @@ func (o *OCI) walkObjects(spec, prefix string, recursive bool) ([]objectstorage.
 		}
 		start = r.NextStartWith
 	}
+	if recursive {
+		objects = keepUnder(prefix, objects)
+	}
 	return objects, dedupePrefixes(prefixes), nil
+}
+
+// keepUnder drops what a recursive listing matched only by spelling.
+//
+// Object Storage matches keys by plain string prefix, so a recursive listing
+// of ".../latest" also returns every sibling that merely starts with the same
+// characters -- ".../latest2/...". rsync keyed those relative to ".../latest"
+// ("2/x") and with -d tried to delete ".../latest/2/x", which does not exist
+// (mojo's customize upload, which keeps latest/ and latest2/ side by side); rm
+// -r deletes the sibling's objects outright.
+//
+// What belongs to the path is the object named exactly that, if there is one,
+// and everything under path + "/" -- the gs backend gets the same answer by
+// listing the directory form (batchAttrs). Filtering the page instead of
+// asking first keeps a recursive listing to ListObjects alone, with no HEAD
+// and so no object-read permission.
+func keepUnder(prefix string, objects []objectstorage.ObjectSummary) []objectstorage.ObjectSummary {
+	if prefix == "" || strings.HasSuffix(prefix, "/") {
+		return objects
+	}
+	dir := prefix + "/"
+	kept := objects[:0]
+	for _, o := range objects {
+		if o.Name == nil {
+			// List skips it with a log line; keep that behaviour in one place.
+			kept = append(kept, o)
+			continue
+		}
+		if *o.Name == prefix || strings.HasPrefix(*o.Name, dir) {
+			kept = append(kept, o)
+		}
+	}
+	return kept
 }
 
 // dedupePrefixes removes repeats while keeping order.
