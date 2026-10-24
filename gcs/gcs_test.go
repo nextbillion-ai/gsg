@@ -322,6 +322,54 @@ func TestDeletePartGivesUpOnAServiceThatKeepsFailing(t *testing.T) {
 	assert.Equal(t, partDeleteAttempts, requests["o.gsg-part-x-01"])
 }
 
+// An unpinned delete gets no retries from the library, so a single 503 used to
+// end a whole rm -r. Each object answers with its scripted statuses in turn.
+func TestDeleteRetriesTransientErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		statuses []int
+		wantErr  bool
+		requests int
+	}{
+		{"ok at once", []int{204}, false, 1},
+		{"503 then ok", []int{503, 204}, false, 2},
+		{"429 twice then ok", []int{429, 429, 204}, false, 3},
+		{"503 then gone: the first attempt landed", []int{503, 404}, false, 2},
+		{"gone at once is still an error", []int{404}, true, 1},
+		{"403 is final", []int{403}, true, 1},
+		{"503 every time", []int{503, 503, 503, 503}, true, partDeleteAttempts},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			n := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				code := tt.statuses[min(n, len(tt.statuses)-1)]
+				n++
+				mu.Unlock()
+				if code == 204 {
+					w.WriteHeader(code)
+					return
+				}
+				http.Error(w, fmt.Sprintf(`{"error":{"code":%d,"message":"scripted"}}`, code), code)
+			}))
+			defer srv.Close()
+			client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+			require.NoError(t, err)
+
+			partDeleteSleep = func(time.Duration) {}
+			defer func() { partDeleteSleep = time.Sleep }()
+
+			err = (&GCS{client: client}).Delete("b", "dir/o")
+			assert.Equal(t, tt.wantErr, err != nil, "err=%v", err)
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Equal(t, tt.requests, n)
+		})
+	}
+}
+
 // A connection that stops answering must not hold the upload either.
 func TestDeletePartHasADeadline(t *testing.T) {
 	release := make(chan struct{})

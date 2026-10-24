@@ -285,15 +285,29 @@ func (g *GCS) DeleteObject(bucket, prefix string) error {
 	return g.client.Bucket(bucket).Object(prefix).Delete(context.Background())
 }
 
-// DeleteObject deletes an object
+// Delete deletes an object.
+//
+// The library never retries a delete that is not pinned to a generation, and
+// rm -r exits on the first object that fails, so transient errors are tried
+// again here. A retry that finds the object gone means an earlier attempt
+// landed and only its response was lost; a first attempt that finds nothing is
+// still an error.
 func (g *GCS) Delete(bucket, prefix string) error {
 	var err error
 	if err = g.Init(); err != nil {
 		return err
 	}
-	if err = g.client.Bucket(bucket).Object(prefix).Delete(context.Background()); err != nil {
-		logger.Info(module, "delete object failed with %s", err)
-		return err
+	o := g.client.Bucket(bucket).Object(prefix)
+	for attempt := 1; ; attempt++ {
+		err = o.Delete(context.Background())
+		if err == nil || (attempt > 1 && errors.Is(err, storage.ErrObjectNotExist)) {
+			break
+		}
+		if attempt == partDeleteAttempts || errors.Is(err, storage.ErrObjectNotExist) || !transientDeleteError(err) {
+			logger.Info(module, "delete object failed with %s", err)
+			return err
+		}
+		partDeleteSleep(time.Duration(attempt) * partDeleteBackoff)
 	}
 	logger.Info(module, "Removing bucket[%s] prefix[%s]", bucket, prefix)
 	return nil
