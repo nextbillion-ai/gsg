@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -322,37 +323,80 @@ func TestDeletePartGivesUpOnAServiceThatKeepsFailing(t *testing.T) {
 	assert.Equal(t, partDeleteAttempts, requests["o.gsg-part-x-01"])
 }
 
-// An unpinned delete gets no retries from the library, so a single 503 used to
-// end a whole rm -r. Each object answers with its scripted statuses in turn.
-func TestDeleteRetriesTransientErrors(t *testing.T) {
+// The server keeps one live generation of the object. Each delete attempt
+// answers with its scripted status; commitLost removes the object and then
+// answers 503, as when the response is lost on the way back. With rewrite,
+// another writer puts a new generation at the name right after the first
+// attempt, and that one must survive the retries.
+func TestDeleteRetriesTransientErrorsPinnedToOneGeneration(t *testing.T) {
+	const commitLost = 0
 	tests := []struct {
 		name     string
-		statuses []int
+		live     int64
+		script   []int
+		rewrite  bool
 		wantErr  bool
-		requests int
+		deletes  int
+		wantLive int64
+		getsFail int // GET requests answered 503 before the first that succeeds
 	}{
-		{"ok at once", []int{204}, false, 1},
-		{"503 then ok", []int{503, 204}, false, 2},
-		{"429 twice then ok", []int{429, 429, 204}, false, 3},
-		{"503 then gone: the first attempt landed", []int{503, 404}, false, 2},
-		{"gone at once is still an error", []int{404}, true, 1},
-		{"403 is final", []int{403}, true, 1},
-		{"503 every time", []int{503, 503, 503, 503}, true, partDeleteAttempts},
+		{"ok at once", 7, []int{204}, false, false, 1, 0, 0},
+		{"503 then ok", 7, []int{503, 204}, false, false, 2, 0, 0},
+		{"429 twice then ok", 7, []int{429, 429, 204}, false, false, 3, 0, 0},
+		{"response lost: the retry finds it gone", 7, []int{commitLost}, false, false, 2, 0, 0},
+		{"response lost and the name rewritten: the new object survives", 7, []int{commitLost}, true, false, 2, 8, 0},
+		{"missing at the start is still an error", 0, []int{204}, false, true, 0, 0, 0},
+		{"lookup 503 then ok", 7, []int{204}, false, false, 1, 0, 2},
+		{"lookup 503 every time", 7, []int{204}, false, true, 0, 7, math.MaxInt},
+		{"403 is final", 7, []int{403}, false, true, 1, 7, 0},
+		{"503 every time", 7, []int{503}, false, true, partDeleteAttempts, 7, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var mu sync.Mutex
-			n := 0
+			live, deletes, gets := tt.live, 0, 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
-				code := tt.statuses[min(n, len(tt.statuses)-1)]
-				n++
-				mu.Unlock()
-				if code == 204 {
-					w.WriteHeader(code)
+				defer mu.Unlock()
+				fail := func(code int) {
+					http.Error(w, fmt.Sprintf(`{"error":{"code":%d,"message":"scripted"}}`, code), code)
+				}
+				if r.Method == http.MethodGet {
+					if gets++; gets <= tt.getsFail {
+						fail(503)
+						return
+					}
+					if live == 0 {
+						fail(404)
+						return
+					}
+					fmt.Fprintf(w, `{"bucket":"b","name":"dir/o","generation":"%d"}`, live)
 					return
 				}
-				http.Error(w, fmt.Sprintf(`{"error":{"code":%d,"message":"scripted"}}`, code), code)
+				deletes++
+				defer func() {
+					if tt.rewrite && deletes == 1 && live == 0 {
+						live = 8
+					}
+				}()
+				gen := live // an unpinned delete takes whatever is live
+				if q := r.URL.Query().Get("generation"); q != "" {
+					gen, _ = strconv.ParseInt(q, 10, 64)
+				}
+				if live == 0 || gen != live {
+					fail(404)
+					return
+				}
+				switch code := tt.script[min(deletes, len(tt.script))-1]; code {
+				case 204:
+					live = 0
+					w.WriteHeader(204)
+				case commitLost:
+					live = 0
+					fail(503)
+				default:
+					fail(code)
+				}
 			}))
 			defer srv.Close()
 			client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
@@ -360,12 +404,16 @@ func TestDeleteRetriesTransientErrors(t *testing.T) {
 
 			partDeleteSleep = func(time.Duration) {}
 			defer func() { partDeleteSleep = time.Sleep }()
+			restore := partLookupTimeout
+			partLookupTimeout = 200 * time.Millisecond
+			defer func() { partLookupTimeout = restore }()
 
 			err = (&GCS{client: client}).Delete("b", "dir/o")
 			assert.Equal(t, tt.wantErr, err != nil, "err=%v", err)
 			mu.Lock()
 			defer mu.Unlock()
-			assert.Equal(t, tt.requests, n)
+			assert.Equal(t, tt.deletes, deletes)
+			assert.Equal(t, tt.wantLive, live)
 		})
 	}
 }
