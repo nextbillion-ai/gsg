@@ -285,15 +285,44 @@ func (g *GCS) DeleteObject(bucket, prefix string) error {
 	return g.client.Bucket(bucket).Object(prefix).Delete(context.Background())
 }
 
-// DeleteObject deletes an object
+// Delete deletes an object.
+//
+// rm -r exits on the first object that fails, so transient errors are tried
+// again here. Every attempt is pinned to the generation found before the first:
+// an unpinned retry after a lost response would delete whatever another writer
+// put at the name in the meantime. A retry that finds that generation gone
+// means an earlier attempt landed; a first attempt that finds nothing is still
+// an error.
 func (g *GCS) Delete(bucket, prefix string) error {
 	var err error
 	if err = g.Init(); err != nil {
 		return err
 	}
-	if err = g.client.Bucket(bucket).Object(prefix).Delete(context.Background()); err != nil {
+	o := g.client.Bucket(bucket).Object(prefix)
+	var h *storage.ObjectHandle
+	for attempt := 1; ; attempt++ {
+		if h, err = lookupPart(o); err == nil || attempt == partDeleteAttempts || !transientDeleteError(err) {
+			break
+		}
+		partDeleteSleep(time.Duration(attempt) * partDeleteBackoff)
+	}
+	if err == nil && h == nil {
+		err = storage.ErrObjectNotExist
+	}
+	if err != nil {
 		logger.Info(module, "delete object failed with %s", err)
 		return err
+	}
+	for attempt := 1; ; attempt++ {
+		err = deletePart(h)
+		if err == nil || (attempt > 1 && errors.Is(err, storage.ErrObjectNotExist)) {
+			break
+		}
+		if attempt == partDeleteAttempts || errors.Is(err, storage.ErrObjectNotExist) || !transientDeleteError(err) {
+			logger.Info(module, "delete object failed with %s", err)
+			return err
+		}
+		partDeleteSleep(time.Duration(attempt) * partDeleteBackoff)
 	}
 	logger.Info(module, "Removing bucket[%s] prefix[%s]", bucket, prefix)
 	return nil
