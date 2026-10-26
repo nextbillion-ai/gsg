@@ -112,6 +112,29 @@ func crc32cOf(b64 *string) (uint32, bool) {
 	return binary.BigEndian.Uint32(raw), true
 }
 
+// md5Of is the MD5 a HEAD reports: content-md5 for a single-part upload,
+// opc-multipart-md5 ("<md5>-<parts>") for a multipart one. It matches the md5
+// a listing carries for the same object, so either side of a comparison can
+// come from either call.
+func md5Of(content, multipart *string) string {
+	if content != nil && *content != "" {
+		return *content
+	}
+	if multipart != nil {
+		return *multipart
+	}
+	return ""
+}
+
+// CopyResetsModTime: OCI's CopyObject gives the destination a new
+// last-modified time and keeps its checksums. Measured on us-phoenix-1
+// (2026-10-26) for a 65 GB multipart object and a 1.3 MB single-part one:
+// content-length, opc-content-crc32c and content-md5 / opc-multipart-md5 were
+// identical on source and copy; only last-modified and etag differed. So rsync
+// between two OCI locations compares content (system.CompareByContent), or it
+// copies again everything an earlier run already copied.
+func (o *OCI) CopyResetsModTime() bool { return true }
+
 // modTime normalises a timestamp to whole seconds.
 //
 // OCI reports an object's modification time at two different precisions
@@ -155,6 +178,7 @@ func (o *OCI) Attributes(bucket, prefix string) (*system.Attrs, error) {
 	if r.LastModified != nil {
 		a.ModTime = modTime(r.LastModified.Time)
 	}
+	a.ContentMD5 = md5Of(r.ContentMd5, r.OpcMultipartMd5)
 	var stored bool
 	if a.CRC32, stored = crc32cOf(r.OpcContentCrc32c); !stored {
 		// Say so rather than letting a bare 0 stand. `gsg hash` prints this
@@ -199,6 +223,13 @@ func (o *OCI) summaryToAttrs(spec string, s objectstorage.ObjectSummary) *system
 		a.ModTime = modTime(s.TimeModified.Time)
 	} else if s.TimeCreated != nil {
 		a.ModTime = modTime(s.TimeCreated.Time)
+	}
+	// The listing's md5 is the composite multipart form for a multipart
+	// upload, as a HEAD's opc-multipart-md5 is; either way a server-side copy
+	// keeps it byte for byte, which is what lets rsync between two OCI
+	// locations skip a copied object without a request (system.Attrs.Same).
+	if s.Md5 != nil {
+		a.ContentMD5 = *s.Md5
 	}
 	if s.Name != nil {
 		name := *s.Name

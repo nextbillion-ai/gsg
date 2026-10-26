@@ -2,6 +2,7 @@ package oci
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -65,4 +66,47 @@ func TestCopyRequestDoesNotCrossItsFields(t *testing.T) {
 	} {
 		assert.Equal(t, c.want, c.got, "%s", c.what)
 	}
+}
+
+// A small object gets the OCI CLI's default wait: --max-wait-seconds is 1200.
+func TestCopyMaxWaitIsTheCLIsTwentyMinutesForASmallObject(t *testing.T) {
+	assert.Equal(t, 20*time.Minute, copyMaxWait(1279733, ""))
+	assert.Equal(t, 20*time.Minute, copyMaxWait(0, ""))
+}
+
+// A large one gets its size at 10 MB/s. The 68.7 GB Valhalla tar took up to
+// 18.5 minutes to copy on us-phoenix-1; the old fixed 10 minutes failed it and
+// the CLI's 20 left almost no margin.
+func TestCopyMaxWaitScalesWithTheObjectsSize(t *testing.T) {
+	assert.Equal(t, 6870*time.Second, copyMaxWait(68_700_000_000, ""))
+	assert.Greater(t, copyMaxWait(68_700_000_000, ""), 18*time.Minute+30*time.Second)
+	// 24 GB copied in up to 10.8 minutes under load: 40 minutes allowed
+	assert.Equal(t, 2400*time.Second, copyMaxWait(24_000_000_000, ""))
+}
+
+// GSG_OCI_COPY_MAX_WAIT overrides it either way round, as --max-wait-seconds
+// does for the CLI: a Go duration or whole seconds.
+func TestCopyMaxWaitOverride(t *testing.T) {
+	assert.Equal(t, 90*time.Minute, copyMaxWait(68_700_000_000, "90m"))
+	assert.Equal(t, 5400*time.Second, copyMaxWait(1, "5400"))
+	assert.Equal(t, 3*time.Minute, copyMaxWait(68_700_000_000, "3m"), "an override can also shorten it")
+}
+
+// An override that cannot be read must not turn into "do not wait".
+func TestCopyMaxWaitIgnoresAnUnreadableOverride(t *testing.T) {
+	for _, bad := range []string{"soon", "0", "-5", "0s", "-1m"} {
+		assert.Equal(t, 20*time.Minute, copyMaxWait(1, bad), "%q", bad)
+	}
+}
+
+// Polling starts fast for small objects and backs off to the CLI's 30 seconds.
+func TestNextPollBacksOffToThirtySeconds(t *testing.T) {
+	var got []time.Duration
+	for d := copyPollFirst; len(got) < 9; d = nextPoll(d) {
+		got = append(got, d)
+	}
+	assert.Equal(t, []time.Duration{
+		500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second,
+		8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+	}, got)
 }

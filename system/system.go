@@ -45,6 +45,36 @@ type Attrs struct {
 	// were real, so two objects that both failed to produce a checksum
 	// matched on size alone.
 	CalcCRC32C func() (uint32, bool)
+	// ContentMD5 is the object's MD5 as the service reports it, when a
+	// backend has one for free (OCI's listing carries it). For a multipart
+	// upload it is the composite form, "<md5 of part md5s>-<parts>", so two
+	// equal values mean equal content, while two different ones can still be
+	// the same bytes uploaded with another part size. Same therefore only
+	// trusts a match, and falls back to the CRC32C when they differ.
+	ContentMD5 string
+}
+
+// copyResetsModTime is implemented by a backend whose server-side Copy gives
+// the destination a new modification time but keeps its content checksums.
+type copyResetsModTime interface {
+	CopyResetsModTime() bool
+}
+
+// CompareByContent reports whether rsync between two locations should compare
+// checksums rather than modification times: when asked to (-v), or when both
+// ends are a backend whose server-side copy resets the modification time.
+// Between two such locations a modification time says only when an object
+// was last copied, so comparing it re-copies everything an earlier run copied.
+func CompareByContent(src, dst ISystem, forceChecksum bool) bool {
+	if forceChecksum {
+		return true
+	}
+	a, ok := src.(copyResetsModTime)
+	if !ok || !a.CopyResetsModTime() {
+		return false
+	}
+	b, ok := dst.(copyResetsModTime)
+	return ok && b.CopyResetsModTime()
 }
 
 func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
@@ -62,6 +92,13 @@ func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
 	// were being hashed and fetched only to be declared different anyway.
 	if !r {
 		return false
+	}
+	// Equal service-reported MD5s are equal content, and they cost nothing:
+	// the listing already carried them. Only a match is trusted -- a
+	// multipart MD5 depends on the part size -- and only when content is what
+	// is being compared, so the default size-and-mtime check is unchanged.
+	if forceChecksum && a.ContentMD5 != "" && a.ContentMD5 == b.ContentMD5 {
+		return true
 	}
 	if a.CalcCRC32C != nil {
 		crc, ok := a.CalcCRC32C()

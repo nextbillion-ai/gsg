@@ -145,7 +145,11 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	*/
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
-	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
+	// A server-side copy can reset the destination's modification time (OCI's
+	// does), so between two such locations objects are compared by content:
+	// size, then the listed MD5, then CRC32C. See system.CompareByContent.
+	byContent := system.CompareByContent(src.System, dst.System, forceChecksum)
+	copyList, deleteList := diffs(srcFiles, dstFiles, byContent)
 	if len(copyList)+len(deleteList) == 0 {
 		logger.Info(module, "No diff detected")
 		return
