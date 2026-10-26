@@ -8,6 +8,20 @@ This is a tool for operating objects on gcs/s3 with command line mode.
 -s3 auth:
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 
+-oci copy wait:
+`GSG_OCI_COPY_MAX_WAIT`
+
+A copy between two `oci://` locations is OCI's server-side CopyObject, the
+same call `oci os object copy` makes, and gsg waits for its work request as
+`--wait-for-state COMPLETED` does. The wait is at least the CLI's 20 minutes
+and grows with the object (its size at 10 MB/s): large objects copy at tens of
+MB/s, and a 69 GB one took 18.5 minutes. `GSG_OCI_COPY_MAX_WAIT` overrides it,
+as a Go duration (`90m`) or whole seconds (`5400`), like `--max-wait-seconds`.
+
+`rsync` between two `oci://` locations compares objects by content (size, then
+the listed MD5, then CRC32C) rather than by modification time, because OCI's
+copy gives the destination a new modification time but keeps its checksums.
+
 -cache directory:
 `GSG_CACHE_DIR`
 

@@ -3,6 +3,8 @@ package oci
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,17 +13,64 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 )
 
-// copyPollInterval and copyTimeout bound the wait for a copy to finish.
+// How long a copy is waited for, and how often it is checked.
 //
-// Measured against the service, a small object took about 4.4 seconds between
-// the request being accepted and the object existing. The timeout is far above
-// that so a slow copy is not mistaken for a broken one, and the interval is
-// long enough not to hammer the work-request endpoint for every object in a
-// tree.
+// The OCI CLI's own `oci os object copy --wait-for-state COMPLETED` polls every
+// 30 seconds (--wait-interval-seconds) for at most 1200 (--max-wait-seconds).
+// This follows it, with two changes the measurements below call for.
+//
+// A small object exists about 4.4 seconds after the request is accepted, so
+// polling starts at half a second and backs off to the CLI's 30: a small copy
+// is not held up, and a tree of large ones does not hammer the work-request
+// endpoint.
+//
+// A fixed limit does not fit both ends. The service copies at a rate, not in
+// a time: on us-phoenix-1 (2026-10-26) 65-69 GB objects took 12.8-18.5 minutes
+// (62-88 MB/s), and 24 GB ones 8.8-10.8 minutes (37-46 MB/s) while about 170
+// were copying at once. The old fixed 10 minutes failed both, and the CLI's
+// 20 would fail the next slowest. So the limit is the CLI's 20 minutes or the
+// object's size at copyFloorRate, whichever is longer -- 10 MB/s is about a
+// quarter of the slowest rate seen -- and GSG_OCI_COPY_MAX_WAIT overrides it,
+// as --max-wait-seconds does the CLI's.
+//
+// Running out of time is reported, but the copy is not undone: the work
+// request carries on in the service, as it does for the CLI.
 const (
-	copyPollInterval = 500 * time.Millisecond
-	copyTimeout      = 10 * time.Minute
+	copyPollFirst  = 500 * time.Millisecond
+	copyPollMax    = 30 * time.Second
+	copyMinWait    = 20 * time.Minute
+	copyFloorRate  = 10 * 1000 * 1000 // bytes per second
+	copyMaxWaitEnv = "GSG_OCI_COPY_MAX_WAIT"
 )
+
+// copyMaxWait is how long a copy of size bytes is waited for. override is the
+// value of GSG_OCI_COPY_MAX_WAIT: a Go duration ("90m") or whole seconds
+// ("5400"), like --max-wait-seconds. One that cannot be read is ignored with a
+// note rather than allowed to mean "do not wait".
+func copyMaxWait(size int64, override string) time.Duration {
+	if override != "" {
+		if d, err := time.ParseDuration(override); err == nil && d > 0 {
+			return d
+		}
+		if secs, err := strconv.ParseInt(override, 10, 64); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		logger.Info(module, "ignoring %s=%q: not a duration or a number of seconds", copyMaxWaitEnv, override)
+	}
+	byRate := time.Duration(float64(size) / copyFloorRate * float64(time.Second))
+	if byRate > copyMinWait {
+		return byRate
+	}
+	return copyMinWait
+}
+
+// nextPoll doubles the interval up to copyPollMax.
+func nextPoll(d time.Duration) time.Duration {
+	if d *= 2; d > copyPollMax {
+		return copyPollMax
+	}
+	return d
+}
 
 // Copy duplicates an object, and does not return until it exists.
 //
@@ -84,7 +133,11 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	}
 	// The work request lives in the region that accepted it, so it is followed
 	// through the source's client even when the object lands elsewhere.
-	if err = o.awaitWorkRequest(src.c, *r.OpcWorkRequestId); err != nil {
+	var size int64
+	if head.ContentLength != nil {
+		size = *head.ContentLength
+	}
+	if err = o.awaitWorkRequest(src.c, *r.OpcWorkRequestId, copyMaxWait(size, os.Getenv(copyMaxWaitEnv))); err != nil {
 		return err
 	}
 	logger.Info(module, "Copying from bucket[%s] prefix[%s] to bucket[%s] prefix[%s]",
@@ -122,8 +175,9 @@ func copyRequest(src, dst bucketRef, srcPrefix, dstPrefix string) objectstorage.
 }
 
 // awaitWorkRequest blocks until the request finishes, or says why it did not.
-func (o *OCI) awaitWorkRequest(c *objectstorage.ObjectStorageClient, id string) error {
-	deadline := time.Now().Add(copyTimeout)
+func (o *OCI) awaitWorkRequest(c *objectstorage.ObjectStorageClient, id string, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	poll := copyPollFirst
 	for {
 		wr, err := c.GetWorkRequest(context.Background(), objectstorage.GetWorkRequestRequest{
 			WorkRequestId: &id,
@@ -146,10 +200,11 @@ func (o *OCI) awaitWorkRequest(c *objectstorage.ObjectStorageClient, id string) 
 		// until it settles into CANCELED, or into something else if the work
 		// finished first.
 		if time.Now().After(deadline) {
-			return fmt.Errorf("oci: copy did not finish within %s (work request %s is %s)",
-				copyTimeout, id, wr.Status)
+			return fmt.Errorf("oci: copy did not finish within %s (work request %s is %s; set %s to wait longer)",
+				maxWait, id, wr.Status, copyMaxWaitEnv)
 		}
-		time.Sleep(copyPollInterval)
+		time.Sleep(poll)
+		poll = nextPoll(poll)
 	}
 }
 
