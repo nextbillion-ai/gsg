@@ -57,3 +57,23 @@ func TestIsNotFound(t *testing.T) {
 		}
 	}
 }
+
+func TestRegionHint(t *testing.T) {
+	for _, tc := range []struct {
+		name, region, defaultRegion, want string
+	}{
+		{"no region set", "", "", defaultRegionHint},
+		{"AWS_REGION", "us-gov-west-1", "", "us-gov-west-1"},
+		{"AWS_DEFAULT_REGION", "", "us-east-1", "us-east-1"},
+		{"AWS_REGION wins", "us-gov-east-1", "us-east-1", "us-gov-east-1"},
+		{"blank is unset", "  ", "", defaultRegionHint},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AWS_REGION", tc.region)
+			t.Setenv("AWS_DEFAULT_REGION", tc.defaultRegion)
+			if got := regionHint(); got != tc.want {
+				t.Errorf("regionHint() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
