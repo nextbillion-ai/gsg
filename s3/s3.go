@@ -41,7 +41,24 @@ const (
 	// readable and writable, and cross-user unlock cannot work anyway: the
 	// ETag is specific to whoever acquired the lock.
 	lockCachePerm = 0600
+	// defaultRegionHint is where a bucket's region is looked up when the
+	// environment names no region.
+	defaultRegionHint = "ap-southeast-1"
 )
+
+// regionHint is the region a bucket's region lookup is sent to. AWS_REGION or
+// AWS_DEFAULT_REGION wins when set: the lookup then stays in the deployment's
+// own region and partition, which is all a VPC without internet access can
+// reach and the only place a GovCloud bucket can be found. The lookup still
+// returns the bucket's real region, so a bucket elsewhere keeps working.
+func regionHint() string {
+	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+		if r := strings.TrimSpace(os.Getenv(k)); r != "" {
+			return r
+		}
+	}
+	return defaultRegionHint
+}
 
 type S3 struct {
 	// mu guards the lazily built clients. One S3 is registered for the whole
@@ -648,7 +665,7 @@ func (s *S3) clientFor(bucket string) (*s3.Client, error) {
 	// the client. This used to return nil from the callback, leaving the
 	// fallback region in place, so a lookup that failed produced a client
 	// quietly pointed at the wrong place.
-	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, "ap-southeast-1")
+	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, regionHint())
 	if rerr != nil {
 		logger.Info(module, "cannot determine the region of bucket[%s]: %s", bucket, rerr)
 		return nil, rerr
