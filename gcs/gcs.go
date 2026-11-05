@@ -104,7 +104,7 @@ func (g *GCS) Init(_ ...string) error {
 	if path == "" {
 		log := fmt.Sprintf("gcs: expected env-var [%s] not found", googleApplicationCredentialsEnv)
 		logger.Info(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 	var err error
 	if _, err = os.Stat(path); err != nil {
@@ -339,7 +339,7 @@ func (g *GCS) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	if ga == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
 		logger.Debug(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 
 	// copy object
@@ -392,7 +392,7 @@ func (g *GCS) Download(
 	if attrs == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
 		logger.Debug(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 
 	// get chunck size and chunk number
@@ -551,7 +551,7 @@ func verifyGentleDownload(forceChecksum bool, dstFile, bucket, prefix string, at
 		if !forceChecksum {
 			return nil
 		}
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 	common.StoreFileCRC32C(dstFile, crc)
 	if forceChecksum {
@@ -1244,7 +1244,7 @@ func mustMatchCRC32C(localPath, bucket, object string, want uint32) error {
 	if local != want {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 		logger.Info(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 	return nil

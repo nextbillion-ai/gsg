@@ -4,7 +4,7 @@ stages:
   - publish
 
 lint:
-  image: golang:1.19
+  image: golang:1.27
   stage: lint
   script:
     - go install golang.org/x/lint/golint@latest
@@ -13,13 +13,13 @@ lint:
     - errcheck $(go list ./... | grep -v /vendor/)
 
 test:
-  image: golang:1.19
+  image: golang:1.27
   stage: test
   script:
     - go test ./...
 
 publish:
-  image: golang:1.19
+  image: golang:1.27
   stage: publish
   services:
     - docker:18.09-dind
