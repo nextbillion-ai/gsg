@@ -24,39 +24,52 @@ import (
 	"github.com/nextbillion-ai/gsg/worker"
 )
 
-// attributeReplies maps an object's key to what GetObjectAttributes returns.
-func attributeReplies(t *testing.T) *S3 {
+// headServer answers HEAD as S3 does: checksums only when asked for with the
+// checksum mode header, nothing in a 404 or 403's body. A call to the
+// GetObjectAttributes API fails the test, because a client that can download with
+// the AWS CLI need not hold the permission for it.
+func headServer(t *testing.T, replies map[string]map[string]string) *S3 {
 	t.Helper()
-	body := func(checksum string) string {
-		return `<GetObjectAttributesResponse><ObjectSize>5</ObjectSize>` + checksum + `</GetObjectAttributesResponse>`
-	}
-	replies := map[string]string{
-		"aws-cp.bin":    body(`<Checksum><ChecksumCRC64NVME>tzbvBuYbmUU=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>`),
-		"composite.bin": body(`<Checksum><ChecksumCRC32C>lu/2iQ==-2</ChecksumCRC32C><ChecksumType>COMPOSITE</ChecksumType></Checksum>`),
-		"none.bin":      body(``),
-		"malformed.bin": body(`<Checksum><ChecksumCRC32C>!!notbase64</ChecksumCRC32C><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>`),
-		"gsg.bin":       body(`<Checksum><ChecksumCRC32C>` + crc32cToBase64(7) + `</ChecksumCRC32C><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>`),
-	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("attributes") {
+			t.Errorf("GetObjectAttributes was called for %s", r.URL.Path)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		key := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 		reply, ok := replies[key]
 		switch {
 		case key == "gone.bin":
 			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, `<Error><Code>NoSuchKey</Code></Error>`)
 		case !ok:
 			w.WriteHeader(http.StatusForbidden)
-			fmt.Fprint(w, `<Error><Code>AccessDenied</Code></Error>`)
 		default:
-			fmt.Fprint(w, reply)
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("Last-Modified", "Thu, 05 Nov 2026 02:14:22 GMT")
+			if r.Header.Get("x-amz-checksum-mode") == "ENABLED" {
+				for k, v := range reply {
+					w.Header().Set(k, v)
+				}
+			}
 		}
 	}))
 	t.Cleanup(srv.Close)
 	return &S3{clients: map[string]*s3.Client{"b": clientAt(srv)}}
 }
 
+func checksumReplies() map[string]map[string]string {
+	full := "FULL_OBJECT"
+	return map[string]map[string]string{
+		"aws-cp.bin":    {"x-amz-checksum-crc64nvme": "tzbvBuYbmUU=", "x-amz-checksum-type": full},
+		"composite.bin": {"x-amz-checksum-crc32c": "lu/2iQ==-2", "x-amz-checksum-type": "COMPOSITE"},
+		"none.bin":      {},
+		"malformed.bin": {"x-amz-checksum-crc32c": "!!notbase64", "x-amz-checksum-type": full},
+		"gsg.bin":       {"x-amz-checksum-crc32c": crc32cToBase64(7), "x-amz-checksum-type": full},
+	}
+}
+
 func TestListedObjectSaysWhetherItStoresAChecksum(t *testing.T) {
-	s := attributeReplies(t)
+	s := headServer(t, checksumReplies())
 	keys := []string{"aws-cp.bin", "composite.bin", "none.bin", "malformed.bin", "gsg.bin", "denied.bin", "gone.bin"}
 	batch := &crcBatch{s: s, bucket: "b", keys: keys}
 	at := time.Unix(1700000000, 0)
@@ -75,25 +88,53 @@ func TestListedObjectSaysWhetherItStoresAChecksum(t *testing.T) {
 	}
 }
 
-func TestObjectFromGetObjectAttributesSaysWhetherItStoresAChecksum(t *testing.T) {
-	s := &S3{}
-	toAttrs := func(c *types.Checksum) bool {
-		return s.toAttrs(&S3Attributes{S3Attrs: &s3.GetObjectAttributesOutput{Checksum: c}}).NoCRC32C()
+func TestObjectReadDirectlySaysWhatItStores(t *testing.T) {
+	s := headServer(t, checksumReplies())
+	want := map[string]struct {
+		noChecksum bool
+		crc        uint32
+	}{
+		"aws-cp.bin":    {noChecksum: true},
+		"composite.bin": {noChecksum: true},
+		"none.bin":      {noChecksum: true},
+		"malformed.bin": {noChecksum: false},
+		"gsg.bin":       {noChecksum: false, crc: 7},
 	}
-	assert.True(t, toAttrs(nil))
-	assert.True(t, toAttrs(&types.Checksum{ChecksumCRC64NVME: aws.String("tzbvBuYbmUU="), ChecksumType: types.ChecksumTypeFullObject}))
-	assert.True(t, toAttrs(&types.Checksum{ChecksumCRC32C: aws.String("lu/2iQ==-2"), ChecksumType: types.ChecksumTypeComposite}))
-	assert.False(t, toAttrs(&types.Checksum{ChecksumCRC32C: aws.String("!!notbase64"), ChecksumType: types.ChecksumTypeFullObject}))
-	assert.False(t, toAttrs(&types.Checksum{ChecksumCRC32C: aws.String(crc32cToBase64(7)), ChecksumType: types.ChecksumTypeFullObject}))
+	at := time.Date(2026, 11, 5, 2, 14, 22, 0, time.UTC)
+	for key, w := range want {
+		a, err := s.S3Attrs("b", key)
+		assert.NoError(t, err, key)
+		attrs := s.toAttrs(a)
+		assert.Equal(t, int64(5), attrs.Size, key)
+		assert.True(t, attrs.ModTime.Equal(at), key)
+		assert.Equal(t, w.crc, attrs.CRC32, key)
+		assert.Equal(t, w.noChecksum, attrs.NoCRC32C(), key)
+	}
+}
+
+// Absent and refused stay different answers: a key that is refused must not
+// read as not being there, or callers delete or re-upload it.
+func TestObjectLookupSeparatesAbsentFromRefused(t *testing.T) {
+	s := headServer(t, checksumReplies())
+	a, err := s.S3Attrs("b", "gone.bin")
+	assert.NoError(t, err)
+	assert.Nil(t, a)
+
+	a, err = s.S3Attrs("b", "denied.bin")
+	assert.Error(t, err)
+	assert.Nil(t, a)
 }
 
 // Reading whether objects store a checksum costs no more than reading the
 // checksums: the two share one lookup per object.
 func TestReadingBothAnswersCostsOneLookupPerObject(t *testing.T) {
 	var lookups atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("attributes") {
+			t.Errorf("GetObjectAttributes was called for %s", r.URL.Path)
+		}
 		lookups.Add(1)
-		fmt.Fprint(w, `<GetObjectAttributesResponse><ObjectSize>5</ObjectSize></GetObjectAttributesResponse>`)
+		w.Header().Set("Content-Length", "5")
 	}))
 	defer srv.Close()
 	s := &S3{clients: map[string]*s3.Client{"b": clientAt(srv)}}
@@ -116,8 +157,13 @@ func rangedObject(t *testing.T, content []byte, shortBy int) *S3 {
 	ranged := regexp.MustCompile(`bytes=(\d+)-(\d+)`)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Has("attributes") {
-			w.Header().Set("Last-Modified", "Sun, 05 Nov 2026 02:14:22 GMT")
-			fmt.Fprintf(w, `<GetObjectAttributesResponse><ObjectSize>%d</ObjectSize></GetObjectAttributesResponse>`, len(content))
+			t.Errorf("GetObjectAttributes was called for %s", r.URL.Path)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("Last-Modified", "Thu, 05 Nov 2026 02:14:22 GMT")
 			return
 		}
 		if len(content) == 0 {
@@ -202,4 +248,25 @@ func TestDownloadOfAnEmptyObjectAsksForNoRange(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, int64(0), info.Size())
 	}
+}
+
+// A HEAD cannot tell a missing bucket from a missing key, so what protects rsync -d
+// from reading a missing bucket as an absent source is that FileType lists first,
+// and a listing can tell.
+func TestAMissingBucketIsCaughtByTheListingNotTheHead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		if r.Method != http.MethodHead {
+			fmt.Fprint(w, `<Error><Code>NoSuchBucket</Code></Error>`)
+		}
+	}))
+	defer srv.Close()
+	s := &S3{clients: map[string]*s3.Client{"b": clientAt(srv)}}
+
+	_, err := s.IsDirectory("b", "data")
+	assert.Error(t, err, "the listing must report the missing bucket")
+
+	a, err := s.S3Attrs("b", "data")
+	assert.NoError(t, err, "a HEAD has no way to tell")
+	assert.Nil(t, a)
 }

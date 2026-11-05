@@ -88,7 +88,7 @@ type S3Attributes struct {
 	// A listing carries an object's size and modification time but not its
 	// checksum, so entries built from one leave this set and the checksum is
 	// paid for only by the caller that reads it. It is nil on an S3Attributes
-	// that came from GetObjectAttributes, where the checksum is already there.
+	// that came from S3Attrs, where the checksum is already there.
 	fetchCRC32C func() (uint32, bool)
 	// noCRC32C goes with fetchCRC32C: whether the object is known to store no
 	// comparable checksum, as opposed to the fetch having failed.
@@ -109,7 +109,7 @@ func (s *S3) toAttrs(attrs *S3Attributes) *system.Attrs {
 	}
 	noCRC32C := attrs.noCRC32C
 	if attrs.fetchCRC32C == nil {
-		// From GetObjectAttributes, so the answer is already here.
+		// From S3Attrs, so the answer is already here.
 		noCRC32C = func() bool { return noComparableCRC32C(attrs) }
 	}
 	return &system.Attrs{
@@ -198,7 +198,6 @@ func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 	if err != nil {
 		return nil, err
 	}
-	var oat types.ObjectAttributes
 	if prefix == "" {
 		return nil, nil
 	}
@@ -214,14 +213,27 @@ func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 	// actually reads a checksum for, so at scale even a small transient rate
 	// is a steady trickle of failures, and each one would otherwise be a hard
 	// error on a request that would have succeeded on a second try.
-	var attrs *s3.GetObjectAttributesOutput
+	//
+	// HeadObject rather than GetObjectAttributes, which needs s3:GetObjectAttributes
+	// on top of s3:GetObject. A client that can download with "aws s3 sync" has
+	// s3:GetObject and may well not have that, and gsg would then fail where the
+	// CLI succeeds. ChecksumMode is what makes a HEAD report checksums at all.
+	//
+	// A HEAD's 404 has no body, so a missing key and a missing bucket read alike
+	// here, and the bucket has to be established some other way. clientFor finds
+	// its region before the first request, and FileType lists it before asking for
+	// an object, which does say NoSuchBucket, so a missing bucket stops there rather
+	// than reaching rsync -d as an absent source. What is left is a bucket deleted
+	// between the two. S3 only deletes an empty bucket, so "nothing is there" is
+	// then true, and the same answer an empty prefix gives.
+	var head *s3.HeadObjectOutput
 	var absent bool
 	if err = common.DoWithRetrySimple(func() error {
 		var e error
-		if attrs, e = c.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
-			Bucket:           aws.String(bucket),
-			Key:              aws.String(prefix),
-			ObjectAttributes: oat.Values(),
+		if head, e = c.HeadObject(context.TODO(), &s3.HeadObjectInput{
+			Bucket:       aws.String(bucket),
+			Key:          aws.String(prefix),
+			ChecksumMode: types.ChecksumModeEnabled,
 		}); e == nil {
 			return nil
 		}
@@ -242,10 +254,22 @@ func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 		return nil, nil
 	}
 	return &S3Attributes{
-		S3Attrs: attrs,
+		S3Attrs: attrsFromHead(head),
 		Bucket:  bucket,
 		Prefix:  prefix,
 	}, nil
+}
+
+// attrsFromHead carries over the fields gsg reads from an object's attributes.
+func attrsFromHead(head *s3.HeadObjectOutput) *s3.GetObjectAttributesOutput {
+	return &s3.GetObjectAttributesOutput{
+		ObjectSize:   head.ContentLength,
+		LastModified: head.LastModified,
+		Checksum: &types.Checksum{
+			ChecksumCRC32C: head.ChecksumCRC32C,
+			ChecksumType:   head.ChecksumType,
+		},
+	}
 }
 
 // isNotFound reports whether err says the key does not exist, as opposed to
@@ -261,8 +285,8 @@ func isNotFound(err error) bool {
 	}
 	// Deliberately not "any 404". A missing bucket is a 404 too -- measured,
 	// code NoSuchBucket -- and that is a failure to answer, not an absent key.
-	// Matching on the code keeps the two apart where the modelled types do not
-	// reach us.
+	// Matching on the code keeps the two apart for a request whose error has a
+	// body, such as a listing. A HEAD's has none, so S3Attrs cannot: see there.
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		switch ae.ErrorCode() {
@@ -404,7 +428,7 @@ func (s *S3) listEntries(bucket, prefix string, recursive bool) ([]*S3Attributes
 	return entries, nil
 }
 
-// maxAttrsInFlight caps concurrent GetObjectAttributes calls. It matches the
+// maxAttrsInFlight caps concurrent attribute lookups. It matches the
 // default of the -c flag; the listing has no access to the worker pool, so it
 // cannot follow that flag directly.
 const maxAttrsInFlight = 64

@@ -61,8 +61,6 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch {
-	case r.Method == http.MethodGet && q.Has("attributes"):
-		fmt.Fprintf(w, `<GetObjectAttributesResponse><ObjectSize>%d</ObjectSize></GetObjectAttributesResponse>`, f.size)
 	case r.Method == http.MethodHead:
 		h := w.Header()
 		h.Set("Content-Length", strconv.FormatInt(f.size, 10))
