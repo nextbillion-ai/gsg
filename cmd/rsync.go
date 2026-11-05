@@ -47,7 +47,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 	deleteTempFiles(dst.Prefix, isRec)
 	srcFiles := listRelatively(src, isRec)
 	dstFiles := listRelatively(dst, isRec)
-	copyList, deleteList := diffs(srcFiles, dstFiles, forceChecksum)
+	copyList, deleteList := downloadDiffs(srcFiles, dstFiles, forceChecksum)
 	if len(copyList)+len(deleteList) == 0 {
 		logger.Info(module, "No diff detected")
 		return
@@ -312,9 +312,33 @@ func listRelatively(base *system.FileObject, isRec bool) map[string]*system.File
 	return r
 }
 func diffs(srcFiles, dstFiles map[string]*system.FileObject, forceChecksum bool) (copyList, deleteList []*system.FileObject) {
+	return diffsBy(srcFiles, dstFiles, func(src, dst *system.Attrs) bool {
+		return src.Same(dst, forceChecksum)
+	})
+}
+
+// downloadDiffs is diffs for objects being downloaded to local files, where an
+// object with no comparable checksum is compared by size and modification time.
+// -v asks for a content check, so it says which objects did not get one.
+func downloadDiffs(srcFiles, dstFiles map[string]*system.FileObject, forceChecksum bool) (copyList, deleteList []*system.FileObject) {
+	skippedByTime := 0
+	copyList, deleteList = diffsBy(srcFiles, dstFiles, func(src, dst *system.Attrs) bool {
+		same, byTime := src.SameForDownload(dst, forceChecksum)
+		if byTime {
+			skippedByTime++
+		}
+		return same
+	})
+	if forceChecksum && skippedByTime > 0 {
+		logger.Info(module, "%d object(s) skipped on size and modification time: they store no comparable CRC32C, so their content was not checked", skippedByTime)
+	}
+	return copyList, deleteList
+}
+
+func diffsBy(srcFiles, dstFiles map[string]*system.FileObject, same func(src, dst *system.Attrs) bool) (copyList, deleteList []*system.FileObject) {
 	for rp, sf := range srcFiles {
 		df, ok := dstFiles[rp]
-		if ok && sf.Attributes != nil && sf.Attributes.Same(df.Attributes, forceChecksum) {
+		if ok && sf.Attributes != nil && same(sf.Attributes, df.Attributes) {
 			continue
 		}
 		copyList = append(copyList, sf)

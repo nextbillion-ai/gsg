@@ -2,7 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,4 +109,119 @@ func TestDownsyncRefusesANameThatClimbsOutOfTheDestination(t *testing.T) {
 	downsync(src, system.ParseFileObject(t.TempDir()), true, false, false)
 	pool.Close() // waits for anything that was queued
 	assert.Equal(t, 0, sys.maxSeen, "nothing was downloaded")
+}
+
+func objectsAt(modTime time.Time, noChecksum bool) map[string]*system.FileObject {
+	attrs := &system.Attrs{RelativePath: "a.bin", Size: 1, ModTime: modTime,
+		CalcCRC32C: func() (uint32, bool) { return 0, false },
+		NoCRC32C:   func() bool { return noChecksum }}
+	fo := &system.FileObject{Prefix: "a.bin", Remote: true}
+	fo.SetAttributes(attrs)
+	return map[string]*system.FileObject{"a.bin": fo}
+}
+
+func localAt(modTime time.Time) map[string]*system.FileObject {
+	fo := &system.FileObject{Prefix: "a.bin"}
+	fo.SetAttributes(&system.Attrs{RelativePath: "a.bin", Size: 1, ModTime: modTime,
+		CalcCRC32C: func() (uint32, bool) { return 1, true }})
+	return map[string]*system.FileObject{"a.bin": fo}
+}
+
+func TestDownloadDiffsSkipsAnUnchangedObjectWithNoChecksum(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	copyList, deleteList := downloadDiffs(objectsAt(at, true), localAt(at), true)
+	assert.Empty(t, copyList)
+	assert.Empty(t, deleteList)
+}
+
+func TestDownloadDiffsFetchesAnObjectWithNoChecksumAtANewTime(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	copyList, _ := downloadDiffs(objectsAt(at.Add(time.Second), true), localAt(at), true)
+	assert.Len(t, copyList, 1)
+}
+
+func TestDownloadDiffsFetchesAfterAFailedLookup(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	copyList, _ := downloadDiffs(objectsAt(at, false), localAt(at), true)
+	assert.Len(t, copyList, 1)
+}
+
+func TestDownloadDiffsFetchesAMissingFileAndDeletesAnExtraOne(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	copyList, deleteList := downloadDiffs(objectsAt(at, true), map[string]*system.FileObject{}, true)
+	assert.Len(t, copyList, 1)
+	assert.Empty(t, deleteList)
+
+	copyList, deleteList = downloadDiffs(map[string]*system.FileObject{}, localAt(at), true)
+	assert.Empty(t, copyList)
+	assert.Len(t, deleteList, 1)
+}
+
+// Only a download may use the time. In an upload or a cloud-to-cloud copy the
+// same pair stays a difference, because the destination's time is its own.
+func TestPlainDiffsStillCopyAnObjectWithNoChecksum(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	copyList, _ := diffs(objectsAt(at, true), localAt(at), true)
+	assert.Len(t, copyList, 1)
+	copyList, _ = diffs(objectsAt(at, true), objectsAt(at, true), true)
+	assert.Len(t, copyList, 1)
+}
+
+// timedObject is one object at a known time, for driving downsync end to end
+// against a real local file.
+type timedObject struct {
+	system.ISystem
+	at         time.Time
+	noChecksum bool
+	downloads  atomic.Int32
+}
+
+func (f *timedObject) Scheme() string                        { return "s3" }
+func (f *timedObject) IsDirectory(_, _ string) (bool, error) { return true, nil }
+func (f *timedObject) IsObject(_, _ string) (bool, error)    { return false, nil }
+
+func (f *timedObject) List(bucket, prefix string, _ bool) ([]*system.FileObject, error) {
+	fo := &system.FileObject{System: f, Bucket: bucket, Prefix: prefix + "/a.bin", Remote: true}
+	fo.SetAttributes(&system.Attrs{Size: 5, ModTime: f.at,
+		CalcCRC32C: func() (uint32, bool) { return 0, false },
+		NoCRC32C:   func() bool { return f.noChecksum }})
+	return []*system.FileObject{fo}, nil
+}
+
+func (f *timedObject) Download(_, _, _ string, _ bool, _ system.RunContext) error {
+	f.downloads.Add(1)
+	return nil
+}
+
+func downloadsFor(t *testing.T, objectAt, fileAt time.Time, noChecksum bool) int32 {
+	t.Helper()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.bin")
+	assert.NoError(t, os.WriteFile(file, []byte("12345"), 0o644))
+	assert.NoError(t, os.Chtimes(file, fileAt, fileAt))
+
+	saved := pool
+	defer func() { pool = saved }()
+	pool = worker.New(1, false)
+	pool.Run()
+	sys := &timedObject{at: objectAt, noChecksum: noChecksum}
+	src := &system.FileObject{System: sys, Bucket: "bucket", Prefix: "out", Remote: true}
+	downsync(src, system.ParseFileObject(dir), true, true, true)
+	pool.Close()
+	return sys.downloads.Load()
+}
+
+func TestDownsyncSkipsAnUnchangedObjectWithNoChecksum(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	assert.Equal(t, int32(0), downloadsFor(t, at, at, true))
+}
+
+func TestDownsyncFetchesAReplacedObjectWithNoChecksum(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	assert.Equal(t, int32(1), downloadsFor(t, at.Add(time.Hour), at, true))
+}
+
+func TestDownsyncFetchesWhenTheLookupFailed(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	assert.Equal(t, int32(1), downloadsFor(t, at, at, false))
 }

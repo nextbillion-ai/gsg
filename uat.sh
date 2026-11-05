@@ -851,6 +851,62 @@ do_test() {
     finish
     fi
 
+    start "regression: rsync does not download an unchanged object with no CRC32C again"
+
+    # aws s3 cp stores a CRC64NVME rather than a CRC32C, so there is nothing to
+    # compare with a local file. rsync used to read that as a difference and
+    # download such an object in full on every run. A download now compares it
+    # by size and modification time, which it stamps on the local file, the way
+    # aws s3 sync does.
+    #
+    # s3 only: gs objects always carry a checksum, so this cannot arise there.
+    if [[ "$mode" != "s3" ]]
+    then
+        echo "SKIP: gs objects always carry a checksum"
+        finish
+    else
+    fnc="folder_nochecksum"
+    mkdir -p $fnc
+    printf 'AAAA' > $fnc/a
+    printf 'BBBB' > $fnc/b
+    aws s3 cp --quiet $fnc/a "s3://gsg-uat/$testid/$fnc/src/a.txt" >/dev/null
+    rm -rf ${fnc}_sync && mkdir -p ${fnc}_sync
+
+    ../gsg -m rsync -r -v -d "$remote_base/$fnc/src" ${fnc}_sync >/dev/null 2>&1
+    assertEq "the first rsync -v downloads it" "$(cat ${fnc}_sync/a.txt)" "AAAA"
+    out=$(../gsg -m rsync -r -v -d "$remote_base/$fnc/src" ${fnc}_sync 2>&1)
+    assertEq "a second rsync -v finds no diff" "$(echo "$out" | grep -c 'No diff detected')" "1"
+    assertEq "and says the content was not checked" "$(echo "$out" | grep -c 'content was not checked')" "1"
+    out=$(../gsg -m rsync -r -d "$remote_base/$fnc/src" ${fnc}_sync 2>&1)
+    assertEq "as does a plain rsync" "$(echo "$out" | grep -c 'No diff detected')" "1"
+
+    # The same size, so only the time can show the object changed. LastModified
+    # has whole seconds, so wait for it to move.
+    sleep 2
+    aws s3 cp --quiet $fnc/b "s3://gsg-uat/$testid/$fnc/src/a.txt" >/dev/null
+    ../gsg -m rsync -r -v -d "$remote_base/$fnc/src" ${fnc}_sync >/dev/null 2>&1
+    assertEq "rsync -v picks up a replacement of the same size" "$(cat ${fnc}_sync/a.txt)" "BBBB"
+
+    # A local change of the same size has a new time too.
+    sleep 2
+    printf 'CCCC' > ${fnc}_sync/a.txt
+    ../gsg -m rsync -r -v -d "$remote_base/$fnc/src" ${fnc}_sync >/dev/null 2>&1
+    assertEq "rsync -v repairs a local file changed since" "$(cat ${fnc}_sync/a.txt)" "BBBB"
+
+    # An empty object has no byte 0, so any range on it is a 416, which used to
+    # end the whole rsync.
+    : > $fnc/empty
+    aws s3 cp --quiet $fnc/empty "s3://gsg-uat/$testid/$fnc/src/empty.txt" >/dev/null
+    assertOk "rsync -v downloads an empty object" \
+        ../gsg -m rsync -r -v -d "$remote_base/$fnc/src" ${fnc}_sync
+    assertEq "and it lands empty" "$(wc -c < ${fnc}_sync/empty.txt | tr -d ' ')" "0"
+    out=$(../gsg -m rsync -r -v -d "$remote_base/$fnc/src" ${fnc}_sync 2>&1)
+    assertEq "and a repeat finds no diff" "$(echo "$out" | grep -c 'No diff detected')" "1"
+
+    rm -rf $fnc ${fnc}_sync
+    finish
+    fi
+
     start "regression: a bucket in another region"
     # One S3 client was cached for the whole process, with its region taken
     # from whichever bucket was touched first, so a later request for a bucket
