@@ -612,7 +612,7 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	if s3a == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
 		logger.Debug(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 
 	if s3ObjectSize(s3a) > s3MaxCopySource {
@@ -734,7 +734,7 @@ func (s *S3) Download(
 	if attrs == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
 		logger.Debug(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 	var size int64 = 0
 	if attrs.S3Attrs.ObjectSize != nil {
@@ -1117,7 +1117,7 @@ func (s *S3) MustEqualCRC32C(flag bool, localPath, bucket, object string) error 
 	if !ok {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 		logger.Info(module, log)
-		return fmt.Errorf(log)
+		return errors.New(log)
 	}
 	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", localPath, bucket, object)
 	return nil

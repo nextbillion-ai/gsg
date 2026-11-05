@@ -1,6 +1,6 @@
 module github.com/nextbillion-ai/gsg
 
-go 1.22
+go 1.27
 
 require (
 	cloud.google.com/go/storage v1.22.1

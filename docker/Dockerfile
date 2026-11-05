@@ -1,3 +1,3 @@
-FROM golang:1.22
+FROM golang:1.27
 
 ENV PATH="/data/bin:$PATH"
