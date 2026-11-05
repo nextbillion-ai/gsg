@@ -33,11 +33,11 @@ remote2="oci://$oci_bucket2@$oci_region2/$testid"
 # where a failing assertion would never reach it.
 cleanup_region2() {
     oci os object bulk-delete --region "$oci_region2" --namespace "$oci_ns" \
-        --bucket-name "$oci_bucket2" --prefix "$testid" --force >/dev/null 2>&1 || true
+        --bucket-name "$oci_bucket2" --prefix "$testid/" --force >/dev/null 2>&1 || true
 }
 echo "note: if these cases fail, remove the second region's data with:"
 echo "      oci os object bulk-delete --region $oci_region2 --namespace $oci_ns \\"
-echo "        --bucket-name $oci_bucket2 --prefix $testid --force"
+echo "        --bucket-name $oci_bucket2 --prefix $testid/ --force"
 
 start "cross-region: two regions in one process"
 
