@@ -134,9 +134,15 @@ func crc32cOf(attrs *S3Attributes) (uint32, bool) {
 	if enc == nil || *enc == "" {
 		return 0, false
 	}
-	raw, err := base64.StdEncoding.DecodeString(*enc)
+	return decodeCRC32C(*enc)
+}
+
+// decodeCRC32C reads the wire form of a checksum: base64 of four big-endian
+// bytes.
+func decodeCRC32C(enc string) (uint32, bool) {
+	raw, err := base64.StdEncoding.DecodeString(enc)
 	if err != nil || len(raw) != 4 {
-		logger.Debug(module, "cannot read checksum %q", *enc)
+		logger.Debug(module, "cannot read checksum %q", enc)
 		return 0, false
 	}
 	return binary.BigEndian.Uint32(raw), true
@@ -607,6 +613,10 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
 		logger.Debug(module, log)
 		return fmt.Errorf(log)
+	}
+
+	if s3ObjectSize(s3a) > s3MaxCopySource {
+		return s.copyMultipart(c, srcBucket, srcPrefix, dstBucket, dstPrefix)
 	}
 
 	if _, err = c.CopyObject(context.TODO(), &s3.CopyObjectInput{

@@ -2782,3 +2782,54 @@ composite parts, at 16 MiB.
     rm -rf $fsmall .time_small
     finish
 ```
+
+---
+
+## 46. An s3 -> s3 copy over 5 GiB is refused
+
+**Fixed.** #64 taught uploads to go in parts, but `S3.Copy` stayed a single
+`CopyObject`, which has its own 5 GiB limit. So `cp`, `rsync` and `mv` between s3
+locations could not handle an object that `cp` could upload. Measured on a
+30.97 GB object: `InvalidRequest: The specified copy source is larger than the
+maximum allowable size for a copy source: 5368709120`, in 3s, writing nothing.
+
+Above 5 GiB `Copy` now uses `UploadPartCopy`, so no bytes pass through the
+machine. At or below it nothing changes. The same object copied in 108s, and its
+stored CRC32C matched one computed by streaming every byte of the source.
+
+### Objects written by older versions
+
+No migration is needed, and nothing already stored is touched.
+
+| source | can it reach the new path | result of copying it |
+|---|---|---|
+| gsg before v1.0.34 | no -- a 5.5 GiB upload fails `EntityTooLarge`, on both builds tried | `CopyObject` as before |
+| gsg v1.0.34 and later | yes | same CRC32C, FULL_OBJECT, byte-identical |
+| COMPOSITE CRC32C, >5 GiB | yes | gains the file's real whole-object CRC32C |
+| no CRC32C, >5 GiB, such as `aws s3 cp` | yes | gains the file's real whole-object CRC32C |
+| anything under 5 GiB | no | identical under main and this build, including ETag |
+
+v1.0.34 reads the checksum of a copy made this way. The ETag depends on the part
+layout: the 30.97 GB object went from `-3692` to `-231`, so it can differ between
+source and copy. gsg compares ETags only for its own locks.
+
+### Still open
+
+**Plain `rsync` between s3 locations re-copies everything, every run, at any
+size.** `Attrs.Same` compares modification times, and a server-side copy resets
+the destination's. This predates the change and was measured on current main at
+200 MiB, but a re-copy of a large object now happens where it used to fail.
+`rsync -v` compares by content and reports no diff, except when the source has no
+comparable checksum, which is item 18 and re-copies even with `-v`. Implementing
+`CopyResetsModTime` on `S3`, as #85 did for oci, would fix the first half. It
+changes what plain `rsync` compares, so it is a decision of its own.
+
+**A worker's `common.ExitWith` can strand other workers' uploads.** It reaches
+`os.Exit`, so under `-m` the deferred aborts of every other copy in flight never
+run, and their parts bill until removed. `uploadMultipart` has the same exposure,
+as does any signal. The fix is at the command layer: collect the error, let the
+others abort, then exit. Until then an `AbortIncompleteMultipartUpload` lifecycle
+rule on the bucket is the backstop.
+
+**A large copy needs `s3:GetObjectTagging` even for a source with no tags**, which
+a small one does not. It fails rather than risk losing tags silently.
