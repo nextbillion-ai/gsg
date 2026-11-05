@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/bar"
@@ -89,6 +90,9 @@ type S3Attributes struct {
 	// paid for only by the caller that reads it. It is nil on an S3Attributes
 	// that came from GetObjectAttributes, where the checksum is already there.
 	fetchCRC32C func() (uint32, bool)
+	// noCRC32C goes with fetchCRC32C: whether the object is known to store no
+	// comparable checksum, as opposed to the fetch having failed.
+	noCRC32C func() bool
 }
 
 func (s *S3) toAttrs(attrs *S3Attributes) *system.Attrs {
@@ -103,11 +107,17 @@ func (s *S3) toAttrs(attrs *S3Attributes) *system.Attrs {
 	if attrs.S3Attrs.ObjectSize != nil {
 		size = *attrs.S3Attrs.ObjectSize
 	}
+	noCRC32C := attrs.noCRC32C
+	if attrs.fetchCRC32C == nil {
+		// From GetObjectAttributes, so the answer is already here.
+		noCRC32C = func() bool { return noComparableCRC32C(attrs) }
+	}
 	return &system.Attrs{
 		Size:       size,
 		CRC32:      crc32c,
 		ModTime:    getR2ModificationTime(attrs),
 		CalcCRC32C: attrs.fetchCRC32C,
+		NoCRC32C:   noCRC32C,
 	}
 }
 
@@ -135,6 +145,15 @@ func crc32cOf(attrs *S3Attributes) (uint32, bool) {
 		return 0, false
 	}
 	return decodeCRC32C(*enc)
+}
+
+// noComparableCRC32C reports that an object stores no whole-object CRC32C. It is
+// narrower than crc32cOf returning false: a whole-object CRC32C that cannot be
+// decoded is unknown rather than absent, so it must not be treated as "there is
+// nothing to compare".
+func noComparableCRC32C(attrs *S3Attributes) bool {
+	c := attrs.S3Attrs.Checksum
+	return c == nil || c.ChecksumType != types.ChecksumTypeFullObject || c.ChecksumCRC32C == nil || *c.ChecksumCRC32C == ""
 }
 
 // decodeCRC32C reads the wire form of a checksum: base64 of four big-endian
@@ -418,15 +437,24 @@ type crcBatch struct {
 // objects that both failed to produce a checksum matched on size alone. Before
 // this, a failure here aborted the whole listing instead, which was loud but
 // is no longer where the request happens.
+//
+// absent separates the two ways of having no checksum: the object was read and
+// stores none (true), or the object could not be read (false).
 type crcResult struct {
-	crc uint32
-	ok  bool
+	crc    uint32
+	ok     bool
+	absent bool
 }
 
 func (b *crcBatch) get(key string) (uint32, bool) {
 	b.once.Do(b.fill)
 	r := b.vals[key]
 	return r.crc, r.ok
+}
+
+func (b *crcBatch) absent(key string) bool {
+	b.once.Do(b.fill)
+	return b.vals[key].absent
 }
 
 func (b *crcBatch) fill() {
@@ -448,6 +476,7 @@ func (b *crcBatch) fill() {
 		crc, stored := crc32cOf(a)
 		if !stored {
 			logger.Debug(module, "s3://%s/%s has no comparable CRC32C", b.bucket, key)
+			vals[i] = crcResult{absent: noComparableCRC32C(a)}
 			return
 		}
 		vals[i] = crcResult{crc: crc, ok: true}
@@ -472,6 +501,7 @@ func (s *S3) listedAttrs(bucket string, o types.Object, batch *crcBatch) *S3Attr
 		Bucket:      bucket,
 		Prefix:      key,
 		fetchCRC32C: func() (uint32, bool) { return batch.get(key) },
+		noCRC32C:    func() bool { return batch.absent(key) },
 	}
 }
 
@@ -759,6 +789,7 @@ func (s *S3) Download(
 	var pb *bar.ProgressBar
 	var wg sync.WaitGroup
 	var once sync.Once
+	var shortChunks atomic.Int64
 	dstFileTemp := common.GetTempFile(dstFile)
 	for i := 0; i < chunkNumber; i++ {
 
@@ -768,6 +799,11 @@ func (s *S3) Download(
 		if i == chunkNumber-1 {
 			length = size - startByte
 		}
+
+		// The range below ends at startByte+length and is inclusive, so every
+		// chunk but the last asks for one byte more than its share and overlaps
+		// the next. The last is cut off by the end of the object.
+		wantBytes := min(length+1, size-startByte)
 
 		wg.Add(1)
 		ctx.Pool.AddWithDepth(1,
@@ -786,7 +822,10 @@ func (s *S3) Download(
 				gi := s3.GetObjectInput{
 					Bucket: aws.String(bucket),
 					Key:    aws.String(prefix),
-					Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startByte, startByte+length)),
+				}
+				// An empty object has no byte 0, so S3 answers any range with 416.
+				if size > 0 {
+					gi.Range = aws.String(fmt.Sprintf("bytes=%d-%d", startByte, startByte+length))
 				}
 				if forceChecksum {
 					gi.ChecksumMode = types.ChecksumModeEnabled
@@ -806,6 +845,14 @@ func (s *S3) Download(
 				}
 
 				defer func() { _ = fl.Close() }()
+
+				var gotBytes int64
+				defer func() {
+					if gotBytes != wantBytes {
+						logger.Info(module, "download of s3://%s/%s got %d bytes at offset %d, expected %d", bucket, prefix, gotBytes, startByte, wantBytes)
+						shortChunks.Add(1)
+					}
+				}()
 
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
@@ -827,6 +874,7 @@ func (s *S3) Download(
 								// Progress bar write error, non-fatal
 							}
 							totalWritten += int64(n)
+							gotBytes = totalWritten
 
 							// Every 10MB, pause and drop cache
 							if totalWritten%(10*1024*1024) == 0 {
@@ -850,7 +898,8 @@ func (s *S3) Download(
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 					defer func() { _ = bufWriter.Flush() }()
 
-					if _, we := io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
+					var we error
+					if gotBytes, we = io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
 						logger.Info(module, "download object failed when write to offet with %s", we)
 						common.Exit()
 					}
@@ -866,6 +915,14 @@ func (s *S3) Download(
 
 	// move back the temp file
 	wg.Wait()
+
+	// The temp file is allocated at full size, so a response that ended early
+	// without an error leaves zeroes at the right length. Renaming that and
+	// stamping the object's time would make a later rsync of an object with no
+	// checksum skip it for good.
+	if n := shortChunks.Load(); n > 0 {
+		return fmt.Errorf("s3: download of s3://%s/%s: %d chunk(s) came back the wrong size", bucket, prefix, n)
+	}
 
 	// sync temp file to disk before rename
 	if tmpFile, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766); err == nil {
