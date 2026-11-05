@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/logger"
@@ -112,6 +114,44 @@ func crc32cOf(b64 *string) (uint32, bool) {
 	return binary.BigEndian.Uint32(raw), true
 }
 
+// noCRC32CStored reports that an object has no CRC32C at all. It is narrower than
+// crc32cOf returning false: a value that cannot be decoded is unknown rather than
+// absent, so it must not be treated as "there is nothing to compare".
+func noCRC32CStored(b64 *string) bool {
+	return b64 == nil || *b64 == ""
+}
+
+// crcLookup is what one HEAD says about an object's checksum. known and absent
+// are both false when the HEAD could not say: Same treats that as a difference,
+// so the object is copied again rather than skipped on the strength of a failure.
+type crcLookup struct {
+	crc    uint32
+	known  bool
+	absent bool
+}
+
+// lazyCRCLookup defers the HEAD until something compares the object, and makes at
+// most one however many questions are asked of the answer.
+func lazyCRCLookup(object string, head func() (*objectstorage.HeadObjectResponse, error)) func() crcLookup {
+	return sync.OnceValue(func() crcLookup {
+		r, err := head()
+		if err != nil {
+			logger.Info(module, "cannot read the checksum of %s, treating it as unknown: %s", object, err)
+			return crcLookup{}
+		}
+		if r == nil {
+			logger.Info(module, "%s vanished while reading its checksum, treating it as unknown", object)
+			return crcLookup{}
+		}
+		crc, stored := crc32cOf(r.OpcContentCrc32c)
+		if !stored {
+			logger.Debug(module, "%s has no readable CRC32C", object)
+			return crcLookup{absent: noCRC32CStored(r.OpcContentCrc32c)}
+		}
+		return crcLookup{crc: crc, known: true}
+	})
+}
+
 // md5Of is the MD5 a HEAD reports: content-md5 for a single-part upload,
 // opc-multipart-md5 ("<md5>-<parts>") for a multipart one. It matches the md5
 // a listing carries for the same object, so either side of a comparison can
@@ -187,6 +227,8 @@ func (o *OCI) Attributes(bucket, prefix string) (*system.Attrs, error) {
 		// difference -- TODO item 18 -- so the log is what carries it.
 		logger.Info(module, "no CRC32C stored for oci://%s/%s; it was uploaded without one", bucket, prefix)
 	}
+	absent := noCRC32CStored(r.OpcContentCrc32c)
+	a.NoCRC32C = func() bool { return absent }
 	return a, nil
 }
 
@@ -233,27 +275,14 @@ func (o *OCI) summaryToAttrs(spec string, s objectstorage.ObjectSummary) *system
 	}
 	if s.Name != nil {
 		name := *s.Name
+		lookup := lazyCRCLookup(fmt.Sprintf("oci://%s/%s", spec, name), func() (*objectstorage.HeadObjectResponse, error) {
+			return o.headObject(spec, name)
+		})
 		a.CalcCRC32C = func() (uint32, bool) {
-			// The second result is what keeps a failure from passing for a
-			// checksum of 0: Same treats "could not determine" as a
-			// difference, so the object is copied again rather than skipped
-			// on the strength of two failures agreeing.
-			r, err := o.headObject(spec, name)
-			if err != nil {
-				logger.Info(module, "cannot read the checksum of oci://%s/%s, treating it as unknown: %s", spec, name, err)
-				return 0, false
-			}
-			if r == nil {
-				logger.Info(module, "oci://%s/%s vanished while reading its checksum, treating it as unknown", spec, name)
-				return 0, false
-			}
-			crc, stored := crc32cOf(r.OpcContentCrc32c)
-			if !stored {
-				logger.Debug(module, "oci://%s/%s has no stored CRC32C", spec, name)
-				return 0, false
-			}
-			return crc, true
+			l := lookup()
+			return l.crc, l.known
 		}
+		a.NoCRC32C = func() bool { return lookup().absent }
 	}
 	return a
 }

@@ -1925,18 +1925,30 @@ GOHELPER
 # $remote_base already set, and may use every helper defined above.
 do_test_oci() {
     mode=oci
-    oci_bucket="${GSG_UAT_OCI_BUCKET:-nb-oci-sin-test}"
+    # The run needs an object store it cannot hurt. There is no dedicated test
+    # bucket in the nextbillion tenancy, so the defaults are two service buckets
+    # that held nothing when chosen and are not versioned. nb-mdm-phx also expires
+    # objects after 14 days, which clears whatever a crashed run leaves behind.
+    # Do not point these at a transformer or release bucket: those hold live data.
+    oci_bucket="${GSG_UAT_OCI_BUCKET:-nb-mdm-phx}"
 
-    # The region an oci:// path names. gsg no longer takes it from
-    # ~/.oci/config -- that is what this suite is here to prove -- so the
-    # harness has to supply it the same way a user does, in the path. It is
-    # still read from the config by default, because that is the region the
-    # oci cli will use for the assertions and the two have to agree.
-    oci_region="${GSG_UAT_OCI_REGION:-$(awk -F= '/^[[:space:]]*region[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${OCI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)}"
+    # Everything this suite deletes is under this prefix, so a malformed id must
+    # stop the run before anything can match more than this run's own objects.
+    if [[ ! "$testid" =~ ^[0-9]+-[0-9]+$ ]]
+    then
+        echo "FATAL: refusing to run with test id '$testid': every delete is scoped by it"
+        exit 1
+    fi
+
+    # The region an oci:// path names. gsg no longer takes it from ~/.oci/config
+    # -- that is what this suite is here to prove -- so the harness supplies it the
+    # same way a user does, in the path. It is the buckets' region rather than the
+    # config's, which can name a different one.
+    oci_region="${GSG_UAT_OCI_REGION:-us-phoenix-1}"
 
     # A second bucket in the same region, for the cross-bucket cases. They
     # skip themselves if it is not reachable, so a run needs only the first.
-    oci_bucket_dst="${GSG_UAT_OCI_BUCKET_DST:-nb-oci-sin-test-dst}"
+    oci_bucket_dst="${GSG_UAT_OCI_BUCKET_DST:-nb-optimization-phx}"
     oci_dst_used=false
 
     # A second region, for the cross-region cases. Optional: most runs have one
@@ -1945,20 +1957,6 @@ do_test_oci() {
     oci_region2="${GSG_UAT_OCI_REGION2:-}"
 
     remote_base="oci://$oci_bucket@$oci_region/$testid"
-
-    # Without a region there is no path to test with, since every oci:// path
-    # now carries one. Guessing a default here would test a bucket the user
-    # did not name.
-    if [[ -z "$oci_region" ]]
-    then
-        if [[ "$target" == "oci" ]]
-        then
-            echo "FATAL: oci mode needs a region -- set GSG_UAT_OCI_REGION, or a region= line in ~/.oci/config"
-            exit 1
-        fi
-        echo "skipping oci: no region in ~/.oci/config and GSG_UAT_OCI_REGION is unset"
-        return 0
-    fi
 
     # A run that cannot reach OCI has not tested OCI. Saying "everything OK"
     # here would be a false green on the one target whose whole purpose is to
@@ -1979,7 +1977,7 @@ do_test_oci() {
         echo "test data left behind for inspection at: $remote_base"
         echo "remove it with: oci os object bulk-delete --region '"$oci_region"' \\"
         echo "                  --namespace '"$oci_ns"' \\"
-        echo "                  --bucket-name '"$oci_bucket"' --prefix '"$testid"' --force"
+        echo "                  --bucket-name '"$oci_bucket"' --prefix '"$testid"/' --force"
         echo "  and the same for --bucket-name '"$oci_bucket_dst"' if the cross-bucket cases ran"
     fi' EXIT
 
@@ -2018,7 +2016,7 @@ do_test_oci() {
     rm -rf uat_temp || true
     cleaned=true
     oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" --bucket-name "$oci_bucket" \
-        --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
+        --prefix "$testid/" --force >/dev/null 2>&1 || cleaned=false
     # The second bucket is swept only when the cross-bucket cases actually ran.
     # That distinction is what makes a failure here worth reporting: if they
     # skipped, there is nothing to remove and a failed delete says nothing,
@@ -2026,7 +2024,7 @@ do_test_oci() {
     if [[ "${oci_dst_used:-false}" == "true" ]]
     then
         oci os object bulk-delete --region "$oci_region" --namespace "$oci_ns" \
-            --bucket-name "$oci_bucket_dst" --prefix "$testid" --force >/dev/null 2>&1 || cleaned=false
+            --bucket-name "$oci_bucket_dst" --prefix "$testid/" --force >/dev/null 2>&1 || cleaned=false
     fi
     if [[ "$cleaned" != "true" ]]
     then
@@ -2049,7 +2047,7 @@ usage() {
     echo "  gs   requires gsutil and GOOGLE_APPLICATION_CREDENTIALS"
     echo "  s3   requires the aws cli and its credentials"
     echo "  oci  requires the oci cli and ~/.oci/config"
-    echo "       GSG_UAT_OCI_REGION overrides the region taken from ~/.oci/config"
+    echo "       GSG_UAT_OCI_REGION is the buckets' region (default us-phoenix-1)"
     echo "       GSG_UAT_OCI_BUCKET_DST is the second bucket, same region, for the"
     echo "       cross-bucket cases; they skip if it is not reachable"
     echo "       GSG_UAT_OCI_BUCKET2 + GSG_UAT_OCI_REGION2 enable the cross-region cases"

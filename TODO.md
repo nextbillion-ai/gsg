@@ -721,8 +721,8 @@ same call's `Key` and the equivalent in `PutObject` while there.
 
 ## 18. Attrs cannot say "there is no checksum"
 
-**Fixed for s3 downloads (Nov 2026), the rest still open.** `rsync` from s3 to
-local files no longer downloads an object with no comparable CRC32C on every
+**Fixed for s3 and oci downloads (Nov 2026), the rest still open.** `rsync` from
+s3 or oci to local files no longer downloads an object with no comparable CRC32C on every
 run. It compares such an object by size and modification time, the same signal
 `aws s3 sync` uses, because `Download` stamps the local file with the object's
 time. Measured: after `aws s3 sync` and after `gsg rsync`, the local time equals
@@ -741,9 +741,6 @@ time, the same as if the replacement had landed just after the run.
 
 Still open:
 
-- **oci downloads.** An object uploaded without a CRC32C has the same repeat
-  download. `system.Attrs.NoCRC32C` is opt-in per backend and oci does not set
-  it yet, because the OCI UAT points at a retired tenancy and could not prove it.
 - **Uploads and cloud-to-cloud.** These stay on `Same` on purpose. A destination
   gets a new time there, so the time says nothing about content, and two
   objects of the same size could otherwise be skipped by coincidence.
