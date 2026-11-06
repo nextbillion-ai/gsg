@@ -721,6 +721,41 @@ same call's `Key` and the equivalent in `PutObject` while there.
 
 ## 18. Attrs cannot say "there is no checksum"
 
+**Fixed for s3 and oci downloads (Nov 2026), the rest still open.** `rsync` from
+s3 or oci to local files no longer downloads an object with no comparable CRC32C on every
+run. It compares such an object by size and modification time, the same signal
+`aws s3 sync` uses, because `Download` stamps the local file with the object's
+time. Measured: after `aws s3 sync` and after `gsg rsync`, the local time equals
+S3's `LastModified` exactly. `-v` logs that the content of those objects was not
+checked. A lookup that failed still downloads. An object with a usable CRC32C
+keeps the content check, so `-v` is unchanged for those.
+
+Two download gaps went with it. A chunk that returns fewer bytes than it asked
+for now fails the download before the rename, since such a file would otherwise
+be skipped for good. An empty object is fetched without a range, because S3
+answers any range on one with 416, which ended the whole run.
+
+Accepted: an object replaced between the listing and the checksum lookup is
+compared using the old time, so that run may skip it. The next run sees the new
+time, the same as if the replacement had landed just after the run.
+
+Still open:
+
+- **Uploads and cloud-to-cloud.** These stay on `Same` on purpose. A destination
+  gets a new time there, so the time says nothing about content, and two
+  objects of the same size could otherwise be skipped by coincidence.
+- **Content checks for these objects.** S3 does store a checksum: see the
+  correction below. Comparing CRC64NVME would give a real content check, at
+  about 1.2-1.6 GB/s locally against about 5 GB/s for CRC32C, and would verify
+  downloads under `-v` as well. Not needed to stop the repeat downloads.
+
+**Correction to the measurements below.** They say `aws s3 cp` stores no
+checksum and that S3 does not compute one. Measured on 2026-11-05 with
+aws-cli/2.15.30, S3 stores a whole-object CRC64NVME for those objects, single
+part and multipart, and a local CRC64NVME matched it for 8 MiB parts, 16 MiB
+parts and a single put. It is still not a CRC32C, so what follows about `Same`
+held until this fix.
+
 `system.Attrs.CRC32` is a bare `uint32`, so an object that carries no checksum
 is indistinguishable from one whose checksum happens to be zero. `Attrs.Same`
 compares the number unconditionally:

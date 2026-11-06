@@ -45,6 +45,12 @@ type Attrs struct {
 	// were real, so two objects that both failed to produce a checksum
 	// matched on size alone.
 	CalcCRC32C func() (uint32, bool)
+	// NoCRC32C, when set, says the object is known to store no checksum that
+	// can be compared with a whole file. That is a fact about the object, and
+	// it is not the same as CalcCRC32C returning false, which also covers a
+	// request that failed. See SameForDownload, which treats the two
+	// differently. A backend that leaves it nil keeps the behaviour of Same.
+	NoCRC32C func() bool
 	// ContentMD5 is the object's MD5 as the service reports it, when a
 	// backend has one for free (OCI's listing carries it). For a multipart
 	// upload it is the composite form, "<md5 of part md5s>-<parts>", so two
@@ -115,6 +121,37 @@ func (a *Attrs) Same(b *Attrs, forceChecksum bool) bool {
 		b.CRC32 = crc
 	}
 	return a.CRC32 == b.CRC32
+}
+
+// SameForDownload is Same for an object being compared with the local file it
+// would be downloaded to. byTime reports that the two were found equal on size
+// and modification time alone, because the object stores no checksum to
+// compare.
+//
+// Without this, such an object can never match a local file, so rsync downloads
+// it again on every run. Anything "aws s3 cp" uploads is one: S3 stores a
+// CRC64NVME for it rather than a CRC32C.
+//
+// The time can stand in for a checksum here because a download stamps the local
+// file with the object's time, as aws s3 sync does too, so an exact match means
+// this file came from this version of the object. That holds only for a
+// download. An upload or a cloud-to-cloud copy gives the destination a new time,
+// so those stay on Same.
+//
+// A lookup that failed is not "no checksum": NoCRC32C is false for it, Same
+// sees an unknown checksum, and the object is downloaded rather than skipped.
+//
+// Times are compared first without -v so that, as in Same, a changed object
+// costs no checksum request.
+func (a *Attrs) SameForDownload(local *Attrs, forceChecksum bool) (same, byTime bool) {
+	if local == nil || a.NoCRC32C == nil || a.RelativePath != local.RelativePath || a.Size != local.Size {
+		return a.Same(local, forceChecksum), false
+	}
+	timesMatch := !a.ModTime.IsZero() && a.ModTime.Equal(local.ModTime)
+	if (!forceChecksum && !timesMatch) || !a.NoCRC32C() {
+		return a.Same(local, forceChecksum), false
+	}
+	return timesMatch, timesMatch
 }
 
 type RunContext struct {
