@@ -2897,21 +2897,30 @@ as `cat` does. A gs object stored with `Content-Encoding: gzip` is served
 decompressed, so its length and checksum describe other bytes: it still goes
 out as one unranged stream, verified only by the storage library.
 
-Measured on a Mac (link about 40 MB/s), CRC32C of the output computed by an
-independent reader and compared with `gcloud storage hash`:
+Measured on a Mac (link about 40 MB/s) and in a 4-CPU pod in europe-west1. The
+CRC32C of the output was computed by a separate reader and compared with
+`gcloud storage hash`; "stopped" runs were cut off by the time cap.
 
-| object | tool | first byte | total | MB/s | peak RSS | CRC32C |
-|---|---|---|---|---|---|---|
-| 42 MB | v1.0.41 | 1.2 s | 1.4 s | 29 | 241 MiB | match |
-| 42 MB | this | 0.19 s | 1.6 s | 26 | 83 MiB | match |
-| 42 MB | `gcloud storage cat` | 0.63 s | 1.9 s | 22 | 89 MiB | match |
-| 12.7 GB | v1.0.41 | none in 120 s | killed | 0 | 7833 MiB at kill | - |
-| 12.7 GB | this | 0.34 s | 322 s | 39.6 | 180 MiB | match |
-| 12.7 GB | `gcloud storage cat` | 0.68 s | 336 s | 37.9 | 89 MiB | match |
+| where | object | tool | first byte | total | MB/s | peak RSS | CRC32C |
+|---|---|---|---|---|---|---|---|
+| Mac | 42 MB | v1.0.41 | 1.2 s | 1.4 s | 29 | 241 MiB | match |
+| Mac | 42 MB | this | 0.19 s | 1.6 s | 26 | 83 MiB | match |
+| Mac | 42 MB | gcloud storage cat | 0.63 s | 1.9 s | 22 | 89 MiB | match |
+| Mac | 12.7 GB | v1.0.41 | none in 120 s | killed | 0 | 7833 MiB at kill | - |
+| Mac | 12.7 GB | this | 0.34 s | 322 s | 39.6 | 180 MiB | match |
+| Mac | 12.7 GB | gcloud storage cat | 0.68 s | 336 s | 37.9 | 89 MiB | match |
+| pod, europe-west1, bucket in asia-southeast1 | 42 MB | v1.0.41 | 7.5 s | 7.8 s | 5.4 | 237 MiB | match |
+| same | 42 MB | this | 2.3 s | 7.4 s | 5.7 | 80 MiB | match |
+| same | 42 MB | gcloud storage cat | 7.7 s | 12.0 s | 3.5 | 95 MiB | match |
+| same | 12.7 GB | v1.0.41 | none in 90 s | killed | 0 | 2082 MiB at kill | - |
+| same | 12.7 GB | this | 2.3 s | 420 s | 30.4 | 173 MiB | match |
+| same | 12.7 GB | gcloud storage cat | 7.8 s | stopped at 194 s | 12.0 | 95 MiB | (partial) |
+| pod, europe-west1, bucket in europe-west1 | 45.7 GB | this, 2 runs | 0.25 / 0.16 s | 111 / 84 s | 411 / 545 | 217 MiB | match |
+| same | 45.7 GB | gcloud storage cat, 2 runs | 1.5 / 1.4 s | stopped at 120 s | 206 / 283 | 95 MiB | (partial) |
 
-`gsg cat ... | head -c 100` on the 12.7 GB object returns in 0.19 s with
-nothing on stderr. `gsg cat <42 MB pbf> | extract-pbf - --bbox ... -s simple`
-wrote a PBF byte-identical to running extract-pbf on a downloaded copy.
+`gsg cat ... | head -c 100`: 0.19 s on the Mac (12.7 GB object), 0.22 / 0.25 s in-region, 2.3 s cross-region; nothing on stderr in every case. The cross-region pod's 2.3 s first byte is gsg's startup there (a bare `gsg hash` of the same object takes 2.1 s: token, metadata and TLS each pay a ~170 ms round trip), not the stream. v1.0.41 was not run in-region: it filled the pod's 8 GiB within seconds and the container was OOM-killed.
+
+Consumer shape: `gsg cat <12.7 GB SEA pbf> | extract-pbf - --bbox 103.80,1.27,103.87,1.32 -s simple -o out.pbf` with `pipefail` exits 0 in 314 s on the Mac with an empty stderr from gsg, and keeps the same 101328 nodes / 62726 ways / 1397 relations as the 42 MB Singapore pbf; on that 42 MB pbf the piped output is byte-identical to extract-pbf run on a `gcloud storage cp` copy.
 
 `uat.sh` covers it for gs and s3 (exact bytes, one stream, `--debug` keeping
 stdout clean, `| head -c 100`, a missing object) and, gs only, through
