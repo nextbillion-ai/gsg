@@ -3,47 +3,92 @@ package oci
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"strings"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 
+	ocicommon "github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 )
 
-// Cat returns an object's bytes.
-func (o *OCI) Cat(bucket, prefix string) ([]byte, error) {
+// Cat writes an object to w as it arrives.
+//
+// Every range is pinned to the ETag the HEAD saw with If-Match, as Download
+// does. The stored CRC32C is checked when there is one, otherwise the MD5 of a
+// single-part upload; a multipart MD5 is of the parts and cannot be.
+func (o *OCI) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) error {
 	ref, err := o.resolve(bucket)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	c, ns, name := ref.c, ref.ns, ref.name
-	r, err := c.GetObject(context.Background(), objectstorage.GetObjectRequest{
-		NamespaceName: &ns, BucketName: &name, ObjectName: &prefix,
-	})
+	head, err := o.headObject(bucket, prefix)
 	if err != nil {
-		logger.Info(module, "cannot read oci://%s/%s: %s", name, prefix, err)
-		return nil, err
+		return err
 	}
-	defer func() {
-		if r.Content != nil {
-			_ = r.Content.Close()
+	if head == nil {
+		return fmt.Errorf("oci: no object at oci://%s/%s", ref.name, prefix)
+	}
+	var size int64
+	if head.ContentLength != nil {
+		size = *head.ContentLength
+	}
+	var pin *string
+	if head.ETag != nil && *head.ETag != "" {
+		pin = head.ETag
+	}
+	src := common.StreamSource{
+		Name: fmt.Sprintf("oci://%s/%s", ref.name, prefix),
+		Size: size,
+		Open: func(ctx context.Context, off, n int64) (io.ReadCloser, error) {
+			req := objectstorage.GetObjectRequest{
+				NamespaceName: &ref.ns, BucketName: &ref.name, ObjectName: &prefix,
+				IfMatch: pin,
+			}
+			if header, ranged := rangeHeader(off, n); ranged {
+				req.Range = &header
+			}
+			r, gerr := ref.c.GetObject(ctx, req)
+			if gerr != nil {
+				return nil, gerr
+			}
+			if r.Content == nil {
+				return nil, fmt.Errorf("oci: oci://%s/%s returned no body", ref.name, prefix)
+			}
+			return r.Content, nil
+		},
+		Permanent: permanentReadError,
+	}
+	src.CRC32C, src.HasCRC32C = crc32cOf(head.OpcContentCrc32c)
+	if !src.HasCRC32C && head.ContentMd5 != nil {
+		if sum, derr := base64.StdEncoding.DecodeString(*head.ContentMd5); derr == nil && len(sum) == md5.Size {
+			src.MD5 = sum
 		}
-	}()
-	if r.Content == nil {
-		return nil, nil
 	}
-	buf := new(bytes.Buffer)
-	// ReadFrom, not ReadAll into a fixed buffer: a short read that is not
-	// reported is how a truncated object comes back looking complete.
-	if _, err = buf.ReadFrom(r.Content); err != nil {
-		logger.Info(module, "cannot read the body of oci://%s/%s: %s", name, prefix, err)
-		return nil, err
+	return common.Stream(context.Background(), w, src, opts)
+}
+
+// permanentReadError reports a read that no retry can turn into the pinned
+// version's bytes.
+func permanentReadError(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
 	}
-	return buf.Bytes(), nil
+	var se ocicommon.ServiceError
+	if asServiceError(err, &se) {
+		switch se.GetHTTPStatusCode() {
+		case 400, 401, 403, 404, 412, 416:
+			return true
+		}
+	}
+	return false
 }
 
 // IsObject reports whether prefix names an object.

@@ -43,3 +43,21 @@ A directory shared by several processes is only safe when they all see the same
 filesystem at the same paths — as two containers mounting one volume do. The
 key is a path and an mtime, so processes that mean different files by the same
 path would read each other's checksums.
+
+-cat:
+`gsg cat URL` writes an object to stdout as it arrives, so it can feed a parser
+without touching local disk (`gsg cat gs://b/map.osm.pbf | extract-pbf - ...`).
+The object is read in ranged chunks of `--chunk-size` (16 MiB by default), up
+to `--window` of them in parallel (8 by default), and written in order; memory
+is window x chunk size, 128 MiB at the defaults. `--chunk-size 0` reads it as
+one stream. A read that fails, or delivers nothing for 30 s, is reopened at the
+byte it reached, with retries for about 15 s. Every range reads the version the
+first lookup saw: the generation on gs, the ETag on s3 and oci.
+
+The output is checked against the object's CRC32C (on oci without one, the MD5
+of a single-part upload; on s3 without a whole-object CRC32C, the length only).
+The bytes are written before the check can finish, so a mismatch or a failed
+read is reported after the fact with a non-zero exit: treat the output as the
+object only when gsg exits 0, e.g. with `set -o pipefail`. Log lines go to
+stderr. When the reader closes the pipe early (`| head -c 100`), gsg ends at
+once on SIGPIPE, as `cat` does.

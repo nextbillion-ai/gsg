@@ -2868,3 +2868,54 @@ rule on the bucket is the backstop.
 
 **A large copy needs `s3:GetObjectTagging` even for a source with no tags**, which
 a small one does not. It fails rather than risk losing tags silently.
+
+---
+
+## 47. `cat` holds the whole object in memory before writing a byte
+
+**Fixed in #94.** Every backend's `Cat` read the object into a `bytes.Buffer`
+and returned it, and `cmd/cat.go` then printed `string(output)`, a second copy.
+Nothing reached stdout until the last byte had arrived, and memory peaked at
+twice the object. `--chunk-size` and `-m` had no effect: `Cat` never chunked.
+Measured with v1.0.41 on a 12.7 GB object: 0 bytes written in 120 s while the
+resident set grew to 7.8 GB, where `gcloud storage cat` started in 0.7 s. Log
+lines went to stdout too, so any warning landed inside the data.
+
+`Cat` now takes a writer and streams through `common.Stream`: ranged chunks,
+up to `--window` (8) in flight, each into its own buffer, written in order
+while the oldest is still filling, so the first byte goes out with the first
+response and memory is window x chunk size (128 MiB at the defaults).
+`--chunk-size 0` reads one stream. A read that fails, or delivers nothing for
+30 s, is reopened at the byte it reached, with retries for about 15 s that
+start over whenever a read makes progress. Ranges are pinned to the generation
+(gs) or ETag (s3, oci) of the first lookup. The CRC32C, or on oci without one
+the MD5 of a single-part upload, is checked over the written bytes; since they
+are already out, a mismatch is an error after the last byte and a non-zero
+exit. An s3 object without a whole-object CRC32C is checked for length only.
+For `cat`, log lines go to stderr. A closed stdout ends the process on SIGPIPE,
+as `cat` does. A gs object stored with `Content-Encoding: gzip` is served
+decompressed, so its length and checksum describe other bytes: it still goes
+out as one unranged stream, verified only by the storage library.
+
+Measured on a Mac (link about 40 MB/s), CRC32C of the output computed by an
+independent reader and compared with `gcloud storage hash`:
+
+| object | tool | first byte | total | MB/s | peak RSS | CRC32C |
+|---|---|---|---|---|---|---|
+| 42 MB | v1.0.41 | 1.2 s | 1.4 s | 29 | 241 MiB | match |
+| 42 MB | this | 0.19 s | 1.6 s | 26 | 83 MiB | match |
+| 42 MB | `gcloud storage cat` | 0.63 s | 1.9 s | 22 | 89 MiB | match |
+| 12.7 GB | v1.0.41 | none in 120 s | killed | 0 | 7833 MiB at kill | - |
+| 12.7 GB | this | 0.34 s | 322 s | 39.6 | 180 MiB | match |
+| 12.7 GB | `gcloud storage cat` | 0.68 s | 336 s | 37.9 | 89 MiB | match |
+
+`gsg cat ... | head -c 100` on the 12.7 GB object returns in 0.19 s with
+nothing on stderr. `gsg cat <42 MB pbf> | extract-pbf - --bbox ... -s simple`
+wrote a PBF byte-identical to running extract-pbf on a downloaded copy.
+
+`uat.sh` covers it for gs and s3 (exact bytes, one stream, `--debug` keeping
+stdout clean, `| head -c 100`, a missing object) and, gs only, through
+`uat/faultproxy`: every connection reset, a refused reconnect, 5 s unreachable,
+responses dropped for 3 s, each in chunked and single-stream form, must give
+the object exactly with exit 0; an outage past the retries must exit non-zero,
+say how many attempts it made, and have written less than the object.

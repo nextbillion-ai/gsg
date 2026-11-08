@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"os/exec"
@@ -350,14 +351,17 @@ func (l *Linux) Move(srcBucket, srcPath, dstBucket, dstPath string) error {
 	return nil
 }
 
-// OutputObject outputs an object
-func (l *Linux) Cat(bucket, path string) ([]byte, error) {
-	var err error
-	var bs []byte
-	if bs, err = exec.Command("cat", path).Output(); err != nil {
-		return nil, commandFailure("read", path, err)
+// Cat copies a local file to w.
+func (l *Linux) Cat(_, path string, w io.Writer, _ common.StreamOptions) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
 	}
-	return bs, nil
+	defer func() { _ = f.Close() }()
+	if _, err = io.Copy(w, f); err != nil {
+		return fmt.Errorf("cannot read %s: %w", path, err)
+	}
+	return nil
 }
 
 // IsDirectoryOrObject checks if is a directory or an object
