@@ -2873,7 +2873,7 @@ a small one does not. It fails rather than risk losing tags silently.
 
 ## 48. A download it cannot write fails as "seek for offset with invalid argument"
 
-**Fixed in this PR.** gs and s3 created the `_.gstmp` inside the first chunk and
+**Fixed in #95.** gs and s3 created the `_.gstmp` inside the first chunk and
 dropped the error, and every chunk then opened it with the error dropped too.
 When the file could not be created, each chunk called `Seek` on a nil
 `*os.File`, which returns `os.ErrInvalid`, so the only message was
