@@ -274,12 +274,23 @@ func TestRetryableJudgesTypedErrors(t *testing.T) {
 		{"not a directory", pathErr(syscall.ENOTDIR), false},
 		{"no such local file", pathErr(syscall.ENOENT), false},
 		{"read-only file system", pathErr(syscall.EROFS), false},
-		{"invalid argument", pathErr(syscall.EINVAL), false},
-		{"nil file", os.ErrInvalid, false},
+		{"invalid argument", pathErr(syscall.EINVAL), true},
+		{"nil file", os.ErrInvalid, true},
+		{"gsg refuses its arguments", Caused("cannot copy s3://b/o onto itself", ErrInvalidRequest), false},
 		{"gs object not found", fmt.Errorf("lookup: %w", storage.ErrObjectNotExist), false},
 		{"gs 403", &googleapi.Error{Code: 403}, false},
 		{"gs 404", &googleapi.Error{Code: 404}, false},
-		{"gs 412", &googleapi.Error{Code: 412}, false},
+		{"gs 412, an overwritten generation", &googleapi.Error{Code: 412}, true},
+		{"gs 403 rate limit", &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "rateLimitExceeded"}}}, true},
+		{"gs 403 user rate limit", &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "userRateLimitExceeded"}}}, true},
+		{"gs 403 rate limit over XML", &googleapi.Error{Code: 403, Body: "<Error><Code>userRateLimitExceeded</Code></Error>"}, true},
+		{"gs 403 forbidden", &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "forbidden"}}}, false},
+		{"gs object changed under the read", Caused("storage: object doesn't exist", ErrObjectChanged), true},
+		{"s3 403 clock skew", codedStatusError{403, "RequestTimeTooSkewed"}, true},
+		{"s3 403 access denied", codedStatusError{403, "AccessDenied"}, false},
+		{"s3 503 slow down", codedStatusError{503, "SlowDown"}, true},
+		{"s3 412", statusError(412), true},
+		{"oci 412, an overwritten ETag", ociStatusError(412), true},
 		{"s3 403", fmt.Errorf("op: %w", statusError(403)), false},
 		{"oci 404", ociStatusError(404), false},
 		{"gs 408", &googleapi.Error{Code: 408}, true},
@@ -303,6 +314,15 @@ type statusError int
 
 func (e statusError) Error() string       { return fmt.Sprintf("status %d", int(e)) }
 func (e statusError) HTTPStatusCode() int { return int(e) }
+
+type codedStatusError struct {
+	status int
+	code   string
+}
+
+func (e codedStatusError) Error() string       { return e.code }
+func (e codedStatusError) ErrorCode() string   { return e.code }
+func (e codedStatusError) HTTPStatusCode() int { return e.status }
 
 type ociStatusError int
 
@@ -379,7 +399,7 @@ func TestRetryableSeesThroughMessagesWrittenForPeople(t *testing.T) {
 		{"no such object", Caused("failed with bucket[b] prefix[o] not an object", ErrNoSuchObject), false},
 		{"service refusal kept as cause", Caused("failed with bucket[b] prefix[o] not an object", &googleapi.Error{Code: 403}), false},
 		{"not configured, with the loader's error", Caused("failed in loading defaultConfig", errors.New("bad profile"), ErrNotConfigured), false},
-		{"copy onto itself", Caused("cannot copy s3://b/o onto itself", fs.ErrInvalid), false},
+		{"copy onto itself", Caused("cannot copy s3://b/o onto itself", ErrInvalidRequest), false},
 		{"chunk reset", Caused("download object failed when write to offet with reset", &net.OpError{Op: "read", Err: syscall.ECONNRESET}), true},
 		{"v1 sdk 403", statusCodeError(403), false},
 		{"v1 sdk 503", statusCodeError(503), true},

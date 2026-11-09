@@ -2902,12 +2902,25 @@ so. oci already checked the chunk open and now also returns the create error.
 like this was printed three times before the exit. Also fixed in #95: they go
 through `DoTransferWithRetry`, which stops at the first error
 `common.Retryable` rejects. It judges only typed errors: `fs.ErrPermission`,
-`fs.ErrNotExist`, `fs.ErrInvalid`, `ENOTDIR`, `EISDIR`, `EROFS`, `EINVAL`,
+`fs.ErrNotExist` (local), `ENOTDIR`, `EISDIR`, `EROFS`,
 `storage.ErrObjectNotExist` / `ErrBucketNotExist`, `common.ErrNoSuchObject`,
-`common.ErrNotConfigured`, and a 400, 403, 404 or 412 from the gs, s3 (v1 and
-v2 SDK) or oci SDK. 408, 429, 5xx, resets, timeouts and anything untyped are
-retried as before. The s3 attribute lookup and the oci chunk retry use the same
-judgement.
+`common.ErrNotConfigured`, `common.ErrInvalidRequest` (gsg refusing its own
+arguments), and a 400, 403 or 404 from the gs, s3 (v1 and v2 SDK) or oci SDK.
+Retried as before: 408, 429, 5xx, resets, timeouts, anything untyped, and
+also:
+
+- A GCS 403 whose reason is `rateLimitExceeded` or `userRateLimitExceeded`
+  (from `Errors[].Reason`, or the body of an XML read, which is not parsed),
+  and an s3 throttling or clock-skew code (`SlowDown`, `RequestTimeTooSkewed`
+  and the like) whatever its status. oci throttles only with 429 and 409.
+- 412. A download reads the generation (gs) or ETag (oci) its lookup saw; an
+  object overwritten while it is read answers 412 (oci) or 404 for that
+  generation (gs, carried as `common.ErrObjectChanged`), and another attempt
+  looks it up again and reads the new version.
+- `EINVAL` and `fs.ErrInvalid`, which also come from a nil or closed file and
+  from an O_DIRECT write a later attempt can make differently.
+
+The s3 attribute lookup and the oci chunk retry use the same judgement.
 
 For that to see the error, every cp and rsync path of gs, s3 and oci now
 hands it over with its type:
@@ -2921,13 +2934,14 @@ hands it over with its type:
   `common.Caused`, which keeps the text and unwraps to the cause.
 - A missing `GOOGLE_APPLICATION_CREDENTIALS` and an s3 config that does not
   load carry `common.ErrNotConfigured`; the s3 one no longer exits on the spot.
-- A copy onto itself (s3, oci) carries `fs.ErrInvalid`; a recovered panic
-  keeps its value when it is an error.
+- A copy onto itself (s3, oci) carries `common.ErrInvalidRequest`; a
+  recovered panic keeps its value when it is an error.
 
 `cmd/transfer_failure_test.go` runs `cp` and `rsync` as a separate process
-against a fake store of each backend: 403, 404, 412, a destination below a file
-and a read-only destination are each tried once, printed once and exit 1; a 503
-and a connection dropped mid-body are retried to success.
+against a fake store of each backend: a 403, a 404 (s3, oci), a destination
+below a file and a read-only destination are each tried once, printed once and
+exit 1; a 503, a connection dropped mid-body, a 412, a gs 404 for the pinned
+generation and a gs rate-limit 403 are retried to success.
 
 Still untyped on these paths, deliberately or because there is nothing to wrap:
 

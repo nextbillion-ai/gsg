@@ -500,6 +500,12 @@ func (g *GCS) Download(
 
 				// create reader with offset and length of object
 				rc, err := obj.NewRangeReader(ff.Context(), startByte, length)
+				if errors.Is(err, storage.ErrObjectNotExist) {
+					// The lookup above found this generation, so it has been
+					// overwritten or deleted since: not a missing object, and
+					// another attempt reads whatever is there now.
+					err = common.Caused(err.Error(), common.ErrObjectChanged)
+				}
 				if err != nil {
 					fail("download object failed when create reader with %s", err)
 					return

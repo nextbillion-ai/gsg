@@ -3,7 +3,6 @@ package oci
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -112,7 +111,7 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	// regions is two different buckets, and refusing that copy would refuse a
 	// legitimate cross-region one.
 	if src.sameBucket(dst) && srcPrefix == dstPrefix {
-		return common.Caused(fmt.Sprintf("oci: refusing to copy oci://%s/%s onto itself", src, srcPrefix), fs.ErrInvalid)
+		return common.Caused(fmt.Sprintf("oci: refusing to copy oci://%s/%s onto itself", src, srcPrefix), common.ErrInvalidRequest)
 	}
 
 	// The source must exist. Without this the work request is accepted and

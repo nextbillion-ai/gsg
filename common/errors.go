@@ -16,6 +16,15 @@ var ErrNoSuchObject = errors.New("no such object")
 // needs to start, which no retry within one command can supply.
 var ErrNotConfigured = errors.New("not configured")
 
+// ErrInvalidRequest is the cause carried when gsg itself refuses what it was
+// asked to do, such as copying an object onto itself.
+var ErrInvalidRequest = errors.New("invalid request")
+
+// ErrObjectChanged is the cause carried when the version of an object a
+// transfer looked up is gone by the time it is read. Another attempt looks the
+// object up again, so it is retryable.
+var ErrObjectChanged = errors.New("object changed while it was read")
+
 type causedError struct {
 	msg    string
 	causes []error

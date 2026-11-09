@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -72,35 +74,73 @@ func DoTransferWithRetry(operation func() error) error {
 	return DoWithRetry(operation, config)
 }
 
-// permanentErrors are local conditions no retry within a command can clear.
+// permanentErrors are conditions no retry within a command can clear.
 // fs.ErrNotExist is a missing local path; a missing object comes back from the
-// storage libraries as one of the types below instead.
+// storage libraries as one of the types below instead. EINVAL and
+// fs.ErrInvalid are not here: they also come from a closed or nil file and from
+// an O_DIRECT write that a later attempt can make differently, so only gsg's
+// own refusal of its arguments, ErrInvalidRequest, counts.
 var permanentErrors = []error{
 	fs.ErrPermission,
 	fs.ErrNotExist,
-	fs.ErrInvalid,
 	syscall.ENOTDIR,
 	syscall.EISDIR,
 	syscall.EROFS,
-	syscall.EINVAL,
 	storage.ErrObjectNotExist,
 	storage.ErrBucketNotExist,
 	ErrNoSuchObject,
 	ErrNotConfigured,
+	ErrInvalidRequest,
 }
 
 // permanentStatus are answers the service gives the same way every time for
-// the same request. 408, 429 and 5xx are not among them.
+// the same request. 408, 429 and 5xx are not among them, and neither is 412:
+// a download reads the generation (gs) or ETag (oci) its lookup saw, an object
+// overwritten while it is read answers 412, and another attempt looks the
+// object up again and reads the new version.
 var permanentStatus = map[int]bool{
-	http.StatusBadRequest:         true,
-	http.StatusForbidden:          true,
-	http.StatusNotFound:           true,
-	http.StatusPreconditionFailed: true,
+	http.StatusBadRequest: true,
+	http.StatusForbidden:  true,
+	http.StatusNotFound:   true,
+}
+
+// gcsRateLimitReasons mark a GCS 403 that is throttling rather than refusal.
+var gcsRateLimitReasons = []string{"rateLimitExceeded", "userRateLimitExceeded"}
+
+// s3RetryableCodes are s3 error codes another attempt can get past whatever
+// their status: throttling, and a clock skew the SDK corrects on the retry.
+var s3RetryableCodes = map[string]bool{
+	"SlowDown":                  true,
+	"Throttling":                true,
+	"ThrottlingException":       true,
+	"RequestLimitExceeded":      true,
+	"RequestThrottled":          true,
+	"RequestTimeTooSkewed":      true,
+	"RequestExpired":            true,
+	"RequestThrottledException": true,
+}
+
+// gcsRateLimited reports whether a GCS error is a rate limit. The JSON API
+// parses the reason into Errors; a read over the XML API is not parsed and
+// carries it only in the body.
+func gcsRateLimited(ge *googleapi.Error) bool {
+	for _, item := range ge.Errors {
+		if slices.Contains(gcsRateLimitReasons, item.Reason) {
+			return true
+		}
+	}
+	for _, reason := range gcsRateLimitReasons {
+		if strings.Contains(ge.Body, reason) {
+			return true
+		}
+	}
+	return false
 }
 
 // Retryable reports whether err may go differently on another attempt. Only
 // typed errors are judged: anything it cannot recognise, including a network
-// error, a timeout or a reset, stays retryable.
+// error, a timeout or a reset, stays retryable. oci throttles with 429 and
+// 409 IncorrectState, never 403, so its status alone decides.
 func Retryable(err error) bool {
 	if err == nil {
 		return false
@@ -112,7 +152,15 @@ func Retryable(err error) bool {
 	}
 	var ge *googleapi.Error
 	if errors.As(err, &ge) {
+		if gcsRateLimited(ge) {
+			return true
+		}
 		return !permanentStatus[ge.Code]
+	}
+	// the s3 SDK's API error code
+	var coded interface{ ErrorCode() string }
+	if errors.As(err, &coded) && s3RetryableCodes[coded.ErrorCode()] {
+		return true
 	}
 	// the s3 SDK's response error
 	var s3e interface{ HTTPStatusCode() int }

@@ -50,7 +50,9 @@ const (
 type fakeStore struct {
 	status    int
 	transient bool
-	media     atomic.Int64
+	// reason goes into a gs error body, as the service gives it
+	reason string
+	media  atomic.Int64
 }
 
 // readFault reports whether this media read is to fail, and with what.
@@ -150,7 +152,7 @@ func gsHandler(f *fakeStore) http.HandlerFunc {
 		} else if code != 0 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(code)
-			fmt.Fprintf(w, `{"error":{"code":%d,"message":"injected"}}`, code)
+			fmt.Fprintf(w, `{"error":{"code":%d,"message":"injected","errors":[{"reason":%q}]}}`, code, f.reason)
 			return
 		}
 		serveRange(w, r)
@@ -309,25 +311,38 @@ func TestTransferFailures(t *testing.T) {
 		status    int
 		transient bool
 		local     string // "notdir" or "readonly": the destination, not the store, fails
+		reason    string
+		only      string // the one backend the fault applies to
+		skip      string // a backend it does not apply to
 	}
 	faults := []fault{
-		{name: "403", status: 403},
-		{name: "404", status: 404},
-		{name: "412", status: 412},
+		{name: "403", status: 403, reason: "forbidden"},
+		// gs reads the generation its lookup found, so a 404 there is an
+		// overwrite, not a missing object; see "404 once"
+		{name: "404", status: 404, skip: "gs"},
 		{name: "not a directory", local: "notdir"},
 		{name: "permission denied", local: "readonly"},
 		{name: "503 once", status: 503, transient: true},
 		{name: "reset once", status: resetFault, transient: true},
+		// an object overwritten under a pinned read: gs answers 404 for the
+		// generation, oci 412 for the ETag; another attempt reads the new one
+		{name: "404 once", status: 404, transient: true, only: "gs"},
+		{name: "412 once", status: 412, transient: true},
+		{name: "403 rate limit once", status: 403, transient: true, reason: "rateLimitExceeded", only: "gs"},
+		{name: "403 user rate limit once", status: 403, transient: true, reason: "userRateLimitExceeded", only: "gs"},
 	}
 	handlers := map[string]func(*fakeStore) http.HandlerFunc{"gs": gsHandler, "s3": s3Handler, "oci": ociHandler}
 	for _, backend := range []string{"gs", "s3", "oci"} {
 		for _, command := range []string{"cp", "rsync"} {
 			for _, fl := range faults {
+				if (fl.only != "" && fl.only != backend) || fl.skip == backend {
+					continue
+				}
 				t.Run(backend+"/"+command+"/"+fl.name, func(t *testing.T) {
 					if fl.local == "readonly" && os.Geteuid() == 0 {
 						t.Skip("root writes to a read-only directory regardless of its mode")
 					}
-					store := &fakeStore{status: fl.status, transient: fl.transient}
+					store := &fakeStore{status: fl.status, transient: fl.transient, reason: fl.reason}
 					srv := httptest.NewServer(handlers[backend](store))
 					defer srv.Close()
 
@@ -373,9 +388,6 @@ func TestTransferFailures(t *testing.T) {
 					switch {
 					case fl.local != "":
 						assert.Zero(t, store.media.Load(), "nothing is fetched for a file that has nowhere to go")
-					case backend == "gs" && fl.status == 404:
-						marker = "doesn't exist"
-						assert.Equal(t, int64(1), store.media.Load(), "one attempt\n%s", out)
 					default:
 						assert.Equal(t, int64(1), store.media.Load(), "one attempt\n%s", out)
 					}
