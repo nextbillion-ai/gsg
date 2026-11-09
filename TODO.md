@@ -2893,5 +2893,12 @@ before dispatching any chunk and return the error from `Download`
 (`open ..._.gstmp: permission denied`), and a chunk that cannot open it says
 so. oci already checked the chunk open and now also returns the create error.
 
-Still open: `cp` and `rsync` retry `Download` through `DoWithRetrySimple`, so a
-permanent error like this one is logged three times before the exit.
+`cp` and `rsync` retried every transfer error three times, so a permanent one
+like this was printed three times before the exit. Also fixed in #95: they go
+through `DoTransferWithRetry`, which stops at the first error
+`common.Retryable` rejects. It judges only typed errors: `fs.ErrPermission`,
+`fs.ErrNotExist`, `fs.ErrInvalid`, `ENOTDIR`, `EISDIR`, `EROFS`, `EINVAL`,
+`storage.ErrObjectNotExist` / `ErrBucketNotExist`, and a 400, 403, 404 or 412
+from the gs, s3 or oci SDK. 408, 429, 5xx, resets, timeouts and anything
+untyped are retried as before. An error the backends turn into a plain string
+(`errors.New(log)`) still gets three attempts.

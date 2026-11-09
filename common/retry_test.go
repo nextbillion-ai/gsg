@@ -1,9 +1,23 @@
 package common
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"cloud.google.com/go/storage"
+	"github.com/nextbillion-ai/gsg/logger"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/api/googleapi"
 )
 
 func TestDefaultRetryConfig(t *testing.T) {
@@ -244,4 +258,114 @@ func TestDoWithRetrySimple_WithNilOperation(t *testing.T) {
 	if err.Error() != expectedErrMsg {
 		t.Errorf("Expected error message '%s', got '%s'", expectedErrMsg, err.Error())
 	}
+}
+
+func TestRetryableJudgesTypedErrors(t *testing.T) {
+	pathErr := func(errno syscall.Errno) error {
+		return &fs.PathError{Op: "open", Path: "/work/o_.gstmp", Err: errno}
+	}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"permission denied", pathErr(syscall.EACCES), false},
+		{"operation not permitted", pathErr(syscall.EPERM), false},
+		{"not a directory", pathErr(syscall.ENOTDIR), false},
+		{"no such local file", pathErr(syscall.ENOENT), false},
+		{"read-only file system", pathErr(syscall.EROFS), false},
+		{"invalid argument", pathErr(syscall.EINVAL), false},
+		{"nil file", os.ErrInvalid, false},
+		{"gs object not found", fmt.Errorf("lookup: %w", storage.ErrObjectNotExist), false},
+		{"gs 403", &googleapi.Error{Code: 403}, false},
+		{"gs 404", &googleapi.Error{Code: 404}, false},
+		{"gs 412", &googleapi.Error{Code: 412}, false},
+		{"s3 403", fmt.Errorf("op: %w", statusError(403)), false},
+		{"oci 404", ociStatusError(404), false},
+		{"gs 408", &googleapi.Error{Code: 408}, true},
+		{"gs 429", &googleapi.Error{Code: 429}, true},
+		{"gs 503", &googleapi.Error{Code: 503}, true},
+		{"s3 500", statusError(500), true},
+		{"oci 429", ociStatusError(429), true},
+		{"connection reset", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}, true},
+		{"timeout", context.DeadlineExceeded, true},
+		{"unexpected EOF", io.ErrUnexpectedEOF, true},
+		{"untyped", errors.New("something else"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, Retryable(tt.err))
+		})
+	}
+}
+
+type statusError int
+
+func (e statusError) Error() string       { return fmt.Sprintf("status %d", int(e)) }
+func (e statusError) HTTPStatusCode() int { return int(e) }
+
+type ociStatusError int
+
+func (e ociStatusError) Error() string          { return fmt.Sprintf("status %d", int(e)) }
+func (e ociStatusError) GetHTTPStatusCode() int { return int(e) }
+
+// captureStdout returns what f printed; the logger writes to stdout.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	saved := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = saved }()
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	f()
+	_ = w.Close()
+	return <-done
+}
+
+func TestDoTransferWithRetryStopsAtAPermanentErrorAndSaysItOnce(t *testing.T) {
+	attempts := 0
+	var err error
+	out := captureStdout(t, func() {
+		err = DoTransferWithRetry(func() error {
+			attempts++
+			e := &fs.PathError{Op: "open", Path: "/work/o_.gstmp", Err: syscall.EACCES}
+			logger.Info("GCS", "download object failed when create temp file with %s", e)
+			return e
+		})
+		ExitWith(err) // AppMode is off in tests, so this only reports
+	})
+	require.ErrorIs(t, err, fs.ErrPermission)
+	assert.Equal(t, 1, attempts, "no retry")
+	assert.Equal(t, 1, strings.Count(out, "permission denied"), out)
+}
+
+func TestDoTransferWithRetryStillRetriesATransientError(t *testing.T) {
+	for _, transient := range []error{
+		&googleapi.Error{Code: 503},
+		&googleapi.Error{Code: 429},
+		&net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)},
+	} {
+		attempts := 0
+		err := DoTransferWithRetry(func() error {
+			attempts++
+			if attempts == 1 {
+				return transient
+			}
+			return nil
+		})
+		assert.NoError(t, err, "%v", transient)
+		assert.Equal(t, 2, attempts, "%v", transient)
+	}
+	attempts := 0
+	err := DoTransferWithRetry(func() error {
+		attempts++
+		return &googleapi.Error{Code: 503}
+	})
+	assert.Error(t, err)
+	assert.Equal(t, 3, attempts, "a transient error that persists uses every attempt")
 }

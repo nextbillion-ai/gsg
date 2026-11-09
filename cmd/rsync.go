@@ -70,7 +70,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		prefix := fo.Prefix
 		dstPath := dstPaths[i]
 		pool.Add(func() {
-			if e := common.DoWithRetrySimple(func() error {
+			if e := common.DoTransferWithRetry(func() error {
 				return sys.Download(bucket, prefix, dstPath, forceChecksum, system.RunContext{Pool: pool, Concurrency: getMultiThread(), Bars: bars, ChunkSize: chunkSize, GentleIO: gentleIO})
 			}); e != nil {
 				common.ExitWith(e)
@@ -83,7 +83,7 @@ func downsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			bucket := fo.Bucket
 			prefix := fo.Prefix
 			pool.Add(func() {
-				if e := common.DoWithRetrySimple(func() error {
+				if e := common.DoTransferWithRetry(func() error {
 					return system.Delete(bucket, prefix)
 				}); e != nil {
 					common.ExitWith(e)
@@ -110,7 +110,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		from := fo.Prefix
 		dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 		pool.Add(func() {
-			if e := common.DoWithRetrySimple(func() error {
+			if e := common.DoTransferWithRetry(func() error {
 				return dst.System.Upload(from, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 			}); e != nil {
 				common.ExitWith(e)
@@ -122,7 +122,7 @@ func upsync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 			system := fo.System
 			pool.Add(func() {
-				if e := common.DoWithRetrySimple(func() error {
+				if e := common.DoTransferWithRetry(func() error {
 					return system.Delete(dst.Bucket, dstPath)
 				}); e != nil {
 					common.ExitWith(e)
@@ -161,7 +161,7 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		bucket := fo.Bucket
 		prefix := fo.Prefix
 		pool.Add(func() {
-			if e := common.DoWithRetrySimple(func() error {
+			if e := common.DoTransferWithRetry(func() error {
 				return system.Copy(bucket, prefix, dst.Bucket, dstPath)
 			}); e != nil {
 				common.ExitWith(e)
@@ -173,7 +173,7 @@ func cloudSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 			system := fo.System
 			pool.Add(func() {
-				if e := common.DoWithRetrySimple(func() error {
+				if e := common.DoTransferWithRetry(func() error {
 					return system.Delete(dst.Bucket, dstPath)
 				}); e != nil {
 					common.ExitWith(e)
@@ -202,7 +202,7 @@ func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 		bucket := fo.Bucket
 		prefix := fo.Prefix
 		pool.Add(func() {
-			if e := common.DoWithRetrySimple(func() error {
+			if e := common.DoTransferWithRetry(func() error {
 				return system.Copy(bucket, prefix, dst.Bucket, dstPath)
 			}); e != nil {
 				common.ExitWith(e)
@@ -214,7 +214,7 @@ func localSync(src, dst *system.FileObject, isRec, isDel, forceChecksum bool) {
 			dstPath := common.JoinPath(dst.Prefix, fo.Attributes.RelativePath)
 			system := fo.System
 			pool.Add(func() {
-				if e := common.DoWithRetrySimple(func() error {
+				if e := common.DoTransferWithRetry(func() error {
 					return system.Delete(dst.Bucket, dstPath)
 				}); e != nil {
 					common.ExitWith(e)

@@ -1878,7 +1878,7 @@ GOHELPER
     touch $fnw/file
     ../gsg -m cp "$remote_base/$fnw/obj.bin" $fnw/file/obj.bin > .nwout 2>&1 && rc=0 || rc=$?
     assertEq "cp below a regular file fails" "$([[ $rc -ne 0 ]] && echo failed || echo 'exit 0')" "failed"
-    assertOk "and names the reason" grep -q "not a directory" .nwout
+    assertEq "and says it once, without retrying" "$(grep -c 'not a directory' .nwout || true)" "1"
     assertEq "and not as a seek" "$(grep -c 'invalid argument' .nwout || true)" "0"
     if [[ "$(id -u)" == "0" ]]
     then
@@ -1889,7 +1889,7 @@ GOHELPER
         ../gsg -m cp "$remote_base/$fnw/obj.bin" $fnw/ro/obj.bin > .nwout 2>&1 && rc=0 || rc=$?
         chmod 755 $fnw/ro
         assertEq "cp into a read-only directory fails" "$([[ $rc -ne 0 ]] && echo failed || echo 'exit 0')" "failed"
-        assertOk "and names the reason" grep -q "permission denied" .nwout
+        assertEq "and says it once, without retrying" "$(grep -c 'permission denied' .nwout || true)" "1"
         assertEq "and not as a seek" "$(grep -c 'invalid argument' .nwout || true)" "0"
     fi
     rm -rf $fnw .nwout

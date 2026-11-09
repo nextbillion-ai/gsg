@@ -25,7 +25,7 @@ func init() {
 	rootCmd.AddCommand(cpCmd)
 }
 
-// Every transfer below goes through DoWithRetrySimple, as rsync's always have.
+// Every transfer below goes through DoTransferWithRetry, as rsync's always have.
 // cp used to send each file once, and one dropped connection failed the
 // command: underneath, storage v1.22.1 sends an upload smaller than a chunk
 // exactly once, and google.golang.org/api v0.93 retries a chunk after a reset
@@ -45,7 +45,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 				wg.Add(1)
 				pool.Add(func() {
 					defer wg.Done()
-					if e := common.DoWithRetrySimple(func() error {
+					if e := common.DoTransferWithRetry(func() error {
 						return dst.System.Upload(op, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 					}); e != nil {
 						common.ExitWith(e)
@@ -65,7 +65,7 @@ func upload(src, dst *system.FileObject, _, isRec bool, wg *sync.WaitGroup) {
 		wg.Add(1)
 		pool.Add(func() {
 			defer wg.Done()
-			if e := common.DoWithRetrySimple(func() error {
+			if e := common.DoTransferWithRetry(func() error {
 				return dst.System.Upload(src.Prefix, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 			}); e != nil {
 				common.ExitWith(e)
@@ -108,7 +108,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 					// writes err and then reads it back for the comparison, and
 					// another goroutine overwriting it in between let a
 					// goroutine miss its own failure and report nothing.
-					if e := common.DoWithRetrySimple(func() error {
+					if e := common.DoTransferWithRetry(func() error {
 						return src.System.Download(src.Bucket, srcPath, dstPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 					}); e != nil {
 						common.ExitWith(e)
@@ -128,7 +128,7 @@ func download(src, dst *system.FileObject, forceChecksum, isRec bool, wg *sync.W
 				return
 			}
 		}
-		if err = common.DoWithRetrySimple(func() error {
+		if err = common.DoTransferWithRetry(func() error {
 			return src.System.Download(src.Bucket, src.Prefix, dstPrefix, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 		}); err != nil {
 			common.ExitWith(err)
@@ -192,7 +192,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 				pool.Add(func() {
 					var err error
 					defer wg.Done()
-					if err = common.DoWithRetrySimple(func() error {
+					if err = common.DoTransferWithRetry(func() error {
 						return src.System.Download(src.Bucket, srcPath, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 					}); err != nil {
 						common.ExitWith(err)
@@ -202,7 +202,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 						logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
 						common.Exit()
 					}
-					if err = common.DoWithRetrySimple(func() error {
+					if err = common.DoTransferWithRetry(func() error {
 						return dst.System.Upload(interPath, dst.Bucket, dstPath, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 					}); err != nil {
 						logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPath, err)
@@ -232,7 +232,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			common.ExitWith(err)
 			return
 		}
-		if err = common.DoWithRetrySimple(func() error {
+		if err = common.DoTransferWithRetry(func() error {
 			return src.System.Download(src.Bucket, src.Prefix, interPath, forceChecksum, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 		}); err != nil {
 			common.ExitWith(err)
@@ -242,7 +242,7 @@ func interCloudCopy(src, dst *system.FileObject, forceChecksum, isRec bool, wg *
 			logger.Error("inter-cloud", "failed to parse intermediate file: %s to file object", interPath)
 			common.Exit()
 		}
-		if err = common.DoWithRetrySimple(func() error {
+		if err = common.DoTransferWithRetry(func() error {
 			return dst.System.Upload(interPath, dst.Bucket, dstPrefix, system.RunContext{Bars: bars, Pool: pool, Concurrency: getMultiThread(), ChunkSize: chunkSize, GentleIO: gentleIO})
 		}); err != nil {
 			logger.Error("inter-cloud", "failed to upload intermediate file %s to %s: %s", interPath, dstPrefix, err)
