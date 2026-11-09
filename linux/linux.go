@@ -264,7 +264,7 @@ func commandFailure(what, path string, err error) error {
 	// caller that handles the error itself should not have a line printed on
 	// its behalf.
 	logger.Debug(module, "%s of [%s] failed: %s", what, path, reason)
-	return fmt.Errorf("cannot %s %s: %s", what, path, reason)
+	return common.Caused(fmt.Sprintf("cannot %s %s: %s", what, path, reason), err)
 }
 
 func (l *Linux) DiskUsage(bucket, prefix string, recursive bool) ([]system.DiskUsage, error) {

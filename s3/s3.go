@@ -216,7 +216,9 @@ func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 	// error on a request that would have succeeded on a second try.
 	var attrs *s3.GetObjectAttributesOutput
 	var absent bool
-	if err = common.DoWithRetrySimple(func() error {
+	config := common.DefaultRetryConfig()
+	config.Retryable = common.Retryable
+	if err = common.DoWithRetry(func() error {
 		var e error
 		if attrs, e = c.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
 			Bucket:           aws.String(bucket),
@@ -233,7 +235,7 @@ func (s *S3) S3Attrs(bucket, prefix string) (*S3Attributes, error) {
 			return nil
 		}
 		return e
-	}); err != nil {
+	}, config); err != nil {
 		logger.Info(module, "failed with s3://%s/%s %s", bucket, prefix, err)
 		return nil, err
 	}
@@ -642,7 +644,7 @@ func (s *S3) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	if s3a == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
 		logger.Debug(module, log)
-		return errors.New(log)
+		return common.Caused(log, common.ErrNoSuchObject)
 	}
 
 	if s3ObjectSize(s3a) > s3MaxCopySource {
@@ -682,6 +684,13 @@ func (s *S3) PutObject(bucket, prefix string, from io.Reader) error {
 	return nil
 }
 
+// NewWithClients returns an S3 that uses the given client for each bucket
+// instead of building one from the environment, for a caller pointing gsg at
+// another endpoint.
+func NewWithClients(clients map[string]*s3.Client) *S3 {
+	return &S3{clients: clients}
+}
+
 // Init satisfies ISystem. It exists to fail early on a bad bucket or missing
 // credentials; the client it builds is kept for clientFor to hand out.
 func (s *S3) Init(buckets ...string) error {
@@ -712,9 +721,9 @@ func (s *S3) clientFor(bucket string) (*s3.Client, error) {
 	}
 	cfg, e1 := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if e1 != nil {
-		logger.Info(module, "failed in loading defaultConfig with error: %s", e1)
-		common.Exit()
-		return nil, e1
+		msg := fmt.Sprintf("failed in loading defaultConfig with error: %s", e1)
+		logger.Info(module, "%s", msg)
+		return nil, common.Caused(msg, e1, common.ErrNotConfigured)
 	}
 	// Check if credentials are valid
 	if _, err := cfg.Credentials.Retrieve(context.TODO()); err != nil {
@@ -764,7 +773,7 @@ func (s *S3) Download(
 	if attrs == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
 		logger.Debug(module, log)
-		return errors.New(log)
+		return common.Caused(log, common.ErrNoSuchObject)
 	}
 	var size int64 = 0
 	if attrs.S3Attrs.ObjectSize != nil {
@@ -790,6 +799,20 @@ func (s *S3) Download(
 	var wg sync.WaitGroup
 	var once sync.Once
 	var shortChunks atomic.Int64
+	// A failed chunk stops the others and fails the download with its error,
+	// so cp and rsync can tell one worth another attempt from one that is not.
+	ff := common.NewFirstFailure()
+	defer ff.Close()
+	fail := func(format string, err error) {
+		if ff.Stopped() {
+			logger.Debug(module, format, err)
+			return
+		}
+		msg := fmt.Sprintf(format, err)
+		if ff.Fail(common.Caused(msg, err)) {
+			logger.Info(module, "%s", msg)
+		}
+	}
 	dstFileTemp := common.GetTempFile(dstFile)
 	// Every chunk opens this file, so it has to exist before any is fetched.
 	folder, _ := common.ParseFile(dstFile)
@@ -822,6 +845,9 @@ func (s *S3) Download(
 				once.Do(func() {
 					pb = ctx.Bars.New(size, fmt.Sprintf("Downloading [%s]:", prefix))
 				})
+				if ff.Stopped() {
+					return
+				}
 				gi := s3.GetObjectInput{
 					Bucket: aws.String(bucket),
 					Key:    aws.String(prefix),
@@ -833,30 +859,31 @@ func (s *S3) Download(
 				if forceChecksum {
 					gi.ChecksumMode = types.ChecksumModeEnabled
 				}
-				oo, oe := c.GetObject(context.TODO(), &gi)
+				oo, oe := c.GetObject(ff.Context(), &gi)
 				if oe != nil {
-					logger.Info(module, "download object failed when create reader with %s", oe)
-					common.Exit()
+					fail("download object failed when create reader with %s", oe)
+					return
 				}
+				defer func() { _ = oo.Body.Close() }()
 
 				// create write with offset and length of file
 				fl, oe := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
 				if oe != nil {
-					logger.Info(module, "download object failed when open temp file with %s", oe)
-					_ = oo.Body.Close()
-					common.Exit()
+					fail("download object failed when open temp file with %s", oe)
 					return
 				}
-				_, se := fl.Seek(startByte, 0)
-				if se != nil {
-					logger.Info(module, "download object failed when seek for offset with %s", se)
-					common.Exit()
-				}
-
 				defer func() { _ = fl.Close() }()
+				if _, se := fl.Seek(startByte, 0); se != nil {
+					fail("download object failed when seek for offset with %s", se)
+					return
+				}
 
 				var gotBytes int64
 				defer func() {
+					// a chunk that failed, or was stopped, has already said so
+					if ff.Stopped() {
+						return
+					}
 					if gotBytes != wantBytes {
 						logger.Info(module, "download of s3://%s/%s got %d bytes at offset %d, expected %d", bucket, prefix, gotBytes, startByte, wantBytes)
 						shortChunks.Add(1)
@@ -876,8 +903,8 @@ func (s *S3) Download(
 						n, readErr := oo.Body.Read(buf)
 						if n > 0 {
 							if _, writeErr := fl.Write(buf[:n]); writeErr != nil {
-								logger.Info(module, "download object failed when write: %s", writeErr)
-								common.Exit()
+								fail("download object failed when write: %s", writeErr)
+								return
 							}
 							if _, writeErr := pb.Write(buf[:n]); writeErr != nil {
 								// Progress bar write error, non-fatal
@@ -895,8 +922,8 @@ func (s *S3) Download(
 							break
 						}
 						if readErr != nil {
-							logger.Info(module, "download object failed when read: %s", readErr)
-							common.Exit()
+							fail("download object failed when read: %s", readErr)
+							return
 						}
 					}
 
@@ -909,13 +936,13 @@ func (s *S3) Download(
 
 					var we error
 					if gotBytes, we = io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
-						logger.Info(module, "download object failed when write to offet with %s", we)
-						common.Exit()
+						fail("download object failed when write to offet with %s", we)
+						return
 					}
 
 					if err := bufWriter.Flush(); err != nil {
-						logger.Info(module, "download object failed when flush buffer with %s", err)
-						common.Exit()
+						fail("download object failed when flush buffer with %s", err)
+						return
 					}
 				}
 			},
@@ -924,6 +951,10 @@ func (s *S3) Download(
 
 	// move back the temp file
 	wg.Wait()
+	if ferr := ff.Err(); ferr != nil {
+		_ = os.Remove(dstFileTemp)
+		return ferr
+	}
 
 	// The temp file is allocated at full size, so a response that ended early
 	// without an error leaves zeroes at the right length. Renaming that and
@@ -1149,7 +1180,7 @@ func (s *S3) equalCRC32C(localPath, bucket, object string) (equal, comparable bo
 	if attr == nil {
 		// Verification was asked for and the object is not there. That is a
 		// failure, not something to pass over.
-		return false, false, fmt.Errorf("cannot verify s3://%s/%s: no such object", bucket, object)
+		return false, false, common.Caused(fmt.Sprintf("cannot verify s3://%s/%s: no such object", bucket, object), common.ErrNoSuchObject)
 	}
 	remote, ok := crc32cOf(attr)
 	if !ok {

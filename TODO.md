@@ -2351,6 +2351,11 @@ upload". The `fp_*` helpers the fault-injection cases use are there too;
 
 ## 36. A gs download chunk that fails exits the process
 
+**Fixed in #95 for gs and s3,** as part of item 48: a failed chunk cancels the
+others, removes the temp file and is returned, and `cp` / `rsync` try the whole
+download again unless the error cannot change. The chunk itself is still not
+retried on its own, as oci does.
+
 Item 29 notes this in passing; it has no item of its own. Every error inside a
 chunk calls `common.Exit()` (`gcs/gcs.go:427`, `:436`, `:451`, `:457`, `:467`,
 `:472`), so `Download` never returns an error that `rsync`'s
@@ -2898,7 +2903,42 @@ like this was printed three times before the exit. Also fixed in #95: they go
 through `DoTransferWithRetry`, which stops at the first error
 `common.Retryable` rejects. It judges only typed errors: `fs.ErrPermission`,
 `fs.ErrNotExist`, `fs.ErrInvalid`, `ENOTDIR`, `EISDIR`, `EROFS`, `EINVAL`,
-`storage.ErrObjectNotExist` / `ErrBucketNotExist`, and a 400, 403, 404 or 412
-from the gs, s3 or oci SDK. 408, 429, 5xx, resets, timeouts and anything
-untyped are retried as before. An error the backends turn into a plain string
-(`errors.New(log)`) still gets three attempts.
+`storage.ErrObjectNotExist` / `ErrBucketNotExist`, `common.ErrNoSuchObject`,
+`common.ErrNotConfigured`, and a 400, 403, 404 or 412 from the gs, s3 (v1 and
+v2 SDK) or oci SDK. 408, 429, 5xx, resets, timeouts and anything untyped are
+retried as before. The s3 attribute lookup and the oci chunk retry use the same
+judgement.
+
+For that to see the error, every cp and rsync path of gs, s3 and oci now
+hands it over with its type:
+
+- A gs or s3 chunk that fails no longer calls `common.Exit()`. The first
+  failure is kept (`common.FirstFailure`), the other chunks are cancelled, the
+  temp file is removed and `Download` returns it, so the whole transfer is
+  tried again when the error allows (item 36, for gs and s3).
+- "not an object" from a lookup carries the service's refusal (gs) or
+  `common.ErrNoSuchObject` (s3, oci) behind the same message, via
+  `common.Caused`, which keeps the text and unwraps to the cause.
+- A missing `GOOGLE_APPLICATION_CREDENTIALS` and an s3 config that does not
+  load carry `common.ErrNotConfigured`; the s3 one no longer exits on the spot.
+- A copy onto itself (s3, oci) carries `fs.ErrInvalid`; a recovered panic
+  keeps its value when it is an error.
+
+`cmd/transfer_failure_test.go` runs `cp` and `rsync` as a separate process
+against a fake store of each backend: 403, 404, 412, a destination below a file
+and a read-only destination are each tried once, printed once and exit 1; a 503
+and a connection dropped mid-body are retried to success.
+
+Still untyped on these paths, deliberately or because there is nothing to wrap:
+
+- Checksum and length mismatches (`mustMatchCRC32C`, `verifyGentleDownload`,
+  the s3 short-chunk count, oci `settleDownload` and its byte count, the s3
+  multipart copy's totals): no underlying error exists, and another attempt is
+  the right answer to corruption in transit.
+- A file that changed under an upload (gs composite, oci multipart): another
+  attempt reads it again and can succeed.
+- An oci copy work request that ends FAILED or CANCELED: the service gives
+  only text, with no status to classify; it gets three attempts.
+- Local `rsync` and `cp` run `cp` and `rm` as commands. The `*exec.ExitError` is
+  kept as the cause, but the errno is only in their stderr, so a permission
+  error there is still tried three times.

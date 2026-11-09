@@ -369,3 +369,45 @@ func TestDoTransferWithRetryStillRetriesATransientError(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, 3, attempts, "a transient error that persists uses every attempt")
 }
+
+func TestRetryableSeesThroughMessagesWrittenForPeople(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no such object", Caused("failed with bucket[b] prefix[o] not an object", ErrNoSuchObject), false},
+		{"service refusal kept as cause", Caused("failed with bucket[b] prefix[o] not an object", &googleapi.Error{Code: 403}), false},
+		{"not configured, with the loader's error", Caused("failed in loading defaultConfig", errors.New("bad profile"), ErrNotConfigured), false},
+		{"copy onto itself", Caused("cannot copy s3://b/o onto itself", fs.ErrInvalid), false},
+		{"chunk reset", Caused("download object failed when write to offet with reset", &net.OpError{Op: "read", Err: syscall.ECONNRESET}), true},
+		{"v1 sdk 403", statusCodeError(403), false},
+		{"v1 sdk 503", statusCodeError(503), true},
+		{"panic with an error", PanicError("panic in part 1", fs.ErrPermission), false},
+		{"panic with a string", PanicError("panic in part 1", "boom"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, Retryable(tt.err))
+		})
+	}
+	msg := "failed with bucket[b] prefix[o] not an object"
+	assert.Equal(t, msg, Caused(msg, ErrNoSuchObject).Error(), "the message is unchanged")
+}
+
+type statusCodeError int
+
+func (e statusCodeError) Error() string   { return fmt.Sprintf("status %d", int(e)) }
+func (e statusCodeError) StatusCode() int { return int(e) }
+
+func TestFirstFailureKeepsTheFirstAndStopsTheRest(t *testing.T) {
+	ff := NewFirstFailure()
+	defer ff.Close()
+	assert.False(t, ff.Stopped())
+	first := errors.New("first")
+	assert.True(t, ff.Fail(first))
+	assert.False(t, ff.Fail(errors.New("second")))
+	assert.True(t, ff.Stopped())
+	assert.ErrorIs(t, ff.Context().Err(), context.Canceled)
+	assert.Equal(t, first, ff.Err())
+}

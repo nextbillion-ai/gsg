@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"sort"
 	"strings"
@@ -47,7 +48,7 @@ func (s *S3) copyMultipart(dst *s3.Client, srcBucket, srcPrefix, dstBucket, dstP
 	// CopyObject refuses this too. Rewriting an object over itself in parts
 	// would succeed, at a real cost, while changing nothing.
 	if srcBucket == dstBucket && srcPrefix == dstPrefix {
-		return fmt.Errorf("s3: cannot copy s3://%s/%s onto itself", srcBucket, srcPrefix)
+		return common.Caused(fmt.Sprintf("s3: cannot copy s3://%s/%s onto itself", srcBucket, srcPrefix), fs.ErrInvalid)
 	}
 	src, err := s.clientFor(srcBucket)
 	if err != nil {
@@ -137,7 +138,7 @@ func (s *S3) copyMultipart(dst *s3.Client, srcBucket, srcPrefix, dstBucket, dstP
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					fail(fmt.Errorf("s3: panic copying part %d: %v", i+1, r))
+					fail(common.PanicError(fmt.Sprintf("s3: panic copying part %d", i+1), r))
 				}
 			}()
 			select {

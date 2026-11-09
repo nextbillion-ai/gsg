@@ -130,7 +130,7 @@ func (o *OCI) uploadMultipart(f *os.File, before os.FileInfo, spec, object strin
 			// an error so the deferred abort above runs.
 			defer func() {
 				if r := recover(); r != nil {
-					errs[i] = fmt.Errorf("oci: panic uploading part %d: %v", i+1, r)
+					errs[i] = common.PanicError(fmt.Sprintf("oci: panic uploading part %d", i+1), r)
 				}
 			}()
 			sem <- struct{}{}

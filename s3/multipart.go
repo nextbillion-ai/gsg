@@ -111,7 +111,7 @@ func (s *S3) uploadMultipart(f *os.File, size int64, bucket, prefix string, part
 			// an error so the deferred abort above runs.
 			defer func() {
 				if r := recover(); r != nil {
-					errs[i] = fmt.Errorf("s3: panic uploading part %d: %v", i+1, r)
+					errs[i] = common.PanicError(fmt.Sprintf("s3: panic uploading part %d", i+1), r)
 				}
 			}()
 			sem <- struct{}{}

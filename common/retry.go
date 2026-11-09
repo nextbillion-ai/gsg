@@ -85,6 +85,8 @@ var permanentErrors = []error{
 	syscall.EINVAL,
 	storage.ErrObjectNotExist,
 	storage.ErrBucketNotExist,
+	ErrNoSuchObject,
+	ErrNotConfigured,
 }
 
 // permanentStatus are answers the service gives the same way every time for
@@ -116,6 +118,11 @@ func Retryable(err error) bool {
 	var s3e interface{ HTTPStatusCode() int }
 	if errors.As(err, &s3e) {
 		return !permanentStatus[s3e.HTTPStatusCode()]
+	}
+	// the v1 aws SDK's request failure, which the s3 region lookup returns
+	var v1e interface{ StatusCode() int }
+	if errors.As(err, &v1e) {
+		return !permanentStatus[v1e.StatusCode()]
 	}
 	// the oci SDK's service error
 	var ocie interface{ GetHTTPStatusCode() int }
