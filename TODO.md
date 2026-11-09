@@ -2868,3 +2868,30 @@ rule on the bucket is the backstop.
 
 **A large copy needs `s3:GetObjectTagging` even for a source with no tags**, which
 a small one does not. It fails rather than risk losing tags silently.
+
+---
+
+## 48. A download it cannot write fails as "seek for offset with invalid argument"
+
+**Fixed in this PR.** gs and s3 created the `_.gstmp` inside the first chunk and
+dropped the error, and every chunk then opened it with the error dropped too.
+When the file could not be created, each chunk called `Seek` on a nil
+`*os.File`, which returns `os.ErrInvalid`, so the only message was
+`download object failed when seek for offset with invalid argument`, printed
+after the range reads had already gone out. Nothing in it says permission or
+path.
+
+Seen 2026-11-08: `gsg -m cp` of a 62 GiB `valhalla_tiles.tar` into the root of a
+fresh volume, in the goroute image, which runs as a user other than root. The
+volume root belongs to root, so `os.Create` got `EACCES`. The size had nothing
+to do with it: a 38 MB object into a read-only directory fails the same way.
+`-m rsync` "working" in the same session came after the pod moved to
+`runAsUser: 0`; it shares the same `Download`.
+
+Now `common.CreateFile` returns its error, gs and s3 create the temp file
+before dispatching any chunk and return the error from `Download`
+(`open ..._.gstmp: permission denied`), and a chunk that cannot open it says
+so. oci already checked the chunk open and now also returns the create error.
+
+Still open: `cp` and `rsync` retry `Download` through `DoWithRetrySimple`, so a
+permanent error like this one is logged three times before the exit.

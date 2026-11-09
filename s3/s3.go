@@ -791,6 +791,15 @@ func (s *S3) Download(
 	var once sync.Once
 	var shortChunks atomic.Int64
 	dstFileTemp := common.GetTempFile(dstFile)
+	// Every chunk opens this file, so it has to exist before any is fetched.
+	folder, _ := common.ParseFile(dstFile)
+	if !common.IsPathExist(folder) {
+		common.CreateFolder(folder)
+	}
+	if err = common.CreateFile(dstFileTemp, size); err != nil {
+		logger.Info(module, "download object failed when create temp file with %s", err)
+		return err
+	}
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -810,14 +819,8 @@ func (s *S3) Download(
 			func() {
 				defer wg.Done()
 
-				// create folder and temp file if not exist
 				once.Do(func() {
 					pb = ctx.Bars.New(size, fmt.Sprintf("Downloading [%s]:", prefix))
-					folder, _ := common.ParseFile(dstFile)
-					if !common.IsPathExist(folder) {
-						common.CreateFolder(folder)
-					}
-					common.CreateFile(dstFileTemp, size)
 				})
 				gi := s3.GetObjectInput{
 					Bucket: aws.String(bucket),
@@ -837,7 +840,13 @@ func (s *S3) Download(
 				}
 
 				// create write with offset and length of file
-				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				fl, oe := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				if oe != nil {
+					logger.Info(module, "download object failed when open temp file with %s", oe)
+					_ = oo.Body.Close()
+					common.Exit()
+					return
+				}
 				_, se := fl.Seek(startByte, 0)
 				if se != nil {
 					logger.Info(module, "download object failed when seek for offset with %s", se)

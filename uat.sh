@@ -1865,6 +1865,55 @@ GOHELPER
     finish
     fi
 
+    # TODO 48. gs only: the objects are put in place with gsutil.
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: a download it cannot write says why, before fetching"
+    # The temp file could not be created and each chunk then seeked a nil
+    # handle: the only message was "seek for offset with invalid argument".
+    fnw="folder_nowrite"
+    mkdir -p $fnw
+    head -c 1048576 /dev/urandom > $fnw/obj.bin
+    gsutil -q cp $fnw/obj.bin "$remote_base/$fnw/obj.bin"
+    touch $fnw/file
+    ../gsg -m cp "$remote_base/$fnw/obj.bin" $fnw/file/obj.bin > .nwout 2>&1 && rc=0 || rc=$?
+    assertEq "cp below a regular file fails" "$([[ $rc -ne 0 ]] && echo failed || echo 'exit 0')" "failed"
+    assertOk "and names the reason" grep -q "not a directory" .nwout
+    assertEq "and not as a seek" "$(grep -c 'invalid argument' .nwout || true)" "0"
+    if [[ "$(id -u)" == "0" ]]
+    then
+        echo "SKIP: read-only directory, running as root, which writes there regardless of its mode"
+    else
+        mkdir -p $fnw/ro
+        chmod 555 $fnw/ro
+        ../gsg -m cp "$remote_base/$fnw/obj.bin" $fnw/ro/obj.bin > .nwout 2>&1 && rc=0 || rc=$?
+        chmod 755 $fnw/ro
+        assertEq "cp into a read-only directory fails" "$([[ $rc -ne 0 ]] && echo failed || echo 'exit 0')" "failed"
+        assertOk "and names the reason" grep -q "permission denied" .nwout
+        assertEq "and not as a seek" "$(grep -c 'invalid argument' .nwout || true)" "0"
+    fi
+    rm -rf $fnw .nwout
+    finish
+
+    start "a -m cp download survives a reset of every storage connection"
+    fp_start
+    fdl="folder_dlblip"
+    mkdir -p $fdl
+    dd if=/dev/urandom of=$fdl/obj.bin bs=1048576 count=120 2>/dev/null
+    gsutil -q cp $fdl/obj.bin "$remote_base/$fdl/obj.bin"
+    HTTPS_PROXY=$fp_proxy ../gsg -m cp "$remote_base/$fdl/obj.bin" $fdl/a.bin >/dev/null 2>&1 &
+    pid=$!
+    fp_wait down $((40 << 20))
+    fp_blip
+    wait $pid && rc=0 || rc=$?
+    assertEq "the download completes" "$rc" "0"
+    assertOk "and the file is whole" cmp $fdl/obj.bin $fdl/a.bin
+    assertEq "and no temp file is left" "$(ls $fdl | grep -c gstmp || true)" "0"
+    fp_stop
+    rm -rf $fdl
+    finish
+    fi
+
     start "rm -r removes a whole tree"
     # cmd/rm.go schedules recursive deletes through the worker pool, and
     # nothing here exercised that at all.

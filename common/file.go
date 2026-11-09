@@ -426,18 +426,16 @@ func CreateFolder(path string) {
 }
 
 // CreateFile creates an empty file with given length (if size > 0)
-func CreateFile(path string, size int64) {
+func CreateFile(path string, size int64) error {
 	f, err := os.Create(path)
 	if err != nil {
-		logger.Debug(module, "failed with %s", err)
-		return
+		return err
 	}
-	defer func() { _ = f.Close() }()
 	if size > 0 {
-		err = f.Truncate(size)
-		if err != nil {
-			logger.Debug(module, "failed with %s", err)
-			return
+		if err = f.Truncate(size); err != nil {
+			_ = f.Close()
+			return err
 		}
 	}
+	return f.Close()
 }

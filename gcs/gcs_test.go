@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -867,4 +869,72 @@ func TestUploadDecidesFromTheFileItOpened(t *testing.T) {
 		"the opened file is empty: one stream")
 	assert.Empty(t, fc.composed)
 	assert.Equal(t, []string{strconv.FormatInt(opened.UnixNano(), 10)}, fc.mtimes, "the opened file's mtime")
+}
+
+// A temp file that cannot be created must fail the download with the reason.
+// Each chunk used to open it with the error dropped and seek the nil handle,
+// so a destination the process may not write to surfaced as "seek for offset
+// with invalid argument", after the first range read had already gone out.
+func TestDownloadIntoAnUnwritableDestinationSaysWhy(t *testing.T) {
+	var mu sync.Mutex
+	reads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("alt") == "json" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"bucket":"b","name":"o","size":"8","generation":"7","crc32c":"AAAAAA==","updated":"2026-01-02T03:04:05Z"}`)
+			return
+		}
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		w.Header().Set("Content-Range", "bytes 0-7/8")
+		w.Header().Set("Content-Length", "8")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("01234567"))
+	}))
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+
+	for _, tc := range unwritableDestinations(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			reads = 0
+			mu.Unlock()
+			pool := worker.New(2, false)
+			pool.Run()
+			defer pool.Close()
+			bars, err := bar.New()
+			require.NoError(t, err)
+
+			err = (&GCS{client: client}).Download("b", "o", tc.dst, false, system.RunContext{Pool: pool, Concurrency: 2, Bars: bars, ChunkSize: 4})
+			require.ErrorIs(t, err, tc.want)
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Zero(t, reads, "nothing is fetched for a file that has nowhere to go")
+		})
+	}
+}
+
+type unwritableDestination struct {
+	name string
+	dst  string
+	want error
+}
+
+// unwritableDestinations lists paths whose temp file cannot be created. A
+// read-only directory stops only a user other than root, which is how the
+// goroute image runs against a volume root owned by root.
+func unwritableDestinations(t *testing.T) []unwritableDestination {
+	t.Helper()
+	dir := t.TempDir()
+	notDir := filepath.Join(dir, "file")
+	require.NoError(t, os.WriteFile(notDir, nil, 0o644))
+	cases := []unwritableDestination{{"parent is a file", filepath.Join(notDir, "o"), syscall.ENOTDIR}}
+	if os.Geteuid() != 0 {
+		ro := filepath.Join(dir, "ro")
+		require.NoError(t, os.Mkdir(ro, 0o555))
+		cases = append(cases, unwritableDestination{"read-only directory", filepath.Join(ro, "o"), fs.ErrPermission})
+	}
+	return cases
 }

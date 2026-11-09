@@ -222,7 +222,10 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	common.CreateFolder(folder)
 
 	dstFileTemp := common.GetTempFile(dstFile)
-	common.CreateFile(dstFileTemp, size)
+	if err = common.CreateFile(dstFileTemp, size); err != nil {
+		logger.Info(module, "cannot create %s: %s", dstFileTemp, err)
+		return err
+	}
 
 	chunkSize, chunks := downloadGeometry(size, ctx.ChunkSize)
 	logger.Debug(module, "Downloading [%s] with %d chunk(s), chunk size: %d bytes, total size: %d bytes",

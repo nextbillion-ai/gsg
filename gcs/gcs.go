@@ -425,6 +425,15 @@ func (g *GCS) Download(
 	var wg sync.WaitGroup
 	var once sync.Once
 	dstFileTemp := common.GetTempFile(dstFile)
+	// Every chunk opens this file, so it has to exist before any is fetched.
+	folder, _ := common.ParseFile(dstFile)
+	if !common.IsPathExist(folder) {
+		common.CreateFolder(folder)
+	}
+	if err = common.CreateFile(dstFileTemp, attrs.Size); err != nil {
+		logger.Info(module, "download object failed when create temp file with %s", err)
+		return err
+	}
 	// gentle mode sums each chunk from the file while its pages are still cached
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
@@ -445,14 +454,8 @@ func (g *GCS) Download(
 					wg.Done()
 				}()
 
-				// create folder and temp file if not exist
 				once.Do(func() {
 					pb = ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
-					folder, _ := common.ParseFile(dstFile)
-					if !common.IsPathExist(folder) {
-						common.CreateFolder(folder)
-					}
-					common.CreateFile(dstFileTemp, attrs.Size)
 				})
 
 				// create reader with offset and length of object
@@ -464,7 +467,12 @@ func (g *GCS) Download(
 				defer func() { _ = rc.Close() }()
 
 				// create write with offset and length of file
-				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				fl, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
+				if err != nil {
+					logger.Info(module, "download object failed when open temp file with %s", err)
+					common.Exit()
+					return
+				}
 				_, err = fl.Seek(startByte, 0)
 				if err != nil {
 					logger.Info(module, "download object failed when seek for offset with %s", err)
