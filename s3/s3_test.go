@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestValidLockETag(t *testing.T) {
@@ -76,4 +77,9 @@ func TestRegionHint(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The line a failed cat prints is the one it printed before cat streamed.
+func TestCatFailureKeepsItsText(t *testing.T) {
+	assert.Equal(t, "output object failed when create reader with boom", catFailure(errors.New("boom")))
 }

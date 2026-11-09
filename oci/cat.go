@@ -34,7 +34,19 @@ func (o *OCI) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions)
 		return err
 	}
 	if head == nil {
-		return fmt.Errorf("oci: no object at oci://%s/%s", ref.name, prefix)
+		// The GetObject error is what callers have always been shown for a
+		// missing object, so it is asked for rather than paraphrased.
+		r, gerr := ref.c.GetObject(context.Background(), objectstorage.GetObjectRequest{
+			NamespaceName: &ref.ns, BucketName: &ref.name, ObjectName: &prefix,
+		})
+		if gerr == nil {
+			if r.Content != nil {
+				_ = r.Content.Close()
+			}
+			gerr = fmt.Errorf("oci: no object at oci://%s/%s", ref.name, prefix)
+		}
+		logger.Info(module, "%s", catFailure(ref.name, prefix, gerr))
+		return gerr
 	}
 	var size int64
 	if head.ContentLength != nil {
@@ -73,6 +85,11 @@ func (o *OCI) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions)
 		}
 	}
 	return common.Stream(context.Background(), w, src, opts)
+}
+
+// catFailure is the line cat prints when the object cannot be opened.
+func catFailure(bucket, prefix string, err error) string {
+	return fmt.Sprintf("cannot read oci://%s/%s: %s", bucket, prefix, err)
 }
 
 // permanentReadError reports a read that no retry can turn into the pinned

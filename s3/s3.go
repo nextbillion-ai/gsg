@@ -1038,7 +1038,15 @@ func (s *S3) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) 
 		return err
 	}
 	if attrs == nil {
-		return fmt.Errorf("no object at s3://%s/%s", bucket, prefix)
+		// The GetObject error is what callers have always been shown for a
+		// missing object, so it is asked for rather than paraphrased.
+		o, gerr := c.GetObject(context.TODO(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(prefix)})
+		if gerr == nil {
+			_ = o.Body.Close()
+			gerr = fmt.Errorf("no object at s3://%s/%s", bucket, prefix)
+		}
+		logger.Info(module, "%s", catFailure(gerr))
+		return gerr
 	}
 	var size int64
 	if attrs.S3Attrs.ObjectSize != nil {
@@ -1074,6 +1082,11 @@ func (s *S3) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) 
 		CRC32C:    crc,
 		HasCRC32C: hasCRC,
 	}, opts)
+}
+
+// catFailure is the line cat prints when the object cannot be opened.
+func catFailure(err error) string {
+	return fmt.Sprintf("output object failed when create reader with %s", err)
 }
 
 // permanentReadError reports a read that no retry can turn into the pinned

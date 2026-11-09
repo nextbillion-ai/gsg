@@ -2892,7 +2892,9 @@ start over whenever a read makes progress. Ranges are pinned to the generation
 the MD5 of a single-part upload, is checked over the written bytes; since they
 are already out, a mismatch is an error after the last byte and a non-zero
 exit. An s3 object without a whole-object CRC32C is checked for length only.
-For `cat`, log lines go to stderr. A closed stdout ends the process on SIGPIPE,
+For `cat`, log lines go to stderr; the line for an object that cannot be opened
+is unchanged (foreman's cloudsql lock matches `storage: object doesn't exist` in
+`gsg cat 2>&1`, pinned by `TestCatFailureKeepsTheNotFoundText`). A closed stdout ends the process on SIGPIPE,
 as `cat` does. A gs object stored with `Content-Encoding: gzip` is served
 decompressed, so its length and checksum describe other bytes: it still goes
 out as one unranged stream, verified only by the storage library.

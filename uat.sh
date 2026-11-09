@@ -1042,6 +1042,12 @@ do_test() {
         exit 1
     fi
     echo "OK: cat of a missing object fails"
+    # foreman's cloudsql lock reads a missing lock from this text in `2>&1`
+    if [[ "$mode" == "gs" ]]
+    then
+        assertOk "and says the object doesn't exist" \
+            grep -q "storage: object doesn't exist" <(../gsg cat "$remote_base/$fcs/absent.bin" 2>&1)
+    fi
     finish
 
     start "regression: a truncated crc32c cache must not crash the next run"

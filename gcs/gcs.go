@@ -1102,12 +1102,20 @@ func (g *GCS) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 // length and checksum describe other bytes: it goes out as one stream, checked
 // by the library rather than here.
 func (g *GCS) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) error {
-	attrs, err := g.GCSAttrs(bucket, prefix)
-	if err != nil {
+	if err := g.Init(); err != nil {
 		return err
 	}
-	if attrs == nil {
-		return fmt.Errorf("no object at gs://%s/%s", bucket, prefix)
+	attrs, err := g.client.Bucket(bucket).Object(prefix).Attrs(context.Background())
+	if err != nil {
+		// Callers match this text: foreman's cloudsql lock reads a missing
+		// object from "storage: object doesn't exist" in `gsg cat 2>&1`.
+		// Attrs wraps the sentinel with the 404 body; NewReader, which cat
+		// used to open with, returned it bare.
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			err = storage.ErrObjectNotExist
+		}
+		logger.Info(module, "%s", catFailure(err))
+		return err
 	}
 	obj := g.client.Bucket(bucket).Object(prefix).Generation(attrs.Generation)
 	if attrs.ContentEncoding == "gzip" {
@@ -1129,6 +1137,11 @@ func (g *GCS) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions)
 		CRC32C:    attrs.CRC32C,
 		HasCRC32C: true,
 	}, opts)
+}
+
+// catFailure is the line cat prints when the object cannot be opened.
+func catFailure(err error) string {
+	return fmt.Sprintf("output object failed when create reader with %s", err)
 }
 
 // permanentReadError reports a read that no retry can turn into the pinned
