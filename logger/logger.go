@@ -2,6 +2,8 @@ package logger
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -9,6 +11,22 @@ import (
 
 // Debugging switches debugging mode
 var Debugging = false
+
+// logOut receives every log line when set; nil means the os.Stdout of the
+// moment, so a caller that swaps os.Stdout also moves the log lines.
+// Output alone always goes to stdout.
+var logOut io.Writer
+
+// LogToStderr moves log lines off stdout, for a command whose stdout is data.
+// It must be called before anything logs.
+func LogToStderr() { logOut = os.Stderr }
+
+func out() io.Writer {
+	if logOut == nil {
+		return os.Stdout
+	}
+	return logOut
+}
 
 // lastSaid is the most recent line printed at info level or above.
 //
@@ -57,7 +75,7 @@ func Debug(module, s string, vs ...any) {
 		return
 	}
 	s = fmt.Sprintf(s, vs...)
-	fmt.Printf("[%s] [DEBUG] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
+	fmt.Fprintf(out(), "[%s] [DEBUG] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 }
 
 // Info info level log
@@ -65,9 +83,9 @@ func Info(module, s string, vs ...any) {
 	s = fmt.Sprintf(s, vs...)
 	remember(s)
 	if len(module) != 0 {
-		fmt.Printf("[%s] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
+		fmt.Fprintf(out(), "[%s] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 	} else {
-		fmt.Printf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), s)
+		fmt.Fprintf(out(), "[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), s)
 	}
 }
 
@@ -75,12 +93,12 @@ func Info(module, s string, vs ...any) {
 func Warn(module, s string, vs ...any) {
 	s = fmt.Sprintf(s, vs...)
 	remember(s)
-	fmt.Printf("[%s] [WARN] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
+	fmt.Fprintf(out(), "[%s] [WARN] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 }
 
 // Error error level log
 func Error(module, s string, vs ...any) {
 	s = fmt.Sprintf(s, vs...)
 	remember(s)
-	fmt.Printf("[%s] [ERROR] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
+	fmt.Fprintf(out(), "[%s] [ERROR] %s: %s\n", time.Now().Format("2006-01-02 15:04:05"), module, s)
 }

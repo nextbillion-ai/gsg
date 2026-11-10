@@ -1028,3 +1028,10 @@ func TestDownloadRemovesATempFileItCouldNotSize(t *testing.T) {
 	left, _ := os.ReadDir(dir)
 	assert.Empty(t, left)
 }
+
+// foreman's cloudsql lock runs `gsg cat <lock> 2>&1` and reads a missing lock
+// from this text, so it must not change.
+func TestCatFailureKeepsTheNotFoundText(t *testing.T) {
+	assert.Equal(t, "output object failed when create reader with storage: object doesn't exist",
+		catFailure(storage.ErrObjectNotExist))
+}

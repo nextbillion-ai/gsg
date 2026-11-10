@@ -2,7 +2,6 @@ package s3
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -25,6 +24,7 @@ import (
 	"google.golang.org/api/googleapi"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -1064,30 +1064,87 @@ func (s *S3) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	return nil
 }
 
-// OutputObject outputs an object
-func (s *S3) Cat(bucket, prefix string) ([]byte, error) {
-	var err error
-	// create reader
+// Cat writes an object to w as it arrives.
+//
+// Every range is pinned to the ETag the lookup saw with If-Match, so an
+// overwrite mid-stream fails the read instead of splicing two versions. Only a
+// whole-object CRC32C is checked; an object without one is checked for length
+// alone, since an ETag is an MD5 only for some uploads.
+func (s *S3) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) error {
 	c, err := s.clientFor(bucket)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var o *s3.GetObjectOutput
-	if o, err = c.GetObject(context.TODO(), &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(prefix),
-	}); err != nil {
-		logger.Info(module, "output object failed when create reader with %s", err)
-		return nil, err
+	attrs, err := s.S3Attrs(bucket, prefix)
+	if err != nil {
+		return err
 	}
+	if attrs == nil {
+		// The GetObject error is what callers have always been shown for a
+		// missing object, so it is asked for rather than paraphrased.
+		o, gerr := c.GetObject(context.TODO(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(prefix)})
+		if gerr == nil {
+			_ = o.Body.Close()
+			gerr = fmt.Errorf("no object at s3://%s/%s", bucket, prefix)
+		}
+		logger.Info(module, "%s", catFailure(gerr))
+		return gerr
+	}
+	var size int64
+	if attrs.S3Attrs.ObjectSize != nil {
+		size = *attrs.S3Attrs.ObjectSize
+	}
+	var pin *string
+	if e := attrs.S3Attrs.ETag; e != nil && *e != "" {
+		quoted := *e
+		if !strings.HasPrefix(quoted, `"`) {
+			quoted = `"` + quoted + `"`
+		}
+		pin = aws.String(quoted)
+	}
+	crc, hasCRC := crc32cOf(attrs)
+	return common.Stream(context.Background(), w, common.StreamSource{
+		Name: fmt.Sprintf("s3://%s/%s", bucket, prefix),
+		Size: size,
+		Open: func(ctx context.Context, off, n int64) (io.ReadCloser, error) {
+			rng := fmt.Sprintf("bytes=%d-", off)
+			if n > 0 {
+				rng = fmt.Sprintf("bytes=%d-%d", off, off+n-1)
+			}
+			o, oerr := c.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(prefix),
+				Range: aws.String(rng), IfMatch: pin,
+			})
+			if oerr != nil {
+				return nil, oerr
+			}
+			return o.Body, nil
+		},
+		Permanent: permanentReadError,
+		CRC32C:    crc,
+		HasCRC32C: hasCRC,
+	}, opts)
+}
 
-	// write to bytes
-	buf := new(bytes.Buffer)
-	if _, err = buf.ReadFrom(o.Body); err != nil {
-		logger.Info(module, "output object failed when write to buffer with %s", err)
-		return nil, err
+// catFailure is the line cat prints when the object cannot be opened.
+func catFailure(err error) string {
+	return fmt.Sprintf("output object failed when create reader with %s", err)
+}
+
+// permanentReadError reports a read that no retry can turn into the pinned
+// version's bytes.
+func permanentReadError(err error) bool {
+	if errors.Is(err, context.Canceled) || isNotFound(err) {
+		return true
 	}
-	return buf.Bytes(), nil
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) {
+		switch re.HTTPStatusCode() {
+		case 400, 401, 403, 404, 412, 416:
+			return true
+		}
+	}
+	return false
 }
 
 // IsObject checks if is an object

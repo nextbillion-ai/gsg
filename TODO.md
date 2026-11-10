@@ -2876,6 +2876,68 @@ a small one does not. It fails rather than risk losing tags silently.
 
 ---
 
+## 47. `cat` holds the whole object in memory before writing a byte
+
+**Fixed in #94.** Every backend's `Cat` read the object into a `bytes.Buffer`
+and returned it, and `cmd/cat.go` then printed `string(output)`, a second copy.
+Nothing reached stdout until the last byte had arrived, and memory peaked at
+twice the object. `--chunk-size` and `-m` had no effect: `Cat` never chunked.
+Measured with v1.0.41 on a 12.7 GB object: 0 bytes written in 120 s while the
+resident set grew to 7.8 GB, where `gcloud storage cat` started in 0.7 s. Log
+lines went to stdout too, so any warning landed inside the data.
+
+`Cat` now takes a writer and streams through `common.Stream`: ranged chunks,
+up to `--window` (8) in flight, each into its own buffer, written in order
+while the oldest is still filling, so the first byte goes out with the first
+response and memory is window x chunk size (128 MiB at the defaults).
+`--chunk-size 0` reads one stream. A read that fails, or delivers nothing for
+30 s, is reopened at the byte it reached, with retries for about 15 s that
+start over whenever a read makes progress. Ranges are pinned to the generation
+(gs) or ETag (s3, oci) of the first lookup. The CRC32C, or on oci without one
+the MD5 of a single-part upload, is checked over the written bytes; since they
+are already out, a mismatch is an error after the last byte and a non-zero
+exit. An s3 object without a whole-object CRC32C is checked for length only.
+For `cat`, log lines go to stderr; the line for an object that cannot be opened
+is unchanged (foreman's cloudsql lock matches `storage: object doesn't exist` in
+`gsg cat 2>&1`, pinned by `TestCatFailureKeepsTheNotFoundText`). A closed stdout ends the process on SIGPIPE,
+as `cat` does. A write that takes fewer bytes than it was given, with no error,
+ends the stream as a write failure rather than a read to retry, which would
+reopen past the bytes never written (`TestStreamStopsAtAShortWrite`). A gs object stored with `Content-Encoding: gzip` is served
+decompressed, so its length and checksum describe other bytes: it still goes
+out as one unranged stream, verified only by the storage library.
+
+Measured on a Mac (link about 40 MB/s) and in a 4-CPU pod in europe-west1. The
+CRC32C of the output was computed by a separate reader and compared with
+`gcloud storage hash`; "stopped" runs were cut off by the time cap.
+
+| where | object | tool | first byte | total | MB/s | peak RSS | CRC32C |
+|---|---|---|---|---|---|---|---|
+| Mac | 42 MB | v1.0.41 | 1.2 s | 1.4 s | 29 | 241 MiB | match |
+| Mac | 42 MB | this | 0.19 s | 1.6 s | 26 | 83 MiB | match |
+| Mac | 42 MB | gcloud storage cat | 0.63 s | 1.9 s | 22 | 89 MiB | match |
+| Mac | 12.7 GB | v1.0.41 | none in 120 s | killed | 0 | 7833 MiB at kill | - |
+| Mac | 12.7 GB | this | 0.34 s | 322 s | 39.6 | 180 MiB | match |
+| Mac | 12.7 GB | gcloud storage cat | 0.68 s | 336 s | 37.9 | 89 MiB | match |
+| pod, europe-west1, bucket in asia-southeast1 | 42 MB | v1.0.41 | 7.5 s | 7.8 s | 5.4 | 237 MiB | match |
+| same | 42 MB | this | 2.3 s | 7.4 s | 5.7 | 80 MiB | match |
+| same | 42 MB | gcloud storage cat | 7.7 s | 12.0 s | 3.5 | 95 MiB | match |
+| same | 12.7 GB | v1.0.41 | none in 90 s | killed | 0 | 2082 MiB at kill | - |
+| same | 12.7 GB | this | 2.3 s | 420 s | 30.4 | 173 MiB | match |
+| same | 12.7 GB | gcloud storage cat | 7.8 s | stopped at 194 s | 12.0 | 95 MiB | (partial) |
+| pod, europe-west1, bucket in europe-west1 | 45.7 GB | this, 2 runs | 0.25 / 0.16 s | 111 / 84 s | 411 / 545 | 217 MiB | match |
+| same | 45.7 GB | gcloud storage cat, 2 runs | 1.5 / 1.4 s | stopped at 120 s | 206 / 283 | 95 MiB | (partial) |
+
+`gsg cat ... | head -c 100`: 0.19 s on the Mac (12.7 GB object), 0.22 / 0.25 s in-region, 2.3 s cross-region; nothing on stderr in every case. The cross-region pod's 2.3 s first byte is gsg's startup there (a bare `gsg hash` of the same object takes 2.1 s: token, metadata and TLS each pay a ~170 ms round trip), not the stream. v1.0.41 was not run in-region: it filled the pod's 8 GiB within seconds and the container was OOM-killed.
+
+Consumer shape: `gsg cat <12.7 GB SEA pbf> | extract-pbf - --bbox 103.80,1.27,103.87,1.32 -s simple -o out.pbf` with `pipefail` exits 0 in 314 s on the Mac with an empty stderr from gsg, and keeps the same 101328 nodes / 62726 ways / 1397 relations as the 42 MB Singapore pbf; on that 42 MB pbf the piped output is byte-identical to extract-pbf run on a `gcloud storage cp` copy.
+
+`uat.sh` covers it for gs and s3 (exact bytes, one stream, `--debug` keeping
+stdout clean, `| head -c 100`, a missing object) and, gs only, through
+`uat/faultproxy`: every connection reset, a refused reconnect, 5 s unreachable,
+responses dropped for 3 s, each in chunked and single-stream form, must give
+the object exactly with exit 0; an outage past the retries must exit non-zero,
+say how many attempts it made, and have written less than the object.
+
 ## 48. A download it cannot write fails as "seek for offset with invalid argument"
 
 **Fixed in #95.** gs and s3 created the `_.gstmp` inside the first chunk and

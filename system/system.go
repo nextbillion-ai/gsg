@@ -2,6 +2,7 @@ package system
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -179,7 +180,10 @@ type ISystem interface {
 	Download(bucket, prefix, dstFile string, forceChecksum bool, ctx RunContext) error
 	Upload(srcFile, bucket, object string, ctx RunContext) error
 	Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error
-	Cat(bucket, prefix string) ([]byte, error)
+	// Cat writes an object to w as it arrives. The bytes are out before they
+	// can be verified, so an error after the first write means w holds
+	// something other than the object.
+	Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) error
 	IsObject(bucket, prefix string) (bool, error)
 	IsDirectory(bucket, prefix string) (bool, error)
 }

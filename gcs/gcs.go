@@ -2,7 +2,6 @@ package gcs
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -1176,28 +1175,69 @@ func (g *GCS) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	return nil
 }
 
-// OutputObject outputs an object
-func (g *GCS) Cat(bucket, prefix string) ([]byte, error) {
-	var err error
-	// create reader
-	if err = g.Init(); err != nil {
-		return nil, err
+// Cat writes an object to w as it arrives, verified against its CRC32C.
+//
+// Every range reads the generation the lookup saw, as Download does. An
+// object stored with Content-Encoding gzip is served decompressed, so its
+// length and checksum describe other bytes: it goes out as one stream, checked
+// by the library rather than here.
+func (g *GCS) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) error {
+	if err := g.Init(); err != nil {
+		return err
 	}
-	var rc io.ReadCloser
-	if rc, err = g.client.Bucket(bucket).Object(prefix).NewReader(context.Background()); err != nil {
-		logger.Info(module, "output object failed when create reader with %s", err)
-		return nil, err
-	}
-	defer func() { _ = rc.Close() }()
-
-	// write to bytes
-	buf := new(bytes.Buffer)
-	_, err = buf.ReadFrom(rc)
+	attrs, err := g.client.Bucket(bucket).Object(prefix).Attrs(context.Background())
 	if err != nil {
-		logger.Info(module, "output object failed when write to buffer with %s", err)
-		return nil, err
+		// Callers match this text: foreman's cloudsql lock reads a missing
+		// object from "storage: object doesn't exist" in `gsg cat 2>&1`.
+		// Attrs wraps the sentinel with the 404 body; NewReader, which cat
+		// used to open with, returned it bare.
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			err = storage.ErrObjectNotExist
+		}
+		logger.Info(module, "%s", catFailure(err))
+		return err
 	}
-	return buf.Bytes(), nil
+	obj := g.client.Bucket(bucket).Object(prefix).Generation(attrs.Generation)
+	if attrs.ContentEncoding == "gzip" {
+		rc, rerr := obj.NewReader(context.Background())
+		if rerr != nil {
+			return rerr
+		}
+		defer func() { _ = rc.Close() }()
+		_, err = io.Copy(w, rc)
+		return err
+	}
+	return common.Stream(context.Background(), w, common.StreamSource{
+		Name: fmt.Sprintf("gs://%s/%s", bucket, prefix),
+		Size: attrs.Size,
+		Open: func(ctx context.Context, off, n int64) (io.ReadCloser, error) {
+			return obj.NewRangeReader(ctx, off, n)
+		},
+		Permanent: permanentReadError,
+		CRC32C:    attrs.CRC32C,
+		HasCRC32C: true,
+	}, opts)
+}
+
+// catFailure is the line cat prints when the object cannot be opened.
+func catFailure(err error) string {
+	return fmt.Sprintf("output object failed when create reader with %s", err)
+}
+
+// permanentReadError reports a read that no retry can turn into the pinned
+// generation's bytes.
+func permanentReadError(err error) bool {
+	if errors.Is(err, storage.ErrObjectNotExist) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var ge *googleapi.Error
+	if errors.As(err, &ge) {
+		switch ge.Code {
+		case 400, 401, 403, 404, 412, 416:
+			return true
+		}
+	}
+	return false
 }
 
 // IsObject checks if is an object

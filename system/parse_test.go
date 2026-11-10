@@ -1,7 +1,10 @@
 package system
 
 import (
+	"io"
 	"testing"
+
+	"github.com/nextbillion-ai/gsg/common"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -19,14 +22,14 @@ func (f *fakeSystem) List(_, _ string, _ bool) ([]*FileObject, error) { return n
 func (f *fakeSystem) DiskUsage(_, _ string, _ bool) ([]DiskUsage, error) {
 	return nil, nil
 }
-func (f *fakeSystem) Delete(_, _ string) error                            { return nil }
-func (f *fakeSystem) Copy(_, _, _, _ string) error                        { return nil }
-func (f *fakeSystem) Move(_, _, _, _ string) error                        { return nil }
-func (f *fakeSystem) Cat(_, _ string) ([]byte, error)                     { return nil, nil }
-func (f *fakeSystem) IsObject(_, _ string) (bool, error)                  { return false, nil }
-func (f *fakeSystem) IsDirectory(_, _ string) (bool, error)               { return false, nil }
-func (f *fakeSystem) Download(_, _, _ string, _ bool, _ RunContext) error { return nil }
-func (f *fakeSystem) Upload(_, _, _ string, _ RunContext) error           { return nil }
+func (f *fakeSystem) Delete(_, _ string) error                                   { return nil }
+func (f *fakeSystem) Copy(_, _, _, _ string) error                               { return nil }
+func (f *fakeSystem) Move(_, _, _, _ string) error                               { return nil }
+func (f *fakeSystem) Cat(_, _ string, _ io.Writer, _ common.StreamOptions) error { return nil }
+func (f *fakeSystem) IsObject(_, _ string) (bool, error)                         { return false, nil }
+func (f *fakeSystem) IsDirectory(_, _ string) (bool, error)                      { return false, nil }
+func (f *fakeSystem) Download(_, _, _ string, _ bool, _ RunContext) error        { return nil }
+func (f *fakeSystem) Upload(_, _, _ string, _ RunContext) error                  { return nil }
 
 // An authority spelled user@host must reach the backend intact. OCI uses it to
 // carry an explicit namespace; the parser keeps the two joined so that Bucket

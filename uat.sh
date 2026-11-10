@@ -1011,6 +1011,45 @@ do_test() {
     assertEq "cat direct.txt" "$(../gsg cat $remote_base/$fdu/direct.txt 2>/dev/null)" "0123456789"
     finish
 
+    # TODO 47. Ground truth is the local file the object was uploaded from by
+    # gsutil or the aws cli, never gsg.
+    start "regression: cat streams a large object byte for byte, logs kept off stdout"
+    fcs="folder_catstream"
+    mkdir -p $fcs
+    dd if=/dev/urandom of=$fcs/obj.bin bs=1048576 count=120 2>/dev/null
+    case $mode in
+    gs) gsutil -q cp $fcs/obj.bin "$remote_base/$fcs/obj.bin" ;;
+    s3) aws s3 cp --quiet $fcs/obj.bin "$remote_base/$fcs/obj.bin" ;;
+    esac
+    ../gsg cat "$remote_base/$fcs/obj.bin" > $fcs/out.bin 2>$fcs/err.txt && rc=0 || rc=$?
+    assertEq "cat exits 0" "$rc" "0"
+    assertOk "and wrote the object exactly" cmp $fcs/obj.bin $fcs/out.bin
+    ../gsg --chunk-size 0 cat "$remote_base/$fcs/obj.bin" > $fcs/out.bin 2>/dev/null
+    assertOk "as one stream too" cmp $fcs/obj.bin $fcs/out.bin
+    ../gsg --debug -m cat --window 3 "$remote_base/$fcs/obj.bin" > $fcs/out.bin 2>$fcs/err.txt
+    assertOk "with --debug, nothing but the object on stdout" cmp $fcs/obj.bin $fcs/out.bin
+    assertOk "and the debug lines on stderr" grep -q DEBUG $fcs/err.txt
+
+    t0=$SECONDS
+    ../gsg cat "$remote_base/$fcs/obj.bin" 2>$fcs/pipe.err | head -c 100 > $fcs/head.bin
+    assertEq "a closed stdout ends cat promptly" "$(( SECONDS - t0 < 10 ))" "1"
+    assertEq "head got its 100 bytes" "$(wc -c < $fcs/head.bin | tr -d ' ')" "100"
+    assertEq "and cat said nothing about it" "$(wc -c < $fcs/pipe.err | tr -d ' ')" "0"
+
+    if ../gsg cat "$remote_base/$fcs/absent.bin" >/dev/null 2>&1
+    then
+        echo "FATAL: cat of a missing object reported success"
+        exit 1
+    fi
+    echo "OK: cat of a missing object fails"
+    # foreman's cloudsql lock reads a missing lock from this text in `2>&1`
+    if [[ "$mode" == "gs" ]]
+    then
+        assertOk "and says the object doesn't exist" \
+            grep -q "storage: object doesn't exist" <(../gsg cat "$remote_base/$fcs/absent.bin" 2>&1)
+    fi
+    finish
+
     start "regression: a truncated crc32c cache must not crash the next run"
     # The cache write was not atomic: the file was created, then the four bytes
     # were written. A run killed in between left an empty file in /tmp for good,
@@ -1911,6 +1950,48 @@ GOHELPER
     assertEq "and no temp file is left" "$(ls $fdl | grep -c gstmp || true)" "0"
     fp_stop
     rm -rf $fdl
+    finish
+    fi
+
+    # TODO 47. gs only, like the cases above. Every outcome must be either the
+    # object exactly, or a non-zero exit.
+    if [[ "$mode" == "gs" ]]
+    then
+    start "regression: cat survives a broken stream, or fails non-zero"
+    # catfault <label> <chunk-size> <fault...>: start cat through the proxy, wait
+    # for 40 MiB to arrive, inject the fault, require success and the exact bytes
+    catfault() {
+        local label=$1 cs=$2; shift 2
+        fp_stop; fp_start
+        HTTPS_PROXY=$fp_proxy ../gsg --chunk-size $cs cat "$remote_base/$fcs/obj.bin" > $fcs/f.bin 2>$fcs/f.err &
+        local pid=$!
+        fp_wait down $((40 << 20))
+        "$@"
+        wait $pid && rc=0 || rc=$?
+        assertEq "$label: exit 0" "$rc" "0"
+        assertOk "$label: the object exactly" cmp $fcs/obj.bin $fcs/f.bin
+    }
+    outage() { fp "mode?set=refuse" >/dev/null; sleep 5; fp "mode?set=pass" >/dev/null; }
+    droppedresponse() { fp "mode?set=dropdown" >/dev/null; sleep 3; fp "mode?set=pass" >/dev/null; }
+    catfault "every connection reset" -1 fp_blip
+    catfault "reset, one reconnect refused" -1 fp "resetrefuse?n=1"
+    catfault "storage unreachable for 5 s" -1 outage
+    catfault "responses dropped for 3 s" -1 droppedresponse
+    catfault "one stream, reset" 0 fp_blip
+    catfault "one stream, unreachable for 5 s" 0 outage
+
+    # unreachable for good: a non-zero exit, and a message saying where it stopped
+    fp_stop; fp_start
+    HTTPS_PROXY=$fp_proxy ../gsg cat "$remote_base/$fcs/obj.bin" > $fcs/f.bin 2>$fcs/f.err &
+    pid=$!
+    fp_wait down $((40 << 20))
+    fp "mode?set=refuse" >/dev/null
+    wait $pid && rc=0 || rc=$?
+    assertEq "an outage past the retries fails cat" "$(( rc != 0 ))" "1"
+    assertOk "and says why" grep -q "attempt(s)" $fcs/f.err
+    assertEq "with less than the object written" "$(( $(wc -c < $fcs/f.bin) < $(wc -c < $fcs/obj.bin) ))" "1"
+    fp_stop
+    rm -rf $fcs
     finish
     fi
 
