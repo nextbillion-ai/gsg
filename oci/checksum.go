@@ -26,7 +26,7 @@ func (o *OCI) equalCRC32C(localPath, bucket, object string) (equal, comparable b
 	if head == nil {
 		// Verification was asked for and the object is not there. That is a
 		// failure, not something to pass over.
-		return false, false, fmt.Errorf("cannot verify oci://%s/%s: no such object", bucket, object)
+		return false, false, common.Caused(fmt.Sprintf("cannot verify oci://%s/%s: no such object", bucket, object), common.ErrNoSuchObject)
 	}
 	remote, stored := crc32cOf(head.OpcContentCrc32c)
 	if !stored {

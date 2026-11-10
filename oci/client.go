@@ -100,6 +100,16 @@ func (o *OCI) configProvider() ocicommon.ConfigurationProvider {
 	return o.provider
 }
 
+// NewWithClient returns an OCI that uses c for region and takes namespace as
+// the tenancy's, instead of reading ~/.oci/config, for a caller pointing gsg at
+// another endpoint.
+func NewWithClient(region, namespace string, c *objectstorage.ObjectStorageClient) *OCI {
+	return &OCI{
+		clients:   map[string]*objectstorage.ObjectStorageClient{region: c},
+		namespace: namespace,
+	}
+}
+
 // clientFor returns the client that talks to a region, building it on first
 // use and caching it.
 //

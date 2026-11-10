@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/bar"
@@ -92,6 +93,12 @@ func (g *GCS) toFileObject(attrs *storage.ObjectAttrs, bucket string) *system.Fi
 	return fo
 }
 
+// NewWithClient returns a GCS that uses c instead of building a client from
+// GOOGLE_APPLICATION_CREDENTIALS, for a caller pointing gsg at another endpoint.
+func NewWithClient(c *storage.Client) *GCS {
+	return &GCS{client: c}
+}
+
 // storageClient gets or creates a gcp storage client
 func (g *GCS) Init(_ ...string) error {
 	g.mu.Lock()
@@ -103,7 +110,7 @@ func (g *GCS) Init(_ ...string) error {
 	if path == "" {
 		log := fmt.Sprintf("gcs: expected env-var [%s] not found", googleApplicationCredentialsEnv)
 		logger.Info(module, log)
-		return errors.New(log)
+		return common.Caused(log, common.ErrNotConfigured)
 	}
 	var err error
 	if _, err = os.Stat(path); err != nil {
@@ -143,6 +150,25 @@ func (g *GCS) Init(_ ...string) error {
 		return err
 	}
 	return nil
+}
+
+// objectAttrs looks an object up for a transfer. Like GCSAttrs, a lookup the
+// service refuses reads as no object, but the refusal is kept as why, so a 403
+// and a missing object stay apart for Retryable. err is a client that could
+// not be built.
+func (g *GCS) objectAttrs(bucket, prefix string) (attrs *storage.ObjectAttrs, why error, err error) {
+	if err := g.Init(); err != nil {
+		return nil, nil, err
+	}
+	if prefix == "" {
+		return nil, common.ErrNoSuchObject, nil
+	}
+	attrs, why = g.client.Bucket(bucket).Object(prefix).Attrs(context.Background())
+	if why != nil {
+		logger.Debug(module, "failed with gs://%s/%s %s", bucket, prefix, why)
+		return nil, why, nil
+	}
+	return attrs, nil, nil
 }
 
 func (g *GCS) GCSAttrs(bucket, prefix string) (*storage.ObjectAttrs, error) {
@@ -329,16 +355,15 @@ func (g *GCS) Delete(bucket, prefix string) error {
 
 // CopyObject copies an object
 func (g *GCS) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
-	var err error
 	// check object
-	var ga *storage.ObjectAttrs
-	if ga, err = g.GCSAttrs(srcBucket, srcPrefix); err != nil {
+	ga, cause, err := g.objectAttrs(srcBucket, srcPrefix)
+	if err != nil {
 		return err
 	}
 	if ga == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", srcBucket, srcPrefix)
 		logger.Debug(module, log)
-		return errors.New(log)
+		return common.Caused(log, cause)
 	}
 
 	// copy object
@@ -382,16 +407,15 @@ func (g *GCS) Download(
 	forceChecksum bool,
 	ctx system.RunContext,
 ) error {
-	var err error
-	var attrs *storage.ObjectAttrs
 	// check object
-	if attrs, err = g.GCSAttrs(bucket, prefix); err != nil {
+	attrs, cause, err := g.objectAttrs(bucket, prefix)
+	if err != nil {
 		return err
 	}
 	if attrs == nil {
 		log := fmt.Sprintf("failed with bucket[%s] prefix[%s] not an object", bucket, prefix)
 		logger.Debug(module, log)
-		return errors.New(log)
+		return common.Caused(log, cause)
 	}
 
 	// get chunck size and chunk number
@@ -424,9 +448,34 @@ func (g *GCS) Download(
 	var wg sync.WaitGroup
 	var once sync.Once
 	dstFileTemp := common.GetTempFile(dstFile)
+	// Every chunk opens this file, so it has to exist before any is fetched.
+	folder, _ := common.ParseFile(dstFile)
+	if !common.IsPathExist(folder) {
+		common.CreateFolder(folder)
+	}
+	if err = common.CreateFile(dstFileTemp, attrs.Size); err != nil {
+		logger.Info(module, "download object failed when create temp file with %s", err)
+		_ = os.Remove(dstFileTemp)
+		return err
+	}
+	// A failed chunk stops the others and fails the download with its error,
+	// so cp and rsync can tell one worth another attempt from one that is not.
+	ff := common.NewFirstFailure()
+	defer ff.Close()
+	fail := func(format string, err error) {
+		if ff.Stopped() {
+			logger.Debug(module, format, err)
+			return
+		}
+		msg := fmt.Sprintf(format, err)
+		if ff.Fail(common.Caused(msg, err)) {
+			logger.Info(module, "%s", msg)
+		}
+	}
 	// gentle mode sums each chunk from the file while its pages are still cached
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
+	var shortChunks atomic.Int64
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -444,33 +493,51 @@ func (g *GCS) Download(
 					wg.Done()
 				}()
 
-				// create folder and temp file if not exist
 				once.Do(func() {
 					pb = ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
-					folder, _ := common.ParseFile(dstFile)
-					if !common.IsPathExist(folder) {
-						common.CreateFolder(folder)
-					}
-					common.CreateFile(dstFileTemp, attrs.Size)
 				})
+				if ff.Stopped() {
+					return
+				}
 
 				// create reader with offset and length of object
-				rc, err := obj.NewRangeReader(context.Background(), startByte, length)
+				rc, err := obj.NewRangeReader(ff.Context(), startByte, length)
+				if errors.Is(err, storage.ErrObjectNotExist) {
+					// The lookup above found this generation, so it has been
+					// overwritten or deleted since: not a missing object, and
+					// another attempt reads whatever is there now.
+					err = common.Caused(err.Error(), common.ErrObjectChanged)
+				}
 				if err != nil {
-					logger.Info(module, "download object failed when create reader with %s", err)
-					common.Exit()
+					fail("download object failed when create reader with %s", err)
+					return
 				}
 				defer func() { _ = rc.Close() }()
 
 				// create write with offset and length of file
-				fl, _ := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
-				_, err = fl.Seek(startByte, 0)
+				fl, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766)
 				if err != nil {
-					logger.Info(module, "download object failed when seek for offset with %s", err)
-					common.Exit()
+					fail("download object failed when open temp file with %s", err)
+					return
+				}
+				defer func() { _ = fl.Close() }()
+				if _, err = fl.Seek(startByte, 0); err != nil {
+					fail("download object failed when seek for offset with %s", err)
+					return
 				}
 
-				defer func() { _ = fl.Close() }()
+				// The library does not check a 206 body against its range.
+				var gotBytes int64
+				defer func() {
+					// a chunk that failed, or was stopped, has already said so
+					if ff.Stopped() {
+						return
+					}
+					if gotBytes != length {
+						logger.Info(module, "download of gs://%s/%s got %d bytes at offset %d, expected %d", bucket, prefix, gotBytes, startByte, length)
+						shortChunks.Add(1)
+					}
+				}()
 
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
@@ -481,29 +548,30 @@ func (g *GCS) Download(
 					// offset is in use.
 					verifier, verr := os.Open(dstFileTemp)
 					if verr != nil {
-						logger.Info(module, "download object failed when open for verify: %s", verr)
-						common.Exit()
+						fail("download object failed when open for verify: %s", verr)
+						return
 					}
 					defer func() { _ = verifier.Close() }()
 					sum, written, gerr := common.GentleWrite(fl, verifier, startByte, rc, pb)
 					if gerr != nil {
-						logger.Info(module, "download object failed in gentle mode with %s", gerr)
-						common.Exit()
+						fail("download object failed in gentle mode with %s", gerr)
+						return
 					}
 					chunkSums[i], chunkLens[i] = sum, written
+					gotBytes = written
 				} else {
 					// Fast mode: use buffered writer
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 					defer func() { _ = bufWriter.Flush() }()
 
-					if _, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
-						logger.Info(module, "download object failed when write to offet with %s", err)
-						common.Exit()
+					if gotBytes, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
+						fail("download object failed when write to offet with %s", err)
+						return
 					}
 
 					if err = bufWriter.Flush(); err != nil {
-						logger.Info(module, "download object failed when flush buffer with %s", err)
-						common.Exit()
+						fail("download object failed when flush buffer with %s", err)
+						return
 					}
 				}
 			},
@@ -512,6 +580,18 @@ func (g *GCS) Download(
 
 	// move back the temp file
 	wg.Wait()
+	if ferr := ff.Err(); ferr != nil {
+		_ = os.Remove(dstFileTemp)
+		return ferr
+	}
+
+	// The temp file is allocated at full size, so a response that ended early
+	// without an error leaves zeroes at the right length. Renaming that and
+	// stamping the object's time would make a later rsync skip it for good.
+	if n := shortChunks.Load(); n > 0 {
+		_ = os.Remove(dstFileTemp)
+		return fmt.Errorf("gs: download of gs://%s/%s: %d chunk(s) came back the wrong size", bucket, prefix, n)
+	}
 
 	// sync temp file to disk before rename
 	if tmpFile, err := os.OpenFile(dstFileTemp, os.O_WRONLY, 0766); err == nil {

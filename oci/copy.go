@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
@@ -110,7 +111,7 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	// regions is two different buckets, and refusing that copy would refuse a
 	// legitimate cross-region one.
 	if src.sameBucket(dst) && srcPrefix == dstPrefix {
-		return fmt.Errorf("oci: refusing to copy oci://%s/%s onto itself", src, srcPrefix)
+		return common.Caused(fmt.Sprintf("oci: refusing to copy oci://%s/%s onto itself", src, srcPrefix), common.ErrInvalidRequest)
 	}
 
 	// The source must exist. Without this the work request is accepted and
@@ -120,7 +121,7 @@ func (o *OCI) Copy(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 		return err
 	}
 	if head == nil {
-		return fmt.Errorf("oci: no object at oci://%s/%s", src, srcPrefix)
+		return common.Caused(fmt.Sprintf("oci: no object at oci://%s/%s", src, srcPrefix), common.ErrNoSuchObject)
 	}
 
 	r, err := src.c.CopyObject(context.Background(), copyRequest(src, dst, srcPrefix, dstPrefix))

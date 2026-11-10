@@ -125,9 +125,9 @@ func runChunks(pool *worker.Pool, chunks int, job func(i int)) {
 
 // fetchWithRetry runs one chunk again rather than the whole transfer.
 //
-// This is what chunking buys beyond speed, and neither gs nor s3 has it: they
-// call common.Exit on a failed chunk, so a blip 79 GiB into an 80 GiB object
-// costs the entire download.
+// This is what chunking buys beyond speed, and neither gs nor s3 has it: a
+// failed chunk fails their whole download, which cp and rsync then try again
+// from the start, so a blip 79 GiB into an 80 GiB object costs all of it.
 //
 // The progress bar has to be wound back by hand. A failed attempt has already
 // reported whatever it managed to write, and the attempt that replaces it
@@ -136,7 +136,9 @@ func runChunks(pool *worker.Pool, chunks int, job func(i int)) {
 func fetchWithRetry(pb *bar.ProgressBar, fetch func() (uint32, int64, error)) (uint32, int64, error) {
 	var sum uint32
 	var written int64
-	err := common.DoWithRetrySimple(func() error {
+	config := common.DefaultRetryConfig()
+	config.Retryable = common.Retryable
+	err := common.DoWithRetry(func() error {
 		crc, n, ferr := fetch()
 		if ferr != nil {
 			if pb != nil && n > 0 {
@@ -146,7 +148,7 @@ func fetchWithRetry(pb *bar.ProgressBar, fetch func() (uint32, int64, error)) (u
 		}
 		sum, written = crc, n
 		return nil
-	})
+	}, config)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -202,7 +204,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 		return err
 	}
 	if head == nil {
-		return fmt.Errorf("oci: no object at oci://%s/%s", ref.name, prefix)
+		return common.Caused(fmt.Sprintf("oci: no object at oci://%s/%s", ref.name, prefix), common.ErrNoSuchObject)
 	}
 	var size int64
 	if head.ContentLength != nil {
@@ -222,7 +224,11 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	common.CreateFolder(folder)
 
 	dstFileTemp := common.GetTempFile(dstFile)
-	common.CreateFile(dstFileTemp, size)
+	if err = common.CreateFile(dstFileTemp, size); err != nil {
+		logger.Info(module, "cannot create %s: %s", dstFileTemp, err)
+		_ = os.Remove(dstFileTemp)
+		return err
+	}
 
 	chunkSize, chunks := downloadGeometry(size, ctx.ChunkSize)
 	logger.Debug(module, "Downloading [%s] with %d chunk(s), chunk size: %d bytes, total size: %d bytes",
@@ -242,7 +248,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 		// failed request does.
 		defer func() {
 			if r := recover(); r != nil {
-				errs[i] = fmt.Errorf("oci: panic downloading chunk %d of oci://%s/%s: %v", i+1, ref.name, prefix, r)
+				errs[i] = common.PanicError(fmt.Sprintf("oci: panic downloading chunk %d of oci://%s/%s", i+1, ref.name, prefix), r)
 			}
 		}()
 		off := int64(i) * chunkSize

@@ -2351,6 +2351,11 @@ upload". The `fp_*` helpers the fault-injection cases use are there too;
 
 ## 36. A gs download chunk that fails exits the process
 
+**Fixed in #95 for gs and s3,** as part of item 48: a failed chunk cancels the
+others, removes the temp file and is returned, and `cp` / `rsync` try the whole
+download again unless the error cannot change. The chunk itself is still not
+retried on its own, as oci does.
+
 Item 29 notes this in passing; it has no item of its own. Every error inside a
 chunk calls `common.Exit()` (`gcs/gcs.go:427`, `:436`, `:451`, `:457`, `:467`,
 `:472`), so `Download` never returns an error that `rsync`'s
@@ -2932,3 +2937,97 @@ stdout clean, `| head -c 100`, a missing object) and, gs only, through
 responses dropped for 3 s, each in chunked and single-stream form, must give
 the object exactly with exit 0; an outage past the retries must exit non-zero,
 say how many attempts it made, and have written less than the object.
+
+## 48. A download it cannot write fails as "seek for offset with invalid argument"
+
+**Fixed in #95.** gs and s3 created the `_.gstmp` inside the first chunk and
+dropped the error, and every chunk then opened it with the error dropped too.
+When the file could not be created, each chunk called `Seek` on a nil
+`*os.File`, which returns `os.ErrInvalid`, so the only message was
+`download object failed when seek for offset with invalid argument`, printed
+after the range reads had already gone out. Nothing in it says permission or
+path.
+
+Seen 2026-11-08: `gsg -m cp` of a 62 GiB `valhalla_tiles.tar` into the root of a
+fresh volume, in the goroute image, which runs as a user other than root. The
+volume root belongs to root, so `os.Create` got `EACCES`. The size had nothing
+to do with it: a 38 MB object into a read-only directory fails the same way.
+`-m rsync` "working" in the same session came after the pod moved to
+`runAsUser: 0`; it shares the same `Download`.
+
+Now `common.CreateFile` returns its error, gs and s3 create the temp file
+before dispatching any chunk and return the error from `Download`
+(`open ..._.gstmp: permission denied`), and a chunk that cannot open it says
+so. oci already checked the chunk open and now also returns the create error.
+A temp file that is created but cannot be sized (`Truncate` refused) is removed
+with the error in all three, pinned for gs and s3 by
+`TestDownloadRemovesATempFileItCouldNotSize`.
+
+Also in #95: a gs chunk whose 206 body ends before its range, with no error,
+now fails the download as s3's already did. The storage library does not
+compare a range body with the range, and forces its own CRC check off for 206,
+so without `-v` the zeroes left in the pre-sized temp file were renamed into
+place with the object's mtime, and rsync skipped the file from then on. Each gs
+chunk now counts its bytes in both the fast and gentle paths, a wrong count
+removes the temp file and fails `Download`, and it is retried
+(`TestDownloadFailsAChunkThatEndsEarly`). The s3 short-chunk path now removes
+the temp file too.
+
+`cp` and `rsync` retried every transfer error three times, so a permanent one
+like this was printed three times before the exit. Also fixed in #95: they go
+through `DoTransferWithRetry`, which stops at the first error
+`common.Retryable` rejects. It judges only typed errors: `fs.ErrPermission`,
+`fs.ErrNotExist` (local), `ENOTDIR`, `EISDIR`, `EROFS`,
+`storage.ErrObjectNotExist` / `ErrBucketNotExist`, `common.ErrNoSuchObject`,
+`common.ErrNotConfigured`, `common.ErrInvalidRequest` (gsg refusing its own
+arguments), and a 400, 403 or 404 from the gs, s3 (v1 and v2 SDK) or oci SDK.
+Retried as before: 408, 429, 5xx, resets, timeouts, anything untyped, and
+also:
+
+- A GCS 403 whose reason is `rateLimitExceeded` or `userRateLimitExceeded`
+  (from `Errors[].Reason`, or the body of an XML read, which is not parsed),
+  and an s3 throttling or clock-skew code (`SlowDown`, `RequestTimeTooSkewed`
+  and the like) whatever its status. oci throttles only with 429 and 409.
+- 412. A download reads the generation (gs) or ETag (oci) its lookup saw; an
+  object overwritten while it is read answers 412 (oci) or 404 for that
+  generation (gs, carried as `common.ErrObjectChanged`), and another attempt
+  looks it up again and reads the new version.
+- `EINVAL` and `fs.ErrInvalid`, which also come from a nil or closed file and
+  from an O_DIRECT write a later attempt can make differently.
+
+The s3 attribute lookup and the oci chunk retry use the same judgement.
+
+For that to see the error, every cp and rsync path of gs, s3 and oci now
+hands it over with its type:
+
+- A gs or s3 chunk that fails no longer calls `common.Exit()`. The first
+  failure is kept (`common.FirstFailure`), the other chunks are cancelled, the
+  temp file is removed and `Download` returns it, so the whole transfer is
+  tried again when the error allows (item 36, for gs and s3).
+- "not an object" from a lookup carries the service's refusal (gs) or
+  `common.ErrNoSuchObject` (s3, oci) behind the same message, via
+  `common.Caused`, which keeps the text and unwraps to the cause.
+- A missing `GOOGLE_APPLICATION_CREDENTIALS` and an s3 config that does not
+  load carry `common.ErrNotConfigured`; the s3 one no longer exits on the spot.
+- A copy onto itself (s3, oci) carries `common.ErrInvalidRequest`; a
+  recovered panic keeps its value when it is an error.
+
+`cmd/transfer_failure_test.go` runs `cp` and `rsync` as a separate process
+against a fake store of each backend: a 403, a 404 (s3, oci), a destination
+below a file and a read-only destination are each tried once, printed once and
+exit 1; a 503, a connection dropped mid-body, a 412, a gs 404 for the pinned
+generation and a gs rate-limit 403 are retried to success.
+
+Still untyped on these paths, deliberately or because there is nothing to wrap:
+
+- Checksum and length mismatches (`mustMatchCRC32C`, `verifyGentleDownload`,
+  the gs and s3 short-chunk counts, oci `settleDownload` and its byte count, the s3
+  multipart copy's totals): no underlying error exists, and another attempt is
+  the right answer to corruption in transit.
+- A file that changed under an upload (gs composite, oci multipart): another
+  attempt reads it again and can succeed.
+- An oci copy work request that ends FAILED or CANCELED: the service gives
+  only text, with no status to classify; it gets three attempts.
+- Local `rsync` and `cp` run `cp` and `rm` as commands. The `*exec.ExitError` is
+  kept as the cause, but the errno is only in their stderr, so a permission
+  error there is still tried three times.
