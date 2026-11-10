@@ -96,6 +96,9 @@ var rootCmd = &cobra.Command{
 
 // TODO: replace this with proper cobra method
 func initFlags() {
+	if isCatCommand(os.Args) {
+		logger.LogToStderr()
+	}
 	for _, v := range os.Args {
 		if v == "-m" {
 			enableMultiThread = true

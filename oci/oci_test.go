@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -154,4 +155,9 @@ func TestErrNotImplementedReportsRatherThanPretends(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "SomeOperation")
 	assert.Contains(t, err.Error(), "not implemented")
+}
+
+// The line a failed cat prints is the one it printed before cat streamed.
+func TestCatFailureKeepsItsText(t *testing.T) {
+	assert.Equal(t, "cannot read oci://b/k: boom", catFailure("b", "k", errors.New("boom")))
 }

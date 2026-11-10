@@ -868,3 +868,10 @@ func TestUploadDecidesFromTheFileItOpened(t *testing.T) {
 	assert.Empty(t, fc.composed)
 	assert.Equal(t, []string{strconv.FormatInt(opened.UnixNano(), 10)}, fc.mtimes, "the opened file's mtime")
 }
+
+// foreman's cloudsql lock runs `gsg cat <lock> 2>&1` and reads a missing lock
+// from this text, so it must not change.
+func TestCatFailureKeepsTheNotFoundText(t *testing.T) {
+	assert.Equal(t, "output object failed when create reader with storage: object doesn't exist",
+		catFailure(storage.ErrObjectNotExist))
+}
