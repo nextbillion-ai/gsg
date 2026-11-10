@@ -100,6 +100,16 @@ func (o *OCI) configProvider() ocicommon.ConfigurationProvider {
 	return o.provider
 }
 
+// NewWithClient returns an OCI that uses c for region and takes namespace as
+// the tenancy's, instead of reading ~/.oci/config, for a caller pointing gsg at
+// another endpoint.
+func NewWithClient(region, namespace string, c *objectstorage.ObjectStorageClient) *OCI {
+	return &OCI{
+		clients:   map[string]*objectstorage.ObjectStorageClient{region: c},
+		namespace: namespace,
+	}
+}
+
 // clientFor returns the client that talks to a region, building it on first
 // use and caching it.
 //
@@ -112,16 +122,6 @@ func (o *OCI) configProvider() ocicommon.ConfigurationProvider {
 // decides that -- but it is still what the SDK validates the provider against
 // when the client is constructed, which is why a config file with no region at
 // all fails here rather than silently defaulting.
-// NewWithClient returns an OCI that uses c for region and takes namespace as
-// the tenancy's, instead of reading ~/.oci/config, for a caller pointing gsg at
-// another endpoint.
-func NewWithClient(region, namespace string, c *objectstorage.ObjectStorageClient) *OCI {
-	return &OCI{
-		clients:   map[string]*objectstorage.ObjectStorageClient{region: c},
-		namespace: namespace,
-	}
-}
-
 func (o *OCI) clientFor(region string) (*objectstorage.ObjectStorageClient, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
