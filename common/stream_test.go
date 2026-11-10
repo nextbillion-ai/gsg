@@ -318,6 +318,34 @@ func TestStreamStopsCleanlyWhenTheWriterFails(t *testing.T) {
 	assert.Equal(t, int32(0), o.inFlight.Load(), "every response body is closed")
 }
 
+// A writer that takes part of a write and reports no error ends the stream as
+// a write failure. Retrying it as a read would reopen past the bytes w never
+// took.
+func TestStreamStopsAtAShortWrite(t *testing.T) {
+	for _, chunk := range []int64{0, 4096} {
+		t.Run(fmt.Sprintf("chunk=%d", chunk), func(t *testing.T) {
+			// larger than one sequential read, so a reopen would land mid-object
+			o := &fakeObject{data: randomBytes(3 * sequentialReadSize)}
+			var out bytes.Buffer
+			var writes atomic.Int32
+			w := writerFunc(func(p []byte) (int, error) {
+				if writes.Add(1) == 1 {
+					half := len(p) / 2
+					out.Write(p[:half])
+					return half, nil
+				}
+				return out.Write(p)
+			})
+			err := Stream(context.Background(), w, o.source(), StreamOptions{ChunkSize: chunk, Window: 4, Retry: fastRetry})
+			require.Error(t, err)
+			assert.True(t, IsStreamWriteError(err), "got %v", err)
+			assert.ErrorIs(t, err, io.ErrShortWrite)
+			assert.Equal(t, int32(1), writes.Load())
+			assert.True(t, bytes.HasPrefix(o.data, out.Bytes()), "what was written is a prefix of the object")
+		})
+	}
+}
+
 // A response that stops delivering without an error, as a lost one does, is
 // abandoned after the stall timeout and reopened where it stopped.
 func TestStreamReopensAStalledRead(t *testing.T) {

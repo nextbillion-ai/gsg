@@ -109,6 +109,11 @@ func Stream(ctx context.Context, w io.Writer, src StreamSource, opts StreamOptio
 	v := newStreamVerifier(src)
 	out := io.MultiWriter(writerFunc(func(p []byte) (int, error) {
 		n, err := w.Write(p)
+		if err == nil && n != len(p) {
+			// io.MultiWriter would report this unwrapped, as a read failure
+			// to retry past bytes that never reached w.
+			err = io.ErrShortWrite
+		}
 		if err != nil {
 			return n, writeError{err}
 		}
@@ -199,11 +204,12 @@ func readAttempt(ctx context.Context, src StreamSource, off, n int64, got *int64
 			// A slow consumer is not a stalled read: the clock runs only
 			// while waiting on the response.
 			timer.Stop()
-			p := next(*got)[:k]
-			*got += int64(k)
-			if werr := took(p); werr != nil {
+			// got moves only past bytes took accepted, so no failure can
+			// reopen the range beyond what was written.
+			if werr := took(next(*got)[:k]); werr != nil {
 				return werr
 			}
+			*got += int64(k)
 			timer.Reset(stall)
 		}
 		if rerr != nil {

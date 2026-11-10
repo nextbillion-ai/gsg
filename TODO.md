@@ -2895,7 +2895,9 @@ exit. An s3 object without a whole-object CRC32C is checked for length only.
 For `cat`, log lines go to stderr; the line for an object that cannot be opened
 is unchanged (foreman's cloudsql lock matches `storage: object doesn't exist` in
 `gsg cat 2>&1`, pinned by `TestCatFailureKeepsTheNotFoundText`). A closed stdout ends the process on SIGPIPE,
-as `cat` does. A gs object stored with `Content-Encoding: gzip` is served
+as `cat` does. A write that takes fewer bytes than it was given, with no error,
+ends the stream as a write failure rather than a read to retry, which would
+reopen past the bytes never written (`TestStreamStopsAtAShortWrite`). A gs object stored with `Content-Encoding: gzip` is served
 decompressed, so its length and checksum describe other bytes: it still goes
 out as one unranged stream, verified only by the storage library.
 
