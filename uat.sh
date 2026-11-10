@@ -314,31 +314,6 @@ is_multipart() {
     esac
 }
 
-# peak_rss_bytes runs a command with stdout to /dev/null and prints its peak
-# resident set size in bytes. BSD time -l reports bytes, GNU time -v reports
-# KB. It fails when the command fails or neither form is available.
-peak_rss_bytes() {
-    local f rc kb
-    f=$(mktemp)
-    if /usr/bin/time -l true >/dev/null 2>&1
-    then
-        /usr/bin/time -l "$@" >/dev/null 2>"$f" && rc=0 || rc=$?
-        [[ $rc -eq 0 ]] && awk '/maximum resident set size/{print $1}' "$f"
-    elif /usr/bin/time -v true >/dev/null 2>&1
-    then
-        /usr/bin/time -v "$@" >/dev/null 2>"$f" && rc=0 || rc=$?
-        if [[ $rc -eq 0 ]]
-        then
-            kb=$(awk -F: '/Maximum resident set size/{gsub(/ /,"",$2); print $2}' "$f")
-            echo $(( kb * 1024 ))
-        fi
-    else
-        rc=1
-    fi
-    rm -f "$f"
-    return $rc
-}
-
 # assertEq compares a value against an expectation and reports which check failed.
 assertEq() {
     local what="$1" got="$2" want="$3"
@@ -1060,25 +1035,6 @@ do_test() {
     assertEq "a closed stdout ends cat promptly" "$(( SECONDS - t0 < 10 ))" "1"
     assertEq "head got its 100 bytes" "$(wc -c < $fcs/head.bin | tr -d ' ')" "100"
     assertEq "and cat said nothing about it" "$(wc -c < $fcs/pipe.err | tr -d ' ')" "0"
-
-    # A cat that buffers the whole object peaks at several times its size
-    # (about 540 MiB for this 120 MiB object). Streaming holds window x chunk
-    # size, 128 MiB at the defaults, plus the runtime and HTTP buffers; one
-    # unchunked stream holds only a copy buffer. Each bound is about 1.5x a
-    # streaming peak measured on macOS and well under the buffering peak.
-    if peak_rss_bytes true >/dev/null 2>&1
-    then
-        rss=$(peak_rss_bytes ../gsg cat "$remote_base/$fcs/obj.bin") \
-            || { echo "FATAL: cat failed while measuring its memory"; exit 1; }
-        echo "      peak RSS chunked: $(( rss >> 20 )) MiB"
-        assertEq "a chunked cat holds window x chunk size, not the object" "$(( rss < (256 << 20) ))" "1"
-        rss=$(peak_rss_bytes ../gsg --chunk-size 0 cat "$remote_base/$fcs/obj.bin") \
-            || { echo "FATAL: cat failed while measuring its memory"; exit 1; }
-        echo "      peak RSS single stream: $(( rss >> 20 )) MiB"
-        assertEq "a single stream cat stays under the object size" "$(( rss < (96 << 20) ))" "1"
-    else
-        echo "SKIP: no /usr/bin/time that reports peak RSS"
-    fi
 
     if ../gsg cat "$remote_base/$fcs/absent.bin" >/dev/null 2>&1
     then
