@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nextbillion-ai/gsg/bar"
@@ -455,6 +456,7 @@ func (g *GCS) Download(
 	}
 	if err = common.CreateFile(dstFileTemp, attrs.Size); err != nil {
 		logger.Info(module, "download object failed when create temp file with %s", err)
+		_ = os.Remove(dstFileTemp)
 		return err
 	}
 	// A failed chunk stops the others and fails the download with its error,
@@ -474,6 +476,7 @@ func (g *GCS) Download(
 	// gentle mode sums each chunk from the file while its pages are still cached
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
+	var shortChunks atomic.Int64
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -524,6 +527,19 @@ func (g *GCS) Download(
 					return
 				}
 
+				// The library does not check a 206 body against its range.
+				var gotBytes int64
+				defer func() {
+					// a chunk that failed, or was stopped, has already said so
+					if ff.Stopped() {
+						return
+					}
+					if gotBytes != length {
+						logger.Info(module, "download of gs://%s/%s got %d bytes at offset %d, expected %d", bucket, prefix, gotBytes, startByte, length)
+						shortChunks.Add(1)
+					}
+				}()
+
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
 					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
@@ -543,12 +559,13 @@ func (g *GCS) Download(
 						return
 					}
 					chunkSums[i], chunkLens[i] = sum, written
+					gotBytes = written
 				} else {
 					// Fast mode: use buffered writer
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 					defer func() { _ = bufWriter.Flush() }()
 
-					if _, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
+					if gotBytes, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
 						fail("download object failed when write to offet with %s", err)
 						return
 					}
@@ -567,6 +584,14 @@ func (g *GCS) Download(
 	if ferr := ff.Err(); ferr != nil {
 		_ = os.Remove(dstFileTemp)
 		return ferr
+	}
+
+	// The temp file is allocated at full size, so a response that ended early
+	// without an error leaves zeroes at the right length. Renaming that and
+	// stamping the object's time would make a later rsync skip it for good.
+	if n := shortChunks.Load(); n > 0 {
+		_ = os.Remove(dstFileTemp)
+		return fmt.Errorf("gs: download of gs://%s/%s: %d chunk(s) came back the wrong size", bucket, prefix, n)
 	}
 
 	// sync temp file to disk before rename

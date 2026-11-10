@@ -171,11 +171,14 @@ func TestDownloadAcceptsCompleteChunks(t *testing.T) {
 func TestDownloadRefusesAChunkThatEndsEarly(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789"), 100)
 	for _, chunkSize := range []int64{0, 333} {
-		dst := filepath.Join(t.TempDir(), "o.bin")
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "o.bin")
 		err := download(t, rangedObject(t, content, 10), chunkSize, dst)
 		assert.Error(t, err, "chunk size %d", chunkSize)
 		_, statErr := os.Stat(dst)
 		assert.True(t, os.IsNotExist(statErr), "nothing may be installed, chunk size %d", chunkSize)
+		left, _ := os.ReadDir(dir)
+		assert.Empty(t, left, "the temp file is removed, chunk size %d", chunkSize)
 	}
 }
 

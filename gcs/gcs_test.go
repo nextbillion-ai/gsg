@@ -938,3 +938,93 @@ func unwritableDestinations(t *testing.T) []unwritableDestination {
 	}
 	return cases
 }
+
+// A 206 whose body ends before the range it promised leaves zeroes in the
+// preallocated temp file. Without -v nothing else compares lengths, and the
+// file would be renamed with the object's time, which rsync then trusts.
+func TestDownloadFailsAChunkThatEndsEarly(t *testing.T) {
+	for _, gentle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gentle=%v", gentle), func(t *testing.T) {
+			content := []byte("0123456789abcdefghij")
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("alt") == "json" {
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprintf(w, `{"bucket":"b","name":"o","size":"%d","generation":"7","updated":"2026-01-02T03:04:05Z"}`, len(content))
+					return
+				}
+				var start, end int
+				_, _ = fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end)
+				body := content[start : end+1]
+				if start == 4 {
+					body = body[:2]
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
+				w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+			require.NoError(t, err)
+
+			pool := worker.New(2, false)
+			pool.Run()
+			defer pool.Close()
+			bars, err := bar.New()
+			require.NoError(t, err)
+
+			dir := t.TempDir()
+			dst := filepath.Join(dir, "o")
+			g := &GCS{client: client}
+			err = g.Download("b", "o", dst, false, system.RunContext{Pool: pool, Concurrency: 2, Bars: bars, ChunkSize: 4, GentleIO: gentle})
+			require.Error(t, err)
+			assert.True(t, common.Retryable(err), "another attempt may get the whole chunk: %v", err)
+			_, serr := os.Stat(dst)
+			assert.True(t, os.IsNotExist(serr), "no file is left under the object's name")
+			left, _ := os.ReadDir(dir)
+			assert.Empty(t, left, "the temp file is removed")
+		})
+	}
+}
+
+// hugeObjectSize is larger than any file the test's filesystem will allocate.
+const hugeObjectSize = int64(1) << 62
+
+// dirRefusingHugeFiles returns a directory where a file can be created but not
+// sized to hugeObjectSize, so CreateFile fails after the file exists.
+func dirRefusingHugeFiles(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "probe")
+	f, err := os.Create(probe)
+	require.NoError(t, err)
+	terr := f.Truncate(hugeObjectSize)
+	_ = f.Close()
+	require.NoError(t, os.Remove(probe))
+	if terr == nil {
+		t.Skip("this filesystem allocates a sparse file of 4 EiB")
+	}
+	return dir
+}
+
+// A temp file created but not sized is removed with the failure.
+func TestDownloadRemovesATempFileItCouldNotSize(t *testing.T) {
+	dir := dirRefusingHugeFiles(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"bucket":"b","name":"o","size":"%d","generation":"7","updated":"2026-01-02T03:04:05Z"}`, hugeObjectSize)
+	}))
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	pool := worker.New(2, false)
+	pool.Run()
+	defer pool.Close()
+	bars, err := bar.New()
+	require.NoError(t, err)
+
+	err = (&GCS{client: client}).Download("b", "o", filepath.Join(dir, "o"), false, system.RunContext{Pool: pool, Concurrency: 2, Bars: bars})
+	require.Error(t, err)
+	left, _ := os.ReadDir(dir)
+	assert.Empty(t, left)
+}

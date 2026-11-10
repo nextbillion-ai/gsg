@@ -2897,6 +2897,19 @@ Now `common.CreateFile` returns its error, gs and s3 create the temp file
 before dispatching any chunk and return the error from `Download`
 (`open ..._.gstmp: permission denied`), and a chunk that cannot open it says
 so. oci already checked the chunk open and now also returns the create error.
+A temp file that is created but cannot be sized (`Truncate` refused) is removed
+with the error in all three, pinned for gs and s3 by
+`TestDownloadRemovesATempFileItCouldNotSize`.
+
+Also in #95: a gs chunk whose 206 body ends before its range, with no error,
+now fails the download as s3's already did. The storage library does not
+compare a range body with the range, and forces its own CRC check off for 206,
+so without `-v` the zeroes left in the pre-sized temp file were renamed into
+place with the object's mtime, and rsync skipped the file from then on. Each gs
+chunk now counts its bytes in both the fast and gentle paths, a wrong count
+removes the temp file and fails `Download`, and it is retried
+(`TestDownloadFailsAChunkThatEndsEarly`). The s3 short-chunk path now removes
+the temp file too.
 
 `cp` and `rsync` retried every transfer error three times, so a permanent one
 like this was printed three times before the exit. Also fixed in #95: they go
@@ -2946,7 +2959,7 @@ generation and a gs rate-limit 403 are retried to success.
 Still untyped on these paths, deliberately or because there is nothing to wrap:
 
 - Checksum and length mismatches (`mustMatchCRC32C`, `verifyGentleDownload`,
-  the s3 short-chunk count, oci `settleDownload` and its byte count, the s3
+  the gs and s3 short-chunk counts, oci `settleDownload` and its byte count, the s3
   multipart copy's totals): no underlying error exists, and another attempt is
   the right answer to corruption in transit.
 - A file that changed under an upload (gs composite, oci multipart): another

@@ -226,6 +226,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	dstFileTemp := common.GetTempFile(dstFile)
 	if err = common.CreateFile(dstFileTemp, size); err != nil {
 		logger.Info(module, "cannot create %s: %s", dstFileTemp, err)
+		_ = os.Remove(dstFileTemp)
 		return err
 	}
 

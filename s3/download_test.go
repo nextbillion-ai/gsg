@@ -62,3 +62,28 @@ func TestDownloadIntoAnUnwritableDestinationSaysWhy(t *testing.T) {
 		})
 	}
 }
+
+// A temp file created but not sized is removed with the failure.
+func TestDownloadRemovesATempFileItCouldNotSize(t *testing.T) {
+	const huge = int64(1) << 62
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "probe")
+	f, err := os.Create(probe)
+	require.NoError(t, err)
+	terr := f.Truncate(huge)
+	_ = f.Close()
+	require.NoError(t, os.Remove(probe))
+	if terr == nil {
+		t.Skip("this filesystem allocates a sparse file of 4 EiB")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Last-Modified", "Sun, 05 Nov 2026 02:14:22 GMT")
+		fmt.Fprintf(w, `<GetObjectAttributesResponse><ObjectSize>%d</ObjectSize></GetObjectAttributesResponse>`, huge)
+	}))
+	t.Cleanup(srv.Close)
+	s := &S3{clients: map[string]*s3.Client{"b": clientAt(srv)}}
+
+	require.Error(t, download(t, s, 4, filepath.Join(dir, "o.bin")))
+	left, _ := os.ReadDir(dir)
+	assert.Empty(t, left)
+}

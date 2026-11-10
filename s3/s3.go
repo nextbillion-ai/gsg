@@ -821,6 +821,7 @@ func (s *S3) Download(
 	}
 	if err = common.CreateFile(dstFileTemp, size); err != nil {
 		logger.Info(module, "download object failed when create temp file with %s", err)
+		_ = os.Remove(dstFileTemp)
 		return err
 	}
 	for i := 0; i < chunkNumber; i++ {
@@ -961,6 +962,7 @@ func (s *S3) Download(
 	// stamping the object's time would make a later rsync of an object with no
 	// checksum skip it for good.
 	if n := shortChunks.Load(); n > 0 {
+		_ = os.Remove(dstFileTemp)
 		return fmt.Errorf("s3: download of s3://%s/%s: %d chunk(s) came back the wrong size", bucket, prefix, n)
 	}
 
