@@ -43,3 +43,40 @@ func TestStoreFileCRC32CIsWhatTheNextLookupReturnsWithoutReadingTheFile(t *testi
 	StoreFileCRC32C(path, 42)
 	assert.Equal(t, uint32(42), GetFileCRC32C(path))
 }
+
+func TestChunkCRC32CSumsOnlyItsOwnShare(t *testing.T) {
+	data := []byte("0123456789abcdefghij")
+	for _, limit := range []int64{0, 1, 7, 19, 20, 25} {
+		c := NewChunkCRC32C(limit)
+		// written in pieces that straddle the limit
+		for start := 0; start < len(data); start += 3 {
+			end := min(start+3, len(data))
+			n, err := c.Write(data[start:end])
+			assert.NoError(t, err)
+			assert.Equal(t, end-start, n, "every byte is accepted")
+		}
+		share := data[:min(limit, int64(len(data)))]
+		crc, n := c.Sum()
+		assert.Equal(t, crc32.Checksum(share, Castagnoli), crc, "limit %d", limit)
+		assert.Equal(t, int64(len(share)), n, "limit %d", limit)
+	}
+}
+
+func TestChunkSumsFoldToTheWholeFile(t *testing.T) {
+	data := make([]byte, 1<<20+333)
+	rand.New(rand.NewSource(3)).Read(data)
+	const chunk = 1 << 16
+	var sums []uint32
+	var lens []int64
+	for start := 0; start < len(data); start += chunk {
+		end := min(start+chunk, len(data))
+		c := NewChunkCRC32C(int64(end - start))
+		// an s3 chunk fetches one byte past its share
+		_, _ = c.Write(data[start:min(end+1, len(data))])
+		s, n := c.Sum()
+		sums, lens = append(sums, s), append(lens, n)
+	}
+	crc, total := FoldCRC32C(sums, lens)
+	assert.Equal(t, crc32.Checksum(data, Castagnoli), crc)
+	assert.Equal(t, int64(len(data)), total)
+}

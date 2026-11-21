@@ -63,3 +63,38 @@ func CombineCRC32C(crcA, crcB uint32, lenB int64) uint32 {
 	}
 	return crcA ^ crcB
 }
+
+// ChunkCRC32C sums the bytes written to one chunk of a download, so the file's
+// CRC32C is known when the last chunk lands, without reading it back. It sums
+// only the first limit bytes and accepts the rest unsummed: an s3 range is
+// inclusive, so every chunk there but the last also fetches the first byte of
+// the next one, which that chunk sums as its own.
+//
+// Write never fails, so it can sit in an io.MultiWriter beside the file.
+type ChunkCRC32C struct {
+	crc   uint32
+	limit int64
+	n     int64
+}
+
+// NewChunkCRC32C sums up to limit bytes.
+func NewChunkCRC32C(limit int64) *ChunkCRC32C {
+	return &ChunkCRC32C{limit: limit}
+}
+
+func (c *ChunkCRC32C) Write(p []byte) (int, error) {
+	if rest := c.limit - c.n; rest > 0 {
+		q := p
+		if int64(len(q)) > rest {
+			q = q[:rest]
+		}
+		c.crc = crc32.Update(c.crc, Castagnoli, q)
+		c.n += int64(len(q))
+	}
+	return len(p), nil
+}
+
+// Sum returns the CRC32C of the bytes summed and how many there were.
+func (c *ChunkCRC32C) Sum() (crc uint32, n int64) {
+	return c.crc, c.n
+}
