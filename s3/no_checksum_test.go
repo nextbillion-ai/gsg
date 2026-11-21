@@ -113,11 +113,18 @@ func TestReadingBothAnswersCostsOneLookupPerObject(t *testing.T) {
 // end a response early without an error, which a Content-Length would prevent.
 func rangedObject(t *testing.T, content []byte, shortBy int) *S3 {
 	t.Helper()
+	return rangedObjectWithChecksum(t, content, shortBy, "")
+}
+
+// rangedObjectWithChecksum is rangedObject whose attributes carry checksum, the
+// <Checksum> element GetObjectAttributes returns.
+func rangedObjectWithChecksum(t *testing.T, content []byte, shortBy int, checksum string) *S3 {
+	t.Helper()
 	ranged := regexp.MustCompile(`bytes=(\d+)-(\d+)`)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Has("attributes") {
 			w.Header().Set("Last-Modified", "Sun, 05 Nov 2026 02:14:22 GMT")
-			fmt.Fprintf(w, `<GetObjectAttributesResponse><ObjectSize>%d</ObjectSize></GetObjectAttributesResponse>`, len(content))
+			fmt.Fprintf(w, `<GetObjectAttributesResponse><ObjectSize>%d</ObjectSize>%s</GetObjectAttributesResponse>`, len(content), checksum)
 			return
 		}
 		if len(content) == 0 {

@@ -277,20 +277,11 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 		common.SetFileModificationTime(dstFile, head.LastModified.Time)
 	}
 
-	// Gentle mode summed each chunk from the file while its pages were still
-	// cached, so folding those is free. Reading the file back instead is what
-	// the pacing spent the whole transfer avoiding: those pages have been
-	// dropped on purpose, so the read would come straight off the disk, as
-	// large as the file, against whatever else is reading that disk.
-	local, computed := uint32(0), false
-	switch {
-	case ctx.GentleIO:
-		local, _ = common.FoldCRC32C(sums, lens)
-		computed = true
-	case readBackToVerify(forceChecksum, stored):
-		local, computed = common.GetFileCRC32C(dstFile), true
-	}
-	return settleDownload(forceChecksum, dstFile, ref.name, prefix, local, computed, want, stored)
+	// Every chunk summed what it wrote, so folding those is free. Reading the
+	// file back instead is a second pass as large as the file, and in gentle
+	// mode one straight off the disk: those pages were dropped on purpose.
+	local, total := common.FoldCRC32C(sums, lens)
+	return settleDownload(forceChecksum, dstFile, ref.name, prefix, local, total, size, want, stored)
 }
 
 // fetchChunk fetches one range into dstFileTemp at its own offset, and returns
@@ -342,9 +333,10 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 		sum, written, err = common.GentleWrite(fl, verifier, offset, r.Content, progressWriter(pb))
 	} else {
 		bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
-		var w io.Writer = bufWriter
+		chunkSum := common.NewChunkCRC32C(length)
+		var w io.Writer = io.MultiWriter(bufWriter, chunkSum)
 		if pb != nil {
-			w = io.MultiWriter(bufWriter, pb)
+			w = io.MultiWriter(bufWriter, pb, chunkSum)
 		}
 		written, err = io.Copy(w, r.Content)
 		if err == nil {
@@ -353,6 +345,7 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 			// reported failure.
 			err = bufWriter.Flush()
 		}
+		sum, _ = chunkSum.Sum()
 	}
 	if err != nil {
 		return 0, written, err
@@ -364,50 +357,38 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 	return sum, written, nil
 }
 
-// readBackToVerify says whether settling the download means reading the file
-// again.
+// settleDownload reports on the transfer, fails it when asked to, and caches
+// the file's CRC32C when it matches the object's, so the next rsync compares
+// without reading the file.
 //
-// Only when the caller asked to verify AND there is something to verify
-// against. OCI records a CRC32C only when the uploader asked for one, so an
-// object written by another tool has none -- and hashing 80 GiB to compare it
-// against nothing is a whole pass over the disk spent to print "skipped".
-//
-// Gentle mode does not consult this: it has the sums already, from the windows
-// its chunks summed while writing, so there is nothing to spend.
-func readBackToVerify(forceChecksum, stored bool) bool {
-	return forceChecksum && stored
-}
-
-// settleDownload reports on the transfer, and fails it when asked to.
-//
-// want is what the HEAD that started the download reported, and stored says
-// whether it reported one at all: OCI records a CRC32C only when the uploader
-// asked for one, and a missing checksum is not a checksum of zero.
-func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, computed bool, want uint32, stored bool) error {
+// local and total are what the chunks summed while writing. want is what the
+// HEAD that started the download reported, and stored says whether it reported
+// one at all: OCI records a CRC32C only when the uploader asked for one, and a
+// missing checksum is not a checksum of zero.
+func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, total, size int64, want uint32, stored bool) error {
 	if !stored {
 		// Nothing to check against. Saying so is the honest outcome: failing
 		// would reject every object written without a CRC32C, and passing in
 		// silence is what makes a -v flag worthless. Said only when the caller
-		// asked, since a gentle download measures itself either way and has no
-		// reason to report on a check nobody wanted.
+		// asked, since every download measures itself and has no reason to
+		// report on a check nobody wanted.
 		if forceChecksum {
 			logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
 		}
 		return nil
 	}
-	if !computed {
-		// Nothing was asked for, so nothing was measured.
-		return nil
+	if forceChecksum {
+		logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
+			dstFile, bucket, prefix, local, want)
 	}
-	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
-		dstFile, bucket, prefix, local, want)
-	if local != want {
-		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
+	if total != size || local != want {
+		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
+			dstFile, bucket, prefix, total, local, size, want)
 		logger.Info(module, log)
 		if !forceChecksum {
-			// Without -v a gentle download still sums itself, because the sums
-			// are free. Reporting a disagreement is worth doing; failing a
-			// transfer the caller did not ask to have verified is not.
+			// Every download sums itself, because the sums are free. Reporting
+			// a disagreement is worth doing; failing a transfer the caller did
+			// not ask to have verified is not.
 			return nil
 		}
 		return fmt.Errorf("%s", log)

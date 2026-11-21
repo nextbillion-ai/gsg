@@ -544,14 +544,14 @@ func gentleSums(content []byte, cuts ...int) ([]uint32, []int64) {
 	return sums, lens
 }
 
-func TestVerifyGentleDownloadAcceptsChunkSumsThatAddUpToTheObject(t *testing.T) {
+func TestVerifyDownloadAcceptsChunkSumsThatAddUpToTheObject(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<16)
 	path := filepath.Join(t.TempDir(), "input.osrm.geometry")
 	require.NoError(t, os.WriteFile(path, content, 0644))
 
 	for _, cuts := range [][]int{nil, {1}, {1 << 19, 3 << 18}} {
 		sums, lens := gentleSums(content, cuts...)
-		assert.NoError(t, verifyGentleDownload(true, path, "b", "o", gentleAttrs(content), sums, lens), "cuts %v", cuts)
+		assert.NoError(t, verifyDownload(true, path, "b", "o", gentleAttrs(content), sums, lens), "cuts %v", cuts)
 	}
 
 	// the sum is now served from the cache: the content below no longer adds up to it
@@ -562,7 +562,7 @@ func TestVerifyGentleDownloadAcceptsChunkSumsThatAddUpToTheObject(t *testing.T) 
 	assert.Equal(t, gentleAttrs(content).CRC32C, common.GetFileCRC32C(path))
 }
 
-func TestVerifyGentleDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
+func TestVerifyDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<12)
 	path := filepath.Join(t.TempDir(), "input.osrm.geometry")
 	require.NoError(t, os.WriteFile(path, content, 0644))
@@ -570,17 +570,17 @@ func TestVerifyGentleDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
 
 	sums, lens := gentleSums(content, 1000)
 	sums[1] ^= 1
-	assert.Error(t, verifyGentleDownload(true, path, "b", "o", attrs, sums, lens))
-	assert.NoError(t, verifyGentleDownload(false, path, "b", "o", attrs, sums, lens), "without -v a mismatch is reported, not fatal")
+	assert.Error(t, verifyDownload(true, path, "b", "o", attrs, sums, lens))
+	assert.NoError(t, verifyDownload(false, path, "b", "o", attrs, sums, lens), "without -v a mismatch is reported, not fatal")
 
 	sums, lens = gentleSums(content[:len(content)-1], 1000)
-	assert.Error(t, verifyGentleDownload(true, path, "b", "o", attrs, sums, lens))
+	assert.Error(t, verifyDownload(true, path, "b", "o", attrs, sums, lens))
 }
 
-func TestVerifyGentleDownloadOfAnEmptyObject(t *testing.T) {
+func TestVerifyDownloadOfAnEmptyObject(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty")
 	require.NoError(t, os.WriteFile(path, nil, 0644))
-	assert.NoError(t, verifyGentleDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0}))
+	assert.NoError(t, verifyDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0}))
 }
 
 // Chunks are separate range reads, and each must ask for the generation the
@@ -1034,4 +1034,99 @@ func TestDownloadRemovesATempFileItCouldNotSize(t *testing.T) {
 func TestCatFailureKeepsTheNotFoundText(t *testing.T) {
 	assert.Equal(t, "output object failed when create reader with storage: object doesn't exist",
 		catFailure(storage.ErrObjectNotExist))
+}
+
+// servedObject is enough of the JSON and XML APIs for Download: a lookup that
+// reports crc32c (base64, or none when empty), and range reads of content.
+func servedObject(t *testing.T, content []byte, crc string) *GCS {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("alt") == "json" {
+			w.Header().Set("Content-Type", "application/json")
+			field := ""
+			if crc != "" {
+				field = fmt.Sprintf(`"crc32c":"%s",`, crc)
+			}
+			fmt.Fprintf(w, `{"bucket":"b","name":"o","size":"%d","generation":"7",%s"updated":"2026-01-02T03:04:05Z"}`, len(content), field)
+			return
+		}
+		var start, end int
+		_, _ = fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
+		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(content[start : end+1])
+	}))
+	t.Cleanup(srv.Close)
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	return &GCS{client: client}
+}
+
+func crc32cBase64(b []byte) string {
+	var c [4]byte
+	binary.BigEndian.PutUint32(c[:], crc32.Checksum(b, common.Castagnoli))
+	return base64.StdEncoding.EncodeToString(c[:])
+}
+
+func downloadServed(t *testing.T, g *GCS, dst string, verify, gentle bool, chunkSize int64) error {
+	t.Helper()
+	pool := worker.New(2, false)
+	pool.Run()
+	defer pool.Close()
+	bars, err := bar.New()
+	require.NoError(t, err)
+	return g.Download("b", "o", dst, verify, system.RunContext{Pool: pool, Concurrency: 2, Bars: bars, ChunkSize: chunkSize, GentleIO: gentle})
+}
+
+// cachedCRC32C returns what GetFileCRC32C answers for path once its content no
+// longer adds up to it: only a cached value survives that.
+func cachedCRC32C(t *testing.T, path string) uint32 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("x"), int(info.Size())), 0644))
+	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+	return common.GetFileCRC32C(path)
+}
+
+// A download sums its chunks as it writes them, in either mode, so the next
+// rsync finds the file's CRC32C in the cache instead of reading the file back.
+func TestDownloadCachesTheCRC32CItSummedWhileWriting(t *testing.T) {
+	content := []byte("0123456789abcdefghijklm") // 23 bytes: chunks that do not divide it
+	want := crc32.Checksum(content, common.Castagnoli)
+	for _, gentle := range []bool{false, true} {
+		for _, verify := range []bool{false, true} {
+			for _, chunkSize := range []int64{0, 4, 7, 64} {
+				name := fmt.Sprintf("gentle=%v -v=%v chunk=%d", gentle, verify, chunkSize)
+				dst := filepath.Join(t.TempDir(), "o")
+				require.NoError(t, downloadServed(t, servedObject(t, content, crc32cBase64(content)), dst, verify, gentle, chunkSize), name)
+				got, err := os.ReadFile(dst)
+				require.NoError(t, err)
+				assert.Equal(t, string(content), string(got), name)
+				assert.Equal(t, want, cachedCRC32C(t, dst), name)
+			}
+		}
+	}
+}
+
+// A sum that disagrees with the object fails the download only under -v, as a
+// read-back did; without -v it is logged and the download succeeds as before.
+// Either way the disagreeing sum is not cached.
+func TestDownloadWhoseSumDisagreesIsNotCachedAndFailsOnlyUnderV(t *testing.T) {
+	content := []byte("0123456789abcdefghijklm")
+	wrong := crc32cBase64([]byte("something else"))
+	for _, gentle := range []bool{false, true} {
+		name := fmt.Sprintf("gentle=%v", gentle)
+		dst := filepath.Join(t.TempDir(), "o")
+		assert.Error(t, downloadServed(t, servedObject(t, content, wrong), dst, true, gentle, 4), name)
+
+		dst = filepath.Join(t.TempDir(), "o")
+		require.NoError(t, downloadServed(t, servedObject(t, content, wrong), dst, false, gentle, 4), name)
+		got, err := os.ReadFile(dst)
+		require.NoError(t, err)
+		assert.Equal(t, string(content), string(got), name)
+		assert.Equal(t, crc32.Checksum(content, common.Castagnoli), common.GetFileCRC32C(dst),
+			"%s: the file's own sum, read from the file, not the one that disagreed", name)
+	}
 }

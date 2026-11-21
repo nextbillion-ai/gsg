@@ -225,26 +225,55 @@ func TestGetObjectRangeReaderOfNothingReadsNothing(t *testing.T) {
 }
 
 func TestSettleDownloadSaysWhatItCanAndFailsOnlyWhenAsked(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "obj")
 	content := []byte("some bytes")
-	require.NoError(t, os.WriteFile(path, content, 0o644))
 	crc := crc32.Checksum(content, common.Castagnoli)
+	size := int64(len(content))
+	file := func() string {
+		path := filepath.Join(t.TempDir(), "obj")
+		require.NoError(t, os.WriteFile(path, content, 0o644))
+		return path
+	}
 
-	// nothing measured, because nothing was asked for
-	assert.NoError(t, settleDownload(false, path, "b", "o", 0, false, crc, true))
+	// the object carries no checksum: not comparable, not a failure, not cached
+	path := file()
+	assert.NoError(t, settleDownload(true, path, "b", "o", crc^1, size, size, 0, false))
+	assert.NoError(t, settleDownload(false, path, "b", "o", crc^1, size, size, 0, false))
+	assert.Equal(t, crc, common.GetFileCRC32C(path), "nothing was cached for an object without a checksum")
 
-	// the object carries no checksum: not comparable, and not a failure
-	assert.NoError(t, settleDownload(true, path, "b", "o", crc, true, 0, false))
+	// agreement, with and without -v: cached either way
+	for _, verify := range []bool{true, false} {
+		path = file()
+		assert.NoError(t, settleDownload(verify, path, "b", "o", crc, size, size, crc, true))
+		assert.Equal(t, crc, cachedCRC32C(t, path), "-v %t: the sum taken while writing is cached", verify)
+	}
 
-	// agreement
-	assert.NoError(t, settleDownload(true, path, "b", "o", crc, true, crc, true))
-	assert.Equal(t, crc, common.GetFileCRC32C(path), "a verified download is cached")
+	// disagreement: reported either way, fatal only under -v, never cached
+	for _, verify := range []bool{true, false} {
+		path = file()
+		err := settleDownload(verify, path, "b", "o", crc^1, size, size, crc, true)
+		if verify {
+			assert.Error(t, err)
+		} else {
+			assert.NoError(t, err, "without -v a mismatch is reported, not fatal")
+		}
+		assert.Equal(t, crc, common.GetFileCRC32C(path), "-v %t: a mismatching sum is not cached", verify)
+	}
 
-	// disagreement: reported either way, fatal only under -v
-	assert.Error(t, settleDownload(true, path, "b", "o", crc^1, true, crc, true))
-	assert.NoError(t, settleDownload(false, path, "b", "o", crc^1, true, crc, true),
-		"without -v a mismatch is reported, not fatal")
+	// a sum over fewer bytes than the object has is a mismatch, whatever it is
+	path = file()
+	assert.Error(t, settleDownload(true, path, "b", "o", crc, size-1, size, crc, true))
+	assert.Equal(t, crc, common.GetFileCRC32C(path))
+}
+
+// cachedCRC32C returns what GetFileCRC32C answers for path once its content no
+// longer adds up to it: only a cached value survives that.
+func cachedCRC32C(t *testing.T, path string) uint32 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("x"), int(info.Size())), 0o644))
+	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+	return common.GetFileCRC32C(path)
 }
 
 // A retried chunk reports its bytes twice unless the failed attempt is wound
@@ -312,14 +341,4 @@ func TestAGentleChunkWithNoProgressBarDoesNotPanic(t *testing.T) {
 	assert.Panics(t, func() {
 		_, _, _ = common.GentleWrite(again, verifier, 0, bytes.NewReader(content), absent)
 	}, "if this stops panicking, bar.IncrBy nil-checks and progressWriter is no longer load-bearing")
-}
-
-// Verifying an object that carries no checksum means hashing the whole file to
-// compare it against nothing, and then printing "skipped". On an 80 GiB object
-// written by another tool that is a full pass over the disk for no answer.
-func TestAVerifiedDownloadOnlyReadsBackWhenThereIsSomethingToCompare(t *testing.T) {
-	assert.True(t, readBackToVerify(true, true), "-v against an object that has a checksum")
-	assert.False(t, readBackToVerify(true, false), "-v against an object that has none")
-	assert.False(t, readBackToVerify(false, true), "no -v was asked for")
-	assert.False(t, readBackToVerify(false, false))
 }

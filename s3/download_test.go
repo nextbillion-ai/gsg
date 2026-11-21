@@ -1,7 +1,9 @@
 package s3
 
 import (
+	"bytes"
 	"fmt"
+	"hash/crc32"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/nextbillion-ai/gsg/bar"
+	"github.com/nextbillion-ai/gsg/common"
+	"github.com/nextbillion-ai/gsg/system"
+	"github.com/nextbillion-ai/gsg/worker"
 )
 
 // A temp file that cannot be created must fail the download with the reason.
@@ -86,4 +93,81 @@ func TestDownloadRemovesATempFileItCouldNotSize(t *testing.T) {
 	require.Error(t, download(t, s, 4, filepath.Join(dir, "o.bin")))
 	left, _ := os.ReadDir(dir)
 	assert.Empty(t, left)
+}
+
+func fullObjectChecksum(crc uint32) string {
+	return `<Checksum><ChecksumCRC32C>` + crc32cToBase64(crc) + `</ChecksumCRC32C><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>`
+}
+
+func downloadVerified(t *testing.T, s *S3, chunkSize int64, verify, gentle bool, dst string) error {
+	t.Helper()
+	bars, err := bar.New()
+	require.NoError(t, err)
+	pool := worker.New(2, false)
+	pool.Run()
+	defer pool.Close()
+	return s.Download("b", "o.bin", dst, verify, system.RunContext{Pool: pool, Concurrency: 2, Bars: bars, ChunkSize: chunkSize, GentleIO: gentle})
+}
+
+// cachedCRC32C returns what GetFileCRC32C answers for path once its content no
+// longer adds up to it: only a cached value survives that.
+func cachedCRC32C(t *testing.T, path string) uint32 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("x"), int(info.Size())), 0o644))
+	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+	return common.GetFileCRC32C(path)
+}
+
+// Every chunk but the last fetches one byte of the next (the range is
+// inclusive); that byte must be summed once, by the chunk it belongs to.
+func TestDownloadCachesTheCRC32CItSummedWhileWriting(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789"), 100)
+	want := crc32.Checksum(content, common.Castagnoli)
+	for _, gentle := range []bool{false, true} {
+		for _, verify := range []bool{false, true} {
+			for _, chunkSize := range []int64{0, 64, 333, 1000} {
+				name := fmt.Sprintf("gentle=%v -v=%v chunk=%d", gentle, verify, chunkSize)
+				dst := filepath.Join(t.TempDir(), "o.bin")
+				require.NoError(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(want)), chunkSize, verify, gentle, dst), name)
+				got, err := os.ReadFile(dst)
+				require.NoError(t, err)
+				assert.Equal(t, content, got, name)
+				assert.Equal(t, want, cachedCRC32C(t, dst), name)
+			}
+		}
+	}
+}
+
+func TestDownloadWhoseSumDisagreesIsNotCachedAndFailsOnlyUnderV(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789"), 100)
+	real := crc32.Checksum(content, common.Castagnoli)
+	for _, gentle := range []bool{false, true} {
+		name := fmt.Sprintf("gentle=%v", gentle)
+		dst := filepath.Join(t.TempDir(), "o.bin")
+		assert.Error(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(real^1)), 333, true, gentle, dst), name)
+
+		dst = filepath.Join(t.TempDir(), "o.bin")
+		require.NoError(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(real^1)), 333, false, gentle, dst), name)
+		got, err := os.ReadFile(dst)
+		require.NoError(t, err)
+		assert.Equal(t, content, got, name)
+		assert.Equal(t, real, common.GetFileCRC32C(dst), "%s: the disagreeing sum is not cached", name)
+	}
+}
+
+// An object with no whole-object CRC32C -- none at all, or the composite kind a
+// multipart upload gets -- has nothing to match, so nothing is cached for it.
+func TestDownloadOfAnObjectWithoutACRC32CCachesNothing(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789"), 100)
+	real := crc32.Checksum(content, common.Castagnoli)
+	composite := `<Checksum><ChecksumCRC32C>` + crc32cToBase64(real) + `-2</ChecksumCRC32C><ChecksumType>COMPOSITE</ChecksumType></Checksum>`
+	for _, checksum := range []string{"", composite} {
+		for _, verify := range []bool{false, true} {
+			dst := filepath.Join(t.TempDir(), "o.bin")
+			require.NoError(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, checksum), 333, verify, false, dst))
+			assert.NotEqual(t, real, cachedCRC32C(t, dst), "checksum %q -v=%v: nothing cached", checksum, verify)
+		}
+	}
 }

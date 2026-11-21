@@ -472,7 +472,8 @@ func (g *GCS) Download(
 			logger.Info(module, "%s", msg)
 		}
 	}
-	// gentle mode sums each chunk from the file while its pages are still cached
+	// Each chunk's CRC32C, taken while it is written, so the file's is known
+	// without reading it back.
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
 	var shortChunks atomic.Int64
@@ -564,7 +565,8 @@ func (g *GCS) Download(
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 					defer func() { _ = bufWriter.Flush() }()
 
-					if gotBytes, err = io.Copy(io.MultiWriter(bufWriter, pb), rc); err != nil {
+					sum := common.NewChunkCRC32C(length)
+					if gotBytes, err = io.Copy(io.MultiWriter(bufWriter, pb, sum), rc); err != nil {
 						fail("download object failed when write to offet with %s", err)
 						return
 					}
@@ -573,6 +575,7 @@ func (g *GCS) Download(
 						fail("download object failed when flush buffer with %s", err)
 						return
 					}
+					chunkSums[i], chunkLens[i] = sum.Sum()
 				}
 			},
 		)
@@ -605,23 +608,21 @@ func (g *GCS) Download(
 		return err
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-	if ctx.GentleIO {
-		return verifyGentleDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
-	}
 	// Settled against the generation the chunks read, not a fresh lookup by
 	// name: an overwrite landing after the last chunk would otherwise have a
 	// correct copy of the old generation reported as corrupt.
-	if !forceChecksum {
-		return nil
-	}
-	return mustMatchCRC32C(dstFile, bucket, prefix, attrs.CRC32C)
+	return verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
 }
 
-// verifyGentleDownload settles a gentle download from the sums its chunks took
-// while writing. The file is not read again: gentle mode has been asking the
-// kernel to drop it from the page cache all along, so that read would come from
-// disk, as large as the file, against whatever else is reading that disk.
-func verifyGentleDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) error {
+// verifyDownload settles a download from the sums its chunks took while
+// writing, and caches the file's CRC32C when it matches the object's, so the
+// next rsync compares without reading the file. The file is not read again:
+// that read is as large as the file, and in gentle mode it would come from
+// disk, since the pages have been dropped from the cache all along.
+//
+// Without -v a mismatch is logged and the download still succeeds, as it did
+// before anything was summed; it is just not cached.
+func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) error {
 	crc, total := common.FoldCRC32C(sums, lens)
 	if total != attrs.Size || crc != attrs.CRC32C {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",

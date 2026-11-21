@@ -824,6 +824,10 @@ func (s *S3) Download(
 		_ = os.Remove(dstFileTemp)
 		return err
 	}
+	// Each chunk's CRC32C, taken while it is written, so the file's is known
+	// without reading it back.
+	chunkSums := make([]uint32, chunkNumber)
+	chunkLens := make([]int64, chunkNumber)
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -880,11 +884,15 @@ func (s *S3) Download(
 				}
 
 				var gotBytes int64
+				// length, not wantBytes: the byte this chunk fetches past its
+				// share is the next chunk's first, and summed there.
+				sum := common.NewChunkCRC32C(length)
 				defer func() {
 					// a chunk that failed, or was stopped, has already said so
 					if ff.Stopped() {
 						return
 					}
+					chunkSums[i], chunkLens[i] = sum.Sum()
 					if gotBytes != wantBytes {
 						logger.Info(module, "download of s3://%s/%s got %d bytes at offset %d, expected %d", bucket, prefix, gotBytes, startByte, wantBytes)
 						shortChunks.Add(1)
@@ -907,6 +915,7 @@ func (s *S3) Download(
 								fail("download object failed when write: %s", writeErr)
 								return
 							}
+							_, _ = sum.Write(buf[:n])
 							if _, writeErr := pb.Write(buf[:n]); writeErr != nil {
 								// Progress bar write error, non-fatal
 							}
@@ -936,7 +945,7 @@ func (s *S3) Download(
 					defer func() { _ = bufWriter.Flush() }()
 
 					var we error
-					if gotBytes, we = io.Copy(io.MultiWriter(bufWriter, pb), oo.Body); we != nil {
+					if gotBytes, we = io.Copy(io.MultiWriter(bufWriter, pb, sum), oo.Body); we != nil {
 						fail("download object failed when write to offet with %s", we)
 						return
 					}
@@ -978,12 +987,62 @@ func (s *S3) Download(
 		return err
 	}
 	common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
+	crc, total := common.FoldCRC32C(chunkSums, chunkLens)
+	if !forceChecksum {
+		settleUnverifiedDownload(dstFile, bucket, prefix, attrs, size, crc, total)
+		return nil
+	}
 	// The point of -v. forceChecksum only ever set ChecksumMode on the request
 	// and then discarded the answer; MustEqualCRC32C was defined and called
 	// from nowhere, so the flag verified nothing on this backend.
-	if err = s.MustEqualCRC32C(forceChecksum, dstFile, bucket, prefix); err != nil {
+	return s.verifyDownload(dstFile, bucket, prefix, size, crc, total)
+}
+
+// settleUnverifiedDownload caches the CRC32C a download summed while writing,
+// when it matches the object's, so the next rsync compares without reading the
+// file. Nothing was asked to be verified, so a mismatch is logged and nothing
+// else: the download succeeds as it did before anything was summed.
+//
+// An object without a whole-object CRC32C has nothing to match, so nothing is
+// cached for it.
+func settleUnverifiedDownload(dstFile, bucket, prefix string, attrs *S3Attributes, size int64, crc uint32, total int64) {
+	want, ok := crc32cOf(attrs)
+	if !ok {
+		return
+	}
+	if total != size || crc != want {
+		logger.Info(module, "CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
+			dstFile, bucket, prefix, total, crc, size, want)
+		return
+	}
+	common.StoreFileCRC32C(dstFile, crc)
+}
+
+// verifyDownload is MustEqualCRC32C for a file whose CRC32C was summed while it
+// was written: the object is looked up again and compared as before, but
+// against that sum rather than a second read of the whole file.
+func (s *S3) verifyDownload(dstFile, bucket, prefix string, size int64, crc uint32, total int64) error {
+	attr, err := s.S3Attrs(bucket, prefix)
+	if err != nil {
 		return err
 	}
+	if attr == nil {
+		return common.Caused(fmt.Sprintf("cannot verify s3://%s/%s: no such object", bucket, prefix), common.ErrNoSuchObject)
+	}
+	want, ok := crc32cOf(attr)
+	if !ok {
+		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
+		return nil
+	}
+	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
+		dstFile, bucket, prefix, crc, want)
+	if total != size || crc != want {
+		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
+		logger.Info(module, log)
+		return errors.New(log)
+	}
+	common.StoreFileCRC32C(dstFile, crc)
+	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 	return nil
 }
 
