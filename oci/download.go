@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"sync"
 
 	"github.com/nextbillion-ai/gsg/bar"
 	"github.com/nextbillion-ai/gsg/common"
@@ -75,52 +74,13 @@ func rangeHeader(offset, length int64) (string, bool) {
 	}
 }
 
-// runChunks runs one job per chunk, bounded, and waits for all of them.
-//
-// Chunks go to the shared pool when there is one, at depth 1 -- the depth gs
-// and s3 submit theirs to, so a download running as a depth 0 job cannot end
-// up waiting on its own chunks.
-//
-// A library caller need not pass a pool at all: jam-core builds a
-// system.RunContext with a ChunkSize and nothing else, which is safe today
-// only because this backend never touched the pool. Such a caller gets a local
-// bound rather than a nil dereference -- and rather than a serial download,
-// which would lose it the point of the change.
-func runChunks(pool *worker.Pool, chunks int, job func(i int)) {
-	var wg sync.WaitGroup
-	run := func(i int) func() {
-		return func() {
-			defer wg.Done()
-			job(i)
-		}
-	}
-	if pool != nil {
-		for i := 0; i < chunks; i++ {
-			wg.Add(1)
-			pool.AddWithDepth(1, run(i))
-		}
-		wg.Wait()
-		return
-	}
-	bound := common.PartConcurrency(int64(chunks))
-	if bound < 1 {
-		bound = 1
-	}
-	sem := make(chan struct{}, bound)
-	for i := 0; i < chunks; i++ {
-		// The slot is taken before the goroutine is started, not inside it.
-		// Acquiring it inside bounds the fetches but still creates a goroutine
-		// per chunk up front, and the chunk count follows the object: 80 GiB
-		// at a 1 MiB --chunk-size is 81920 of them, parked, before the first
-		// byte moves.
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(fn func()) {
-			defer func() { <-sem }()
-			fn()
-		}(run(i))
-	}
-	wg.Wait()
+// runChunks runs one job per chunk, bounded, and waits for all of them; see
+// worker.RunChunks. A library caller need not pass a pool at all: jam-core
+// builds a system.RunContext with a ChunkSize and nothing else, and gets a
+// local bound -- its Concurrency, or common.PartConcurrency without one --
+// rather than a nil dereference or a serial download.
+func runChunks(pool *worker.Pool, chunks, bound int, job func(i int)) {
+	worker.RunChunks(pool, chunks, bound, job)
 }
 
 // fetchWithRetry runs one chunk again rather than the whole transfer.
@@ -242,7 +202,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	sums := make([]uint32, chunks)
 	lens := make([]int64, chunks)
 	errs := make([]error, chunks)
-	runChunks(ctx.Pool, chunks, func(i int) {
+	runChunks(ctx.Pool, chunks, ctx.Concurrency, func(i int) {
 		// A panic in one chunk would otherwise take the process down and leave
 		// the temporary file behind; as an error it goes out the same way a
 		// failed request does.
@@ -268,6 +228,18 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 		}
 	}
 
+	// Every chunk summed what it wrote, so folding those is free. Reading the
+	// file back instead is a second pass as large as the file, and in gentle
+	// mode one straight off the disk: those pages were dropped on purpose.
+	// Settled before the rename, so a download that does not match leaves
+	// whatever was at dstFile as it was.
+	local, total := common.FoldCRC32C(sums, lens)
+	keep, cache, err := settleDownload(forceChecksum, dstFile, ref.name, prefix, local, total, size, want, stored)
+	if !keep {
+		_ = os.Remove(dstFileTemp)
+		return err
+	}
+
 	if err = os.Rename(dstFileTemp, dstFile); err != nil {
 		logger.Info(module, "cannot move %s into place: %s", dstFileTemp, err)
 		_ = os.Remove(dstFileTemp)
@@ -276,12 +248,10 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	if head.LastModified != nil {
 		common.SetFileModificationTime(dstFile, head.LastModified.Time)
 	}
-
-	// Every chunk summed what it wrote, so folding those is free. Reading the
-	// file back instead is a second pass as large as the file, and in gentle
-	// mode one straight off the disk: those pages were dropped on purpose.
-	local, total := common.FoldCRC32C(sums, lens)
-	return settleDownload(forceChecksum, dstFile, ref.name, prefix, local, total, size, want, stored)
+	if cache {
+		common.StoreFileCRC32C(dstFile, local)
+	}
+	return nil
 }
 
 // fetchChunk fetches one range into dstFileTemp at its own offset, and returns
@@ -357,15 +327,22 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 	return sum, written, nil
 }
 
-// settleDownload reports on the transfer, fails it when asked to, and caches
-// the file's CRC32C when it matches the object's, so the next rsync compares
+// settleDownload reports on the transfer before its temp file is renamed, fails
+// it when asked to, and says whether the file goes into place and whether its
+// CRC32C, matching the object's, is worth caching so the next rsync compares
 // without reading the file.
+//
+// A file that does not match never goes into place. Under -v that is the
+// download's error; without -v it is logged and the download returns nil, but
+// whatever was at dstFile -- the previous copy, or nothing -- stays, rather
+// than bytes known to be wrong stamped with the object's time, which a later
+// rsync without -v trusts.
 //
 // local and total are what the chunks summed while writing. want is what the
 // HEAD that started the download reported, and stored says whether it reported
 // one at all: OCI records a CRC32C only when the uploader asked for one, and a
 // missing checksum is not a checksum of zero.
-func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, total, size int64, want uint32, stored bool) error {
+func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, total, size int64, want uint32, stored bool) (keep, cache bool, err error) {
 	if !stored {
 		// Nothing to check against. Saying so is the honest outcome: failing
 		// would reject every object written without a CRC32C, and passing in
@@ -375,7 +352,7 @@ func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local ui
 		if forceChecksum {
 			logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
 		}
-		return nil
+		return true, false, nil
 	}
 	if forceChecksum {
 		logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
@@ -384,18 +361,18 @@ func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local ui
 	if total != size || local != want {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
 			dstFile, bucket, prefix, total, local, size, want)
-		logger.Info(module, log)
 		if !forceChecksum {
 			// Every download sums itself, because the sums are free. Reporting
 			// a disagreement is worth doing; failing a transfer the caller did
 			// not ask to have verified is not.
-			return nil
+			logger.Info(module, "%s %s is left as it was.", log, dstFile)
+			return false, false, nil
 		}
-		return fmt.Errorf("%s", log)
+		logger.Info(module, log)
+		return false, false, fmt.Errorf("%s", log)
 	}
-	common.StoreFileCRC32C(dstFile, local)
 	if forceChecksum {
 		logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 	}
-	return nil
+	return true, true, nil
 }

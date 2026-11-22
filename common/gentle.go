@@ -79,7 +79,7 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 	}
 
 	for {
-		n, readErr := src.Read(buf)
+		n, readErr := fillBuffer(src, buf)
 		if n > 0 {
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return 0, written, werr
@@ -136,6 +136,21 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 		gentleAdviseDrop(dst, offset, written)
 	}
 	return sum.Sum32(), written, nil
+}
+
+// fillBuffer reads into buf until it is full or src ends, so each write is
+// buf's size rather than whatever one Read returned. Over HTTP/1.1 a Read of a
+// response body returns one TLS record, 16 KiB at most; written one at a time
+// from 16 ranged chunks into one file, an 80 GB download spent 734-912 s of
+// kernel CPU, against 425-470 s filled.
+//
+// The end of src is io.EOF with whatever was read, as from a plain Read.
+func fillBuffer(src io.Reader, buf []byte) (int, error) {
+	n, err := io.ReadFull(src, buf)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return n, err
 }
 
 // FoldCRC32C returns the CRC32C of the pieces laid end to end, and their total

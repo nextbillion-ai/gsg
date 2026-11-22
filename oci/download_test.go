@@ -129,7 +129,7 @@ func TestRunChunksRunsEveryChunkOnceAndBoundsThem(t *testing.T) {
 		var mu sync.Mutex
 		seen := map[int]int{}
 		var inFlight, peak int64
-		runChunks(pool, chunks, func(i int) {
+		runChunks(pool, chunks, 0, func(i int) {
 			n := atomic.AddInt64(&inFlight, 1)
 			for {
 				old := atomic.LoadInt64(&peak)
@@ -173,7 +173,7 @@ func TestRunChunksWithoutAPoolStillRunsInParallel(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		runChunks(nil, chunks, func(i int) {
+		runChunks(nil, chunks, 0, func(i int) {
 			if i < 2 {
 				started <- struct{}{}
 				<-proceed
@@ -198,7 +198,7 @@ func TestRunChunksWithoutAPoolDoesNotStartAGoroutinePerChunk(t *testing.T) {
 	const chunks = 5000
 	base := runtime.NumGoroutine()
 	var peak int64
-	runChunks(nil, chunks, func(int) {
+	runChunks(nil, chunks, 0, func(int) {
 		grew := int64(runtime.NumGoroutine() - base)
 		for {
 			old := atomic.LoadInt64(&peak)
@@ -228,41 +228,41 @@ func TestSettleDownloadSaysWhatItCanAndFailsOnlyWhenAsked(t *testing.T) {
 	content := []byte("some bytes")
 	crc := crc32.Checksum(content, common.Castagnoli)
 	size := int64(len(content))
-	file := func() string {
-		path := filepath.Join(t.TempDir(), "obj")
-		require.NoError(t, os.WriteFile(path, content, 0o644))
-		return path
+	const path = "/nonexistent/obj" // settled before the rename: no file is read
+
+	// the object carries no checksum: not comparable, not a failure, put in
+	// place but not cached
+	for _, verify := range []bool{true, false} {
+		keep, cache, err := settleDownload(verify, path, "b", "o", crc^1, size, size, 0, false)
+		assert.NoError(t, err)
+		assert.True(t, keep, "-v %t: nothing to compare with is not a mismatch", verify)
+		assert.False(t, cache, "-v %t: nothing is cached for an object without a checksum", verify)
 	}
 
-	// the object carries no checksum: not comparable, not a failure, not cached
-	path := file()
-	assert.NoError(t, settleDownload(true, path, "b", "o", crc^1, size, size, 0, false))
-	assert.NoError(t, settleDownload(false, path, "b", "o", crc^1, size, size, 0, false))
-	assert.Equal(t, crc, common.GetFileCRC32C(path), "nothing was cached for an object without a checksum")
-
-	// agreement, with and without -v: cached either way
+	// agreement, with and without -v: in place and cached either way
 	for _, verify := range []bool{true, false} {
-		path = file()
-		assert.NoError(t, settleDownload(verify, path, "b", "o", crc, size, size, crc, true))
-		assert.Equal(t, crc, cachedCRC32C(t, path), "-v %t: the sum taken while writing is cached", verify)
+		keep, cache, err := settleDownload(verify, path, "b", "o", crc, size, size, crc, true)
+		assert.NoError(t, err)
+		assert.True(t, keep, "-v %t", verify)
+		assert.True(t, cache, "-v %t: the sum taken while writing is cached", verify)
 	}
 
-	// disagreement: reported either way, fatal only under -v, never cached
+	// disagreement: reported either way, fatal only under -v, never put in place
 	for _, verify := range []bool{true, false} {
-		path = file()
-		err := settleDownload(verify, path, "b", "o", crc^1, size, size, crc, true)
+		keep, cache, err := settleDownload(verify, path, "b", "o", crc^1, size, size, crc, true)
 		if verify {
 			assert.Error(t, err)
 		} else {
 			assert.NoError(t, err, "without -v a mismatch is reported, not fatal")
 		}
-		assert.Equal(t, crc, common.GetFileCRC32C(path), "-v %t: a mismatching sum is not cached", verify)
+		assert.False(t, keep, "-v %t: a mismatching file does not replace the destination", verify)
+		assert.False(t, cache, "-v %t: a mismatching sum is not cached", verify)
 	}
 
 	// a sum over fewer bytes than the object has is a mismatch, whatever it is
-	path = file()
-	assert.Error(t, settleDownload(true, path, "b", "o", crc, size-1, size, crc, true))
-	assert.Equal(t, crc, common.GetFileCRC32C(path))
+	keep, _, err := settleDownload(true, path, "b", "o", crc, size-1, size, crc, true)
+	assert.Error(t, err)
+	assert.False(t, keep)
 }
 
 // cachedCRC32C returns what GetFileCRC32C answers for path once its content no
@@ -332,13 +332,13 @@ func TestAGentleChunkWithNoProgressBarDoesNotPanic(t *testing.T) {
 	require.NoError(t, werr)
 	assert.Equal(t, int64(len(content)), n)
 
-	// And the hazard the helper exists to prevent, pinned rather than
-	// described: handing the same nil bar over directly is a write to a
-	// non-nil interface holding a nil pointer.
+	// The same nil bar handed over directly is a non-nil interface holding a
+	// nil pointer; the bar accepts that too, since gs and s3 pass theirs on
+	// without the helper.
 	again, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer func() { _ = again.Close() }()
-	assert.Panics(t, func() {
+	assert.NotPanics(t, func() {
 		_, _, _ = common.GentleWrite(again, verifier, 0, bytes.NewReader(content), absent)
-	}, "if this stops panicking, bar.IncrBy nil-checks and progressWriter is no longer load-bearing")
+	})
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
+	"github.com/nextbillion-ai/gsg/worker"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -444,9 +445,9 @@ func (g *GCS) Download(
 	// chunk opened after the overwrite still reads the old generation where
 	// versioning keeps it, and fails where it does not.
 	obj := g.client.Bucket(bucket).Object(prefix).Generation(attrs.Generation)
-	var pb *bar.ProgressBar
+	// nil without Bars: no progress output
+	pb := ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
 	var wg sync.WaitGroup
-	var once sync.Once
 	dstFileTemp := common.GetTempFile(dstFile)
 	// Every chunk opens this file, so it has to exist before any is fetched.
 	folder, _ := common.ParseFile(dstFile)
@@ -477,6 +478,7 @@ func (g *GCS) Download(
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
 	var shortChunks atomic.Int64
+	submit := worker.Submitter(ctx.Pool, chunkNumber, ctx.Concurrency)
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -488,15 +490,19 @@ func (g *GCS) Download(
 		}
 
 		wg.Add(1)
-		ctx.Pool.AddWithDepth(1,
+		submit(
 			func() {
 				defer func() {
 					wg.Done()
 				}()
+				// A panic fails this download like any chunk error, rather
+				// than ending the process from inside a pool worker.
+				defer func() {
+					if r := recover(); r != nil {
+						fail("%s", common.PanicError(fmt.Sprintf("download object panicked in chunk %d", i), r))
+					}
+				}()
 
-				once.Do(func() {
-					pb = ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
-				})
 				if ff.Stopped() {
 					return
 				}
@@ -602,42 +608,55 @@ func (g *GCS) Download(
 		_ = tmpFile.Close()
 	}
 
+	// Settled before the rename, so a download that does not match leaves
+	// whatever was at dstFile as it was. Against the generation the chunks
+	// read, not a fresh lookup by name: an overwrite landing after the last
+	// chunk would otherwise have a correct copy of the old generation reported
+	// as corrupt.
+	crc, matches, err := verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
+	if !matches {
+		_ = os.Remove(dstFileTemp)
+		return err
+	}
+
 	err = os.Rename(dstFileTemp, dstFile)
 	if err != nil {
 		logger.Info(module, "download object failed when rename file with %s", err)
 		return err
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-	// Settled against the generation the chunks read, not a fresh lookup by
-	// name: an overwrite landing after the last chunk would otherwise have a
-	// correct copy of the old generation reported as corrupt.
-	return verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
+	common.StoreFileCRC32C(dstFile, crc)
+	return nil
 }
 
 // verifyDownload settles a download from the sums its chunks took while
-// writing, and caches the file's CRC32C when it matches the object's, so the
-// next rsync compares without reading the file. The file is not read again:
-// that read is as large as the file, and in gentle mode it would come from
-// disk, since the pages have been dropped from the cache all along.
+// writing, before the temp file is renamed. It returns the file's CRC32C, for
+// the caller to cache once the file has its name and time so the next rsync
+// compares without reading the file, and whether it matches the object. The
+// file is not read again: that read is as large as the file, and in gentle
+// mode it would come from disk, since the pages have been dropped all along.
 //
-// Without -v a mismatch is logged and the download still succeeds, as it did
-// before anything was summed; it is just not cached.
-func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) error {
+// A file that does not match is never renamed into place. Under -v that is the
+// download's error. Without -v the mismatch is logged and the download returns
+// nil, as it did before anything was summed, but whatever was at dstFile --
+// the previous copy, or nothing -- stays: replacing it would stamp bytes known
+// to be wrong with the object's time, which a later rsync without -v trusts.
+func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) (crc uint32, matches bool, err error) {
 	crc, total := common.FoldCRC32C(sums, lens)
 	if total != attrs.Size || crc != attrs.CRC32C {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
 			dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
-		logger.Info(module, log)
 		if !forceChecksum {
-			return nil
+			logger.Info(module, "%s %s is left as it was.", log, dstFile)
+			return crc, false, nil
 		}
-		return errors.New(log)
+		logger.Info(module, log)
+		return crc, false, errors.New(log)
 	}
-	common.StoreFileCRC32C(dstFile, crc)
 	if forceChecksum {
 		logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 	}
-	return nil
+	return crc, true, nil
 }
 
 // DoAttemptUnlock takes generation as input and returns potential error
@@ -763,7 +782,7 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	}
 	size, modTime := before.Size(), before.ModTime()
 
-	// progress bar
+	// progress bar; nil without Bars, which counts nothing
 	pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
 
 	// upload file
@@ -891,11 +910,19 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 		abort()
 	}
 	var wg sync.WaitGroup
+	submit := worker.Submitter(ctx.Pool, parts, ctx.Concurrency)
 	for i := 0; i < parts; i++ {
 		i := i
 		wg.Add(1)
-		ctx.Pool.AddWithDepth(1, func() {
+		submit(func() {
 			defer wg.Done()
+			// A panic fails the upload, and its parts are cleaned up, like
+			// any other failed part.
+			defer func() {
+				if r := recover(); r != nil {
+					fail(i, common.PanicError(fmt.Sprintf("upload object panicked in part %d", i), r))
+				}
+			}()
 			off := int64(i) * partSize
 			length := partSize
 			if off+length > size {

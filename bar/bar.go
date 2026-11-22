@@ -76,8 +76,14 @@ func (b *Container) printer() {
 	}
 }
 
-// New creates a ProgressBar
+// New creates a ProgressBar. A nil container is no progress output at all: it
+// hands back a nil bar, which counts nothing and prints nothing. Library
+// callers pass a RunContext without Bars, and a transfer must not depend on
+// having somewhere to report to.
 func (b *Container) New(total int64, prepend string) *ProgressBar {
+	if b == nil {
+		return nil
+	}
 	bar := &ProgressBar{
 		Container:   b,
 		Progress:    0,
@@ -100,6 +106,9 @@ func (b *Container) New(total int64, prepend string) *ProgressBar {
 
 // IncrBy increate progress by an number
 func (p *ProgressBar) IncrBy(delta int64) {
+	if p == nil {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -115,7 +124,8 @@ func (p *ProgressBar) IncrBy(delta int64) {
 	}
 }
 
-// Write implement io.Writer
+// Write implement io.Writer. A nil bar accepts and discards, so it can be
+// handed on as an io.Writer, where it is no longer comparable to nil.
 func (p *ProgressBar) Write(bs []byte) (n int, err error) {
 	n = len(bs)
 	if n > 0 {
