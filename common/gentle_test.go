@@ -198,7 +198,7 @@ func TestGentleWriteShorterThanAWindowIsStillPaced(t *testing.T) {
 	for _, d := range *slept {
 		total += d
 	}
-	assert.Equal(t, gentlePause*size/GentleWindow, total, "the rate must not depend on the chunk size")
+	assert.Equal(t, GentlePause*size/GentleWindow, total, "the rate must not depend on the chunk size")
 
 	// The window it wrote has to be asked for twice: once as the window, and
 	// once more by the request that closes the call, or the pages only ever
@@ -231,7 +231,7 @@ func TestGentleWritePacesAtTheSameRateWhateverTheChunkSize(t *testing.T) {
 		for _, d := range *slept {
 			total += d
 		}
-		assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total, "size %d", size)
+		assert.Equal(t, GentlePause*time.Duration(size)/GentleWindow, total, "size %d", size)
 	}
 }
 
@@ -258,4 +258,31 @@ func TestGentleWriteAsksForEveryByteTwice(t *testing.T) {
 	for mb, times := range asked {
 		assert.GreaterOrEqual(t, times, 2, "MB %d is asked for %d time(s), so it only starts writeback", mb, times)
 	}
+}
+
+// A zero pause turns the pacing off and nothing else: every window is still
+// dropped, and the checksum still covers what landed.
+func TestGentleWriteWithoutPauseStillDrops(t *testing.T) {
+	slept, dropped, _ := withRecordedPacing(t)
+	pause := GentlePause
+	GentlePause = 0
+	t.Cleanup(func() { GentlePause = pause })
+
+	const size = 3*GentleWindow + 1234
+	crc, n := gentleWriteOf(t, size, 0)
+	require.Equal(t, int64(size), n)
+
+	var total time.Duration
+	for _, d := range *slept {
+		total += d
+	}
+	assert.Zero(t, total, "no pause was asked for")
+	assert.Equal(t, crc32.Checksum(bytes.Repeat([]byte("z"), size), Castagnoli), crc)
+	covered := int64(0)
+	for _, d := range *dropped {
+		if d.offset+d.length > covered && d.offset <= covered {
+			covered = d.offset + d.length
+		}
+	}
+	assert.Equal(t, int64(size), covered, "every byte written is asked to leave the page cache: %v", *dropped)
 }

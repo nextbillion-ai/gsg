@@ -103,7 +103,7 @@ func TestGentleSectionDropsEveryByteItReadsAndPacesThem(t *testing.T) {
 	for _, d := range *slept {
 		total += d
 	}
-	assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total,
+	assert.Equal(t, GentlePause*time.Duration(size)/GentleWindow, total,
 		"the rate must not depend on how much each Read returned")
 }
 
@@ -183,7 +183,7 @@ func TestGentleSectionDoesNotDependOnTheReadSize(t *testing.T) {
 	for _, d := range *slept {
 		total += d
 	}
-	assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total)
+	assert.Equal(t, GentlePause*time.Duration(size)/GentleWindow, total)
 }
 
 // Pause and Drop are separate because an upload wants them in different
@@ -258,7 +258,7 @@ func TestGentleSectionReleasesItsTailUnderARealRequest(t *testing.T) {
 		for _, d := range *slept {
 			total += d
 		}
-		assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total, "size %d: paced at the usual rate", size)
+		assert.Equal(t, GentlePause*time.Duration(size)/GentleWindow, total, "size %d: paced at the usual rate", size)
 	}
 }
 
@@ -312,7 +312,7 @@ func TestARewoundBodyPacesItsColdReread(t *testing.T) {
 	for _, d := range *slept {
 		total += d
 	}
-	assert.Equal(t, gentlePause*time.Duration(size)/GentleWindow, total,
+	assert.Equal(t, GentlePause*time.Duration(size)/GentleWindow, total,
 		"a retry re-reads from disk and has to be paced like any other cold read")
 }
 

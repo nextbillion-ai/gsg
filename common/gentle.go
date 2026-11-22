@@ -11,9 +11,14 @@ import (
 // and asks the kernel to drop it.
 const GentleWindow = 10 * 1024 * 1024
 
-// gentlePause is how long a gentle transfer stands aside per window written,
-// so that whatever else is using the disk gets a turn.
-const gentlePause = 20 * time.Millisecond
+// DefaultGentlePause is how long a gentle transfer stands aside per window it
+// moves, so that whatever else is using the disk gets a turn.
+const DefaultGentlePause = 20 * time.Millisecond
+
+// GentlePause is the pause a gentle transfer takes per GentleWindow. Zero
+// keeps the rest of gentle mode -- the page-cache drops and the checksum taken
+// while the pages are still cached -- and only stops the pacing.
+var GentlePause = DefaultGentlePause
 
 // Seams for the tests. The advice is a no-op on every platform but linux, and
 // a sleep is not observable, so a test has no other way to see that a transfer
@@ -94,7 +99,7 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 				if cerr := closeWindow(); cerr != nil {
 					return 0, written, cerr
 				}
-				gentleSleep(gentlePause)
+				gentleSleep(GentlePause)
 				paced = written
 			}
 		}
@@ -114,9 +119,9 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 	// window, so the remainder of any call -- or the whole of one shorter than
 	// a window, which is every chunk of a download at a 1 MiB --chunk-size --
 	// would otherwise cost nothing at all. Proportional, so the rate is the
-	// same whatever the caller's chunk size: gentlePause per GentleWindow.
+	// same whatever the caller's chunk size: GentlePause per GentleWindow.
 	if unpaced := written - paced; unpaced > 0 {
-		gentleSleep(time.Duration(int64(gentlePause) * unpaced / GentleWindow))
+		gentleSleep(time.Duration(int64(GentlePause) * unpaced / GentleWindow))
 	}
 
 	// Then one more request over everything written. A drop request on dirty

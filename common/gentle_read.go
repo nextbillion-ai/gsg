@@ -146,7 +146,7 @@ func (g *GentleSection) Read(p []byte) (int, error) {
 // as long as those bytes are worth.
 //
 // The pause is proportional rather than fixed so that the rate does not depend
-// on how much the caller happens to read per call: gentlePause per
+// on how much the caller happens to read per call: GentlePause per
 // GentleWindow, the same rate GentleWrite uses.
 func (g *GentleSection) release() {
 	window := g.pos - g.marked
@@ -157,7 +157,7 @@ func (g *GentleSection) release() {
 		gentleAdviseDropRead(g.f, g.off+g.marked, window)
 	}
 	if g.gentle.Pause {
-		gentleSleep(time.Duration(int64(gentlePause) * window / GentleWindow))
+		gentleSleep(time.Duration(int64(GentlePause) * window / GentleWindow))
 	}
 	g.marked = g.pos
 }

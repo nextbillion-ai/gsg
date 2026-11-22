@@ -28,6 +28,7 @@ var (
 	multiThread       int
 	chunkSize         int64
 	gentleIO          bool
+	gentlePause       time.Duration
 	bars              *bar.Container
 	pool              *worker.Pool
 )
@@ -53,6 +54,16 @@ func init() {
 		&gentleIO, "gentle-io", false,
 		"enable gentle I/O mode to reduce impact on other applications (uses O_DIRECT, fadvise, throttling)",
 	)
+	rootCmd.PersistentFlags().DurationVar(
+		&gentlePause, "gentle-pause", common.DefaultGentlePause,
+		"with --gentle-io, how long a transfer pauses per 10 MiB it moves (0 keeps the page-cache drops and write-time checksums, without pacing)",
+	)
+	rootCmd.PersistentPreRun = func(*cobra.Command, []string) {
+		if gentlePause < 0 {
+			gentlePause = 0
+		}
+		common.GentlePause = gentlePause
+	}
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
 		"enable debugging mode to print more logs",
