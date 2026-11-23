@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	awsv1 "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/aws/smithy-go"
@@ -703,6 +705,24 @@ func (s *S3) Init(buckets ...string) error {
 	return err
 }
 
+// newHTTPClient is the SDK's default client with each connection failing a read
+// or write that moves nothing for common.StallTimeout. The SDK sets no deadline
+// on a request, rightly, since a body's duration scales with its size, so a peer
+// that stopped answering held a transfer forever.
+func newHTTPClient() *awshttp.BuildableClient {
+	return awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.DialContext = common.StallGuardDialContext(t.DialContext, common.StallTimeout)
+	})
+}
+
+// newTransport is the same guard for the region lookup, which goes through the
+// v1 SDK.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = common.StallGuardDialContext(t.DialContext, common.StallTimeout)
+	return t
+}
+
 // clientFor returns the client for one bucket, building it on first use.
 func (s *S3) clientFor(bucket string) (*s3.Client, error) {
 	s.mu.Lock()
@@ -715,12 +735,12 @@ func (s *S3) clientFor(bucket string) (*s3.Client, error) {
 	// the client. This used to return nil from the callback, leaving the
 	// fallback region in place, so a lookup that failed produced a client
 	// quietly pointed at the wrong place.
-	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, regionHint())
+	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession(&awsv1.Config{HTTPClient: &http.Client{Transport: newTransport()}})), bucket, regionHint())
 	if rerr != nil {
 		logger.Info(module, "cannot determine the region of bucket[%s]: %s", bucket, rerr)
 		return nil, rerr
 	}
-	cfg, e1 := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	cfg, e1 := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region), config.WithHTTPClient(newHTTPClient()))
 	if e1 != nil {
 		msg := fmt.Sprintf("failed in loading defaultConfig with error: %s", e1)
 		logger.Info(module, "%s", msg)

@@ -96,8 +96,41 @@ func (g *GCS) toFileObject(attrs *storage.ObjectAttrs, bucket string) *system.Fi
 
 // NewWithClient returns a GCS that uses c instead of building a client from
 // GOOGLE_APPLICATION_CREDENTIALS, for a caller pointing gsg at another endpoint.
+// c's transport is the caller's: build it with NewTransport, or wrap its dialer
+// in common.StallGuardDialContext, for transfers to fail on a peer that stops.
 func NewWithClient(c *storage.Client) *GCS {
 	return &GCS{client: c}
+}
+
+// NewTransport is the transport under every request of a client gsg builds,
+// before authentication is layered on.
+//
+// Over HTTP/2 every chunk of a transfer is multiplexed onto one TCP connection,
+// which caps a gsg process at roughly 230 MB/s. HTTP/1.1 with a keep-alive pool
+// spreads the chunks over as many connections as there are workers; http2
+// (GSG_HTTP2=1) keeps HTTP/2.
+//
+// Each connection fails a read or write that moves nothing for
+// common.StallTimeout. Nothing else bounded a transfer: the library's calls run
+// on context.Background(), so a peer that stopped answering mid-body, before
+// the headers, or while taking an upload held the process forever.
+func NewTransport(http2 bool) *http.Transport {
+	t := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           common.StallGuardDialContext((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext, common.StallTimeout),
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		ForceAttemptHTTP2:     http2,
+	}
+	if !http2 {
+		// no h2 in ALPN either, or the server still negotiates HTTP/2
+		t.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return t
 }
 
 // storageClient gets or creates a gcp storage client
@@ -118,34 +151,12 @@ func (g *GCS) Init(_ ...string) error {
 		logger.Info(module, "gcs: failed in loading [%s=%s] with error: %s", googleApplicationCredentialsEnv, path, err)
 		return err
 	}
-	// Over HTTP/2 every chunk of a transfer is multiplexed onto one TCP connection, which
-	// caps a gsg process at roughly 230 MB/s. HTTP/1.1 with a keep-alive pool spreads the
-	// chunks over as many connections as there are workers. GSG_HTTP2=1 keeps HTTP/2.
-	var clientOpts []option.ClientOption
-	if os.Getenv("GSG_HTTP2") != "1" {
-		base := &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: time.Second,
-			MaxIdleConns:          1024,
-			MaxIdleConnsPerHost:   1024,
-			ForceAttemptHTTP2:     false,
-			// no h2 in ALPN either, or the server still negotiates HTTP/2
-			TLSClientConfig: &tls.Config{NextProtos: []string{"http/1.1"}},
-			TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{},
-		}
-		rt, terr := htransport.NewTransport(context.Background(), base, option.WithCredentialsFile(path), option.WithScopes(storage.ScopeFullControl))
-		if terr != nil {
-			logger.Info(module, "get transport failed with %s", terr)
-			return terr
-		}
-		clientOpts = []option.ClientOption{option.WithHTTPClient(&http.Client{Transport: rt})}
-	} else {
-		clientOpts = []option.ClientOption{option.WithCredentialsFile(path)}
+	rt, terr := htransport.NewTransport(context.Background(), NewTransport(os.Getenv("GSG_HTTP2") == "1"), option.WithCredentialsFile(path), option.WithScopes(storage.ScopeFullControl))
+	if terr != nil {
+		logger.Info(module, "get transport failed with %s", terr)
+		return terr
 	}
-	g.client, err = storage.NewClient(context.Background(), clientOpts...)
+	g.client, err = storage.NewClient(context.Background(), option.WithHTTPClient(&http.Client{Transport: rt}))
 	if err != nil {
 		logger.Info(module, "get client failed with %s", err)
 		return err
@@ -856,6 +867,13 @@ var partDeleteTimeout = 30 * time.Second
 var partLookupTimeout = 30 * time.Second
 var bucketAttrsTimeout = 30 * time.Second
 
+// composeTimeout bounds the compose. It moves no data, the service joins the
+// parts by reference; but it ran on context.Background(), and a request the
+// service kept open held the upload, with its parts in the bucket, for good.
+// The stall guard does not cover a connection the service keeps alive without
+// answering, nor a client the caller built. Five minutes, as jam-core runs it.
+var composeTimeout = 5 * time.Minute
+
 // bucketAllowsCompose is false when a retention policy would keep the parts from
 // being deleted afterwards. A bucket that cannot be inspected counts as allowed;
 // parts left behind are then reported by the upload.
@@ -887,6 +905,7 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 	}
 	partSize := int64(math.Ceil(float64(size) / float64(parts)))
 	bkt := g.client.Bucket(bucket)
+	g.sweepStaleParts(bucket, object)
 	// parts are named per upload and referenced by the generation each one was
 	// written as, so two uploads of the same object never touch each other's parts
 	var uid [8]byte
@@ -1011,7 +1030,9 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 	composer.ContentType = sniffContentType(f)
 	composer.CRC32C = crc
 	composer.SendCRC32C = true
-	_, err = composer.Run(context.Background())
+	composeCtx, composeCancel := context.WithTimeout(context.Background(), composeTimeout)
+	_, err = composer.Run(composeCtx)
+	composeCancel()
 	left := cleanup()
 	if len(left) > 0 {
 		// the object is already committed and verified: a retry of the upload would
@@ -1150,8 +1171,23 @@ func transientDeleteError(err error) bool {
 }
 
 func deleteParts(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []string {
+	failed := deletePartsReporting(handles, del)
+	var left []string
+	for i, h := range handles {
+		if failed[i] {
+			left = append(left, h.ObjectName())
+		}
+	}
+	return left
+}
+
+// deletePartsReporting is deleteParts reporting by position, for a caller whose
+// handles can share a name (versions of one part).
+func deletePartsReporting(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []bool {
 	failed := make([]bool, len(handles))
 	var wg sync.WaitGroup
+	// one upload has at most compositeMaxParts; a sweep can have thousands
+	slots := make(chan struct{}, compositeMaxParts)
 	for i, h := range handles {
 		if h == nil {
 			continue
@@ -1159,6 +1195,8 @@ func deleteParts(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle
 		wg.Add(1)
 		go func(i int, h *storage.ObjectHandle) {
 			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
 			for attempt := 1; ; attempt++ {
 				err := del(h)
 				if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
@@ -1173,13 +1211,7 @@ func deleteParts(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle
 		}(i, h)
 	}
 	wg.Wait()
-	var left []string
-	for i, h := range handles {
-		if failed[i] {
-			left = append(left, h.ObjectName())
-		}
-	}
-	return left
+	return failed
 }
 
 func sniffContentType(f *os.File) string {

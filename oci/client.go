@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 
 	ocicommon "github.com/oracle/oci-go-sdk/v65/common"
@@ -32,6 +33,11 @@ import (
 // has been fully written, so a twenty-minute upload cannot trip it while a
 // server that goes silent afterwards still fails in a minute.
 //
+// ResponseHeaderTimeout does not cover a body that stops mid-way, nor an upload
+// the service stops taking, so each connection also fails a read or write that
+// moves nothing for common.StallTimeout, as on gs and s3. Over HTTP/2 that
+// catches a connection that stops as a whole, not one stream among several.
+//
 // The values match the aws and google defaults so the three backends behave
 // alike.
 func newHTTPClient() *http.Client {
@@ -39,10 +45,10 @@ func newHTTPClient() *http.Client {
 		Timeout: 0,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
+			DialContext: common.StallGuardDialContext((&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			}).DialContext, common.StallTimeout),
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,

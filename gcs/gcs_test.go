@@ -696,7 +696,10 @@ type fakeComposite struct {
 	composed []string // the crc32c each compose was asked to confirm
 	deleted  []string
 	mtimes   []string // the goog-reserved-file-mtime of each single-stream upload
+	listed   int      // listings, as the sweep before an upload makes
 	onLast   func(part string)
+	// onCompose runs as the compose arrives, before it is answered
+	onCompose func()
 }
 
 func (fc *fakeComposite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -745,7 +748,15 @@ func (fc *fakeComposite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fc.onLast(name)
 		}
 		_, _ = fmt.Fprintf(w, `{"bucket":"b","name":%q,"generation":"7"}`, name)
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/o"):
+		fc.mu.Lock()
+		fc.listed++
+		fc.mu.Unlock()
+		_, _ = w.Write([]byte(`{"kind":"storage#objects"}`))
 	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/compose"):
+		if fc.onCompose != nil {
+			fc.onCompose()
+		}
 		var req struct {
 			Destination struct {
 				Crc32c string `json:"crc32c"`
