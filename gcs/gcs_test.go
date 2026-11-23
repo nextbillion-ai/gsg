@@ -552,9 +552,10 @@ func TestVerifyDownloadAcceptsChunkSumsThatAddUpToTheObject(t *testing.T) {
 	for _, cuts := range [][]int{nil, {1}, {1 << 19, 3 << 18}} {
 		sums, lens := gentleSums(content, cuts...)
 		for _, verify := range []bool{true, false} {
-			crc, matches, err := verifyDownload(verify, path, "b", "o", gentleAttrs(content), sums, lens)
+			crc, keep, cache, err := verifyDownload(verify, path, "b", "o", gentleAttrs(content), sums, lens)
 			assert.NoError(t, err, "cuts %v", cuts)
-			assert.True(t, matches, "cuts %v", cuts)
+			assert.True(t, keep, "cuts %v", cuts)
+			assert.True(t, cache, "cuts %v", cuts)
 			assert.Equal(t, gentleAttrs(content).CRC32C, crc, "cuts %v: the sum to cache", cuts)
 		}
 	}
@@ -568,25 +569,50 @@ func TestVerifyDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
 
 	sums, lens := gentleSums(content, 1000)
 	sums[1] ^= 1
-	_, matches, err := verifyDownload(true, path, "b", "o", attrs, sums, lens)
+	_, keep, _, err := verifyDownload(true, path, "b", "o", attrs, sums, lens)
 	assert.Error(t, err)
-	assert.False(t, matches)
-	_, matches, err = verifyDownload(false, path, "b", "o", attrs, sums, lens)
+	assert.False(t, keep)
+	_, keep, _, err = verifyDownload(false, path, "b", "o", attrs, sums, lens)
 	assert.NoError(t, err, "without -v a mismatch is reported, not fatal")
-	assert.False(t, matches, "but it is still a mismatch")
+	assert.False(t, keep, "but it is still a mismatch")
 
 	sums, lens = gentleSums(content[:len(content)-1], 1000)
-	_, matches, err = verifyDownload(true, path, "b", "o", attrs, sums, lens)
+	_, keep, _, err = verifyDownload(true, path, "b", "o", attrs, sums, lens)
 	assert.Error(t, err)
-	assert.False(t, matches)
+	assert.False(t, keep)
+}
+
+// GCS stores no CRC32C for an XML-API multipart upload, and the attrs read that
+// as 0. There is nothing to compare: the file goes into place, as on s3 and
+// oci, and its sum is not cached. A size that disagrees is still a mismatch.
+func TestVerifyDownloadOfAnObjectThatStoresNoCRC32C(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<12)
+	path := filepath.Join(t.TempDir(), "input.osrm.geometry")
+	require.NoError(t, os.WriteFile(path, content, 0644))
+	attrs := &storage.ObjectAttrs{Size: int64(len(content))}
+
+	sums, lens := gentleSums(content, 1000)
+	for _, verify := range []bool{true, false} {
+		_, keep, cache, err := verifyDownload(verify, path, "b", "o", attrs, sums, lens)
+		assert.NoError(t, err, "-v %t: nothing to compare with is not a mismatch", verify)
+		assert.True(t, keep, "-v %t: the file goes into place", verify)
+		assert.False(t, cache, "-v %t: nothing is cached for an object without a checksum", verify)
+	}
+
+	sums, lens = gentleSums(content[:len(content)-1], 1000)
+	for _, verify := range []bool{true, false} {
+		_, keep, _, _ := verifyDownload(verify, path, "b", "o", attrs, sums, lens)
+		assert.False(t, keep, "-v %t: a short file is a mismatch with or without a checksum", verify)
+	}
 }
 
 func TestVerifyDownloadOfAnEmptyObject(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty")
 	require.NoError(t, os.WriteFile(path, nil, 0644))
-	_, matches, err := verifyDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0})
+	_, keep, cache, err := verifyDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0})
 	assert.NoError(t, err)
-	assert.True(t, matches)
+	assert.True(t, keep)
+	assert.True(t, cache, "an empty object's CRC32C is a genuine 0, and the file sums to it")
 }
 
 // Chunks are separate range reads, and each must ask for the generation the

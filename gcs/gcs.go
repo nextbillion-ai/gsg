@@ -616,8 +616,8 @@ func (g *GCS) Download(
 	// read, not a fresh lookup by name: an overwrite landing after the last
 	// chunk would otherwise have a correct copy of the old generation reported
 	// as corrupt.
-	crc, matches, err := verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
-	if !matches {
+	crc, keep, cache, err := verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
+	if !keep {
 		_ = os.Remove(dstFileTemp)
 		return err
 	}
@@ -628,38 +628,53 @@ func (g *GCS) Download(
 		return err
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-	common.StoreFileCRC32C(dstFile, crc)
+	if cache {
+		common.StoreFileCRC32C(dstFile, crc)
+	}
 	return nil
 }
 
 // verifyDownload settles a download from the sums its chunks took while
-// writing, before the temp file is renamed. It returns the file's CRC32C, for
-// the caller to cache once the file has its name and time so the next rsync
-// compares without reading the file, and whether it matches the object. The
-// file is not read again: that read is as large as the file, and in gentle
-// mode it would come from disk, since the pages have been dropped all along.
+// writing, before the temp file is renamed. It says whether the file goes into
+// place, and whether its CRC32C, matching the object's, is worth caching once
+// the file has its name and time so the next rsync compares without reading the
+// file. The file is not read again: that read is as large as the file, and in
+// gentle mode it would come from disk, since the pages have been dropped all
+// along.
 //
 // A file that does not match is never renamed into place. Under -v that is the
 // download's error. Without -v the mismatch is logged and the download returns
 // nil, as it did before anything was summed, but whatever was at dstFile --
 // the previous copy, or nothing -- stays: replacing it would stamp bytes known
 // to be wrong with the object's time, which a later rsync without -v trusts.
-func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) (crc uint32, matches bool, err error) {
+//
+// An object can store no CRC32C (GCS omits it for XML-API multipart uploads),
+// and ObjectAttrs.CRC32C has no presence bit, so that reads as 0. A stored 0
+// that the file sums to is a match like any other. A 0 the file does not sum
+// to cannot be told from "none stored", so it is treated as nothing to compare,
+// as s3 and oci treat a missing checksum: the file goes into place and is not
+// cached. For an object whose real CRC32C is 0 that lets a corrupt download of
+// the right size through; the size is still checked.
+func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) (crc uint32, keep, cache bool, err error) {
 	crc, total := common.FoldCRC32C(sums, lens)
-	if total != attrs.Size || crc != attrs.CRC32C {
-		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
-			dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
-		if !forceChecksum {
-			logger.Info(module, "%s %s is left as it was.", log, dstFile)
-			return crc, false, nil
+	if total == attrs.Size && crc == attrs.CRC32C {
+		if forceChecksum {
+			logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 		}
-		logger.Info(module, log)
-		return crc, false, errors.New(log)
+		return crc, true, true, nil
 	}
-	if forceChecksum {
-		logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
+	if total == attrs.Size && attrs.CRC32C == 0 {
+		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
+		return crc, true, false, nil
 	}
-	return crc, true, nil
+	log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
+		dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
+	if !forceChecksum {
+		logger.Info(module, "%s %s is left as it was.", log, dstFile)
+		return crc, false, false, nil
+	}
+	logger.Info(module, log)
+	return crc, false, false, errors.New(log)
 }
 
 // DoAttemptUnlock takes generation as input and returns potential error
