@@ -85,10 +85,11 @@ func GentleWrite(dst *os.File, offset, length int64, src io.Reader, progress io.
 		previous = windowLen
 	}
 	// pace sleeps for what was written since the last pause, at gentlePause per
-	// GentleWindow whatever the window or the caller's chunk size.
+	// GentleWindow whatever the window or the caller's chunk size. Taken as
+	// the difference of the totals so that rounding does not accumulate.
 	pace := func() {
-		if unpaced := written - paced; unpaced > 0 {
-			gentleSleep(time.Duration(int64(gentlePause)*written/GentleWindow) - time.Duration(int64(gentlePause)*paced/GentleWindow))
+		if written > paced {
+			gentleSleep(pauseFor(written) - pauseFor(paced))
 			paced = written
 		}
 	}
@@ -141,6 +142,13 @@ func GentleWrite(dst *os.File, offset, length int64, src io.Reader, progress io.
 		gentleAdviseDrop(dst, offset, written)
 	}
 	return sum.Sum32(), written, nil
+}
+
+// pauseFor is the pause owed for n bytes, gentlePause*n/GentleWindow rounded
+// down, computed in two parts: gentlePause*n itself overflows an int64 past
+// about 460 GB.
+func pauseFor(n int64) time.Duration {
+	return gentlePause*time.Duration(n/GentleWindow) + time.Duration(int64(gentlePause)*(n%GentleWindow)/GentleWindow)
 }
 
 // fillBuffer reads into buf until it is full or src ends, so each write is

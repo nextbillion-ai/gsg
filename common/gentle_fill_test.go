@@ -163,3 +163,13 @@ func (r *repeating) Read(b []byte) (int, error) {
 	}
 	return n, nil
 }
+
+// The pause owed for a transfer of any size, without overflowing.
+func TestPauseForIsProportionalAtAnySize(t *testing.T) {
+	assert.Equal(t, time.Duration(0), pauseFor(0))
+	assert.Equal(t, gentlePause, pauseFor(GentleWindow))
+	assert.Equal(t, gentlePause*3/2, pauseFor(GentleWindow*3/2))
+	const tb = int64(1) << 40
+	assert.Equal(t, gentlePause*time.Duration(tb/GentleWindow)+gentlePause*time.Duration(tb%GentleWindow)/GentleWindow, pauseFor(tb))
+	assert.Greater(t, pauseFor(tb), 30*time.Minute)
+}
