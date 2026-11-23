@@ -1297,6 +1297,31 @@ do_test() {
     finish
     fi
 
+    if [[ "$mode" == "gs" ]]
+    then
+    start "sweep-parts removes a killed upload's parts and leaves a running one's"
+    # The parts are written with gsutil under the names a composite upload
+    # gives them. A dead upload is one whose newest part is older than
+    # --older-than; the running one has an old part and a young one, and both
+    # must stay, or its compose would fail. The object itself is no part.
+    fsw="folder_sweep"
+    mkdir -p $fsw
+    prepare_file $fsw/part sweep
+    for name in big.bin.gsg-part-00112233aabbccdd-00 big.bin.gsg-part-00112233aabbccdd-01 \
+        old.csv.jam-part-0a0b0c0d0e0f0a0b-00 big.bin live.bin.gsg-part-ffeeddccbbaa9988-00
+    do
+        gsutil -q cp $fsw/part "$remote_base/$fsw/$name"
+    done
+    sleep 12
+    gsutil -q cp $fsw/part "$remote_base/$fsw/live.bin.gsg-part-ffeeddccbbaa9988-01"
+    assertOk "sweep-parts exits 0" ../gsg sweep-parts --older-than 10s "$remote_base/$fsw/"
+    assertEq "only the dead uploads' parts are gone" \
+        "$(gsutil ls "$remote_base/$fsw/" | sed 's#.*/##' | sort | tr '\n' ' ')" \
+        "big.bin live.bin.gsg-part-ffeeddccbbaa9988-00 live.bin.gsg-part-ffeeddccbbaa9988-01 "
+    rm -rf $fsw
+    finish
+    fi
+
     start "regression: an upload is checked on arrival, not after it"
     # gs stores a CRC32C for every object whether asked or not -- but it
     # computes it from whatever reached it. Nothing was transmitted, so a body
