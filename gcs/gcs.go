@@ -648,8 +648,9 @@ func (g *GCS) Download(
 // the previous copy, or nothing -- stays: replacing it would stamp bytes known
 // to be wrong with the object's time, which a later rsync without -v trusts.
 //
-// An object can store no CRC32C (GCS omits it for XML-API multipart uploads),
-// and ObjectAttrs.CRC32C has no presence bit, so that reads as 0. A stored 0
+// The JSON API leaves crc32c out for an object that stores none, and
+// ObjectAttrs.CRC32C has no presence bit, so that reads as 0. (An XML-API
+// multipart upload, the usual example, did get one when tried on nb-data.) A stored 0
 // that the file sums to is a match like any other. A 0 the file does not sum
 // to cannot be told from "none stored", so it is treated as nothing to compare,
 // as s3 and oci treat a missing checksum: the file goes into place and is not

@@ -615,8 +615,8 @@ func TestVerifyDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
 	assert.False(t, keep)
 }
 
-// GCS stores no CRC32C for an XML-API multipart upload, and the attrs read that
-// as 0. There is nothing to compare: the file goes into place, as on s3 and
+// An object that stores no CRC32C reads as 0 in the attrs, which have no
+// presence bit. There is nothing to compare: the file goes into place, as on s3 and
 // oci, and its sum is not cached. A size that disagrees is still a mismatch.
 func TestVerifyDownloadOfAnObjectThatStoresNoCRC32C(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<12)
