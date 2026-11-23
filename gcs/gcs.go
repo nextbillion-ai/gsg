@@ -1156,7 +1156,20 @@ func lookupPart(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
 // pinned to a generation is retried until the context ends and deleteParts'
 // attempt limit is never reached.
 func deletePart(h *storage.ObjectHandle) error {
-	ctx, cancel := context.WithTimeout(context.Background(), partDeleteTimeout)
+	return deletePartWithin(context.Background(), h)
+}
+
+// errDeleteAbandoned marks a delete not attempted because the caller's context
+// had ended. It is final, so deleteParts does not wait and try again for it.
+var errDeleteAbandoned = errors.New("part delete abandoned")
+
+// deletePartWithin is deletePart bounded by the caller's context as well as its
+// own deadline, so a sweep given a deadline does not run past it deleting.
+func deletePartWithin(ctx context.Context, h *storage.ObjectHandle) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", errDeleteAbandoned, context.Cause(ctx))
+	}
+	ctx, cancel := context.WithTimeout(ctx, partDeleteTimeout)
 	defer cancel()
 	return h.Retryer(storage.WithPolicy(storage.RetryNever)).Delete(ctx)
 }
@@ -1170,6 +1183,9 @@ var partDeleteSleep = time.Sleep
 const partDeleteAttempts = 3
 
 func transientDeleteError(err error) bool {
+	if errors.Is(err, errDeleteAbandoned) {
+		return false
+	}
 	var ge *googleapi.Error
 	if errors.As(err, &ge) {
 		return ge.Code == 408 || ge.Code == 429 || ge.Code >= 500
@@ -1199,10 +1215,12 @@ func deletePartsReporting(handles []*storage.ObjectHandle, del func(*storage.Obj
 		if h == nil {
 			continue
 		}
+		// taken before the goroutine starts, so a sweep over thousands of parts
+		// runs at most compositeMaxParts goroutines rather than parking the rest
+		slots <- struct{}{}
 		wg.Add(1)
 		go func(i int, h *storage.ObjectHandle) {
 			defer wg.Done()
-			slots <- struct{}{}
 			defer func() { <-slots }()
 			for attempt := 1; ; attempt++ {
 				err := del(h)

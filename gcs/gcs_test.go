@@ -445,6 +445,39 @@ func TestDeletePartHasADeadline(t *testing.T) {
 	assert.True(t, transientDeleteError(err), "a timeout is worth another attempt")
 }
 
+// A sweep's context bounds its deletes: one in flight ends with it, and one
+// not yet started is abandoned at once rather than tried again.
+func TestDeletePartWithinEndsWithTheCallersContext(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	h := client.Bucket("b").Object("hung").Generation(7)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = deletePartWithin(ctx, h)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second, "the caller's deadline, not the 30 s of the delete")
+
+	err = deletePartWithin(ctx, h)
+	assert.ErrorIs(t, err, errDeleteAbandoned)
+	assert.False(t, transientDeleteError(err), "an ended context is not worth another attempt")
+
+	partDeleteSleep = func(time.Duration) { t.Error("no wait for a delete the caller abandoned") }
+	defer func() { partDeleteSleep = time.Sleep }()
+	failed := deletePartsReporting([]*storage.ObjectHandle{h, h}, func(h *storage.ObjectHandle) error { return deletePartWithin(ctx, h) })
+	assert.Equal(t, []bool{true, true}, failed)
+}
+
 func TestLookupPart(t *testing.T) {
 	var mu sync.Mutex
 	requests := map[string]int{}

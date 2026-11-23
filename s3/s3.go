@@ -919,7 +919,7 @@ func (s *S3) Download(
 				var gotBytes int64
 				// length, not wantBytes: the byte this chunk fetches past its
 				// share is the next chunk's first, and summed there.
-				sum := common.NewChunkCRC32C(length)
+				var sum *common.ChunkCRC32C
 				var gentleSum uint32
 				var gentleLen int64
 				defer func() {
@@ -964,6 +964,7 @@ func (s *S3) Download(
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 					defer func() { _ = bufWriter.Flush() }()
 
+					sum = common.NewChunkCRC32C(length)
 					var we error
 					if gotBytes, we = io.Copy(io.MultiWriter(bufWriter, pb, sum), oo.Body); we != nil {
 						fail("download object failed when write to offet with %s", we)

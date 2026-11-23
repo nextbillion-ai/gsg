@@ -118,7 +118,7 @@ func (g *GCS) sweepParts(ctx context.Context, bucket, prefix, object string, old
 	for i, p := range stale {
 		handles[i] = bkt.Object(p.Name).Generation(p.Generation)
 	}
-	failed := deletePartsReporting(handles, deletePart)
+	failed := deletePartsReporting(handles, func(h *storage.ObjectHandle) error { return deletePartWithin(ctx, h) })
 	for i, p := range stale {
 		if failed[i] {
 			res.Left = append(res.Left, versionName(p.Name, p.Generation))
