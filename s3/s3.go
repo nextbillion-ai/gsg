@@ -889,6 +889,8 @@ func (s *S3) Download(
 				gi := s3.GetObjectInput{
 					Bucket: aws.String(bucket),
 					Key:    aws.String(prefix),
+					// A chunk of another version would be spliced into the file.
+					IfMatch: etagPin(attrs),
 				}
 				// An empty object has no byte 0, so S3 answers any range with 416.
 				if size > 0 {
@@ -1173,6 +1175,19 @@ func (s *S3) Move(srcBucket, srcPrefix, dstBucket, dstPrefix string) error {
 	return nil
 }
 
+// etagPin is the If-Match value that ties every range of a read to the object
+// version the lookup saw, or nil when the lookup returned no ETag.
+func etagPin(attrs *S3Attributes) *string {
+	if e := attrs.S3Attrs.ETag; e != nil && *e != "" {
+		quoted := *e
+		if !strings.HasPrefix(quoted, `"`) {
+			quoted = `"` + quoted + `"`
+		}
+		return aws.String(quoted)
+	}
+	return nil
+}
+
 // Cat writes an object to w as it arrives.
 //
 // Every range is pinned to the ETag the lookup saw with If-Match, so an
@@ -1203,14 +1218,7 @@ func (s *S3) Cat(bucket, prefix string, w io.Writer, opts common.StreamOptions) 
 	if attrs.S3Attrs.ObjectSize != nil {
 		size = *attrs.S3Attrs.ObjectSize
 	}
-	var pin *string
-	if e := attrs.S3Attrs.ETag; e != nil && *e != "" {
-		quoted := *e
-		if !strings.HasPrefix(quoted, `"`) {
-			quoted = `"` + quoted + `"`
-		}
-		pin = aws.String(quoted)
-	}
+	pin := etagPin(attrs)
 	crc, hasCRC := crc32cOf(attrs)
 	return common.Stream(context.Background(), w, common.StreamSource{
 		Name: fmt.Sprintf("s3://%s/%s", bucket, prefix),
