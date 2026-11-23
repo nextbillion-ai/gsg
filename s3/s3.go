@@ -707,8 +707,8 @@ func (s *S3) Init(buckets ...string) error {
 
 // newHTTPClient is the SDK's default client with each connection failing a read
 // or write that moves nothing for common.StallTimeout. The SDK sets no deadline
-// on a request, rightly, since a body's duration scales with its size, so a peer
-// that stopped answering held a transfer forever.
+// on a request, rightly, since a body's duration scales with its size, so
+// without this a peer that stops answering holds a transfer forever.
 func newHTTPClient() *awshttp.BuildableClient {
 	return awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
 		t.DialContext = common.StallGuardDialContext(t.DialContext, common.StallTimeout)

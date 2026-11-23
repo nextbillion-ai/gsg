@@ -111,9 +111,9 @@ func NewWithClient(c *storage.Client) *GCS {
 // (GSG_HTTP2=1) keeps HTTP/2.
 //
 // Each connection fails a read or write that moves nothing for
-// common.StallTimeout. Nothing else bounded a transfer: the library's calls run
-// on context.Background(), so a peer that stopped answering mid-body, before
-// the headers, or while taking an upload held the process forever.
+// common.StallTimeout. Nothing else bounds a transfer: the library's calls run
+// on context.Background(), so without it a peer that stops answering mid-body,
+// before the headers, or while taking an upload holds the process forever.
 func NewTransport(http2 bool) *http.Transport {
 	t := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -860,10 +860,10 @@ var partLookupTimeout = 30 * time.Second
 var bucketAttrsTimeout = 30 * time.Second
 
 // composeTimeout bounds the compose. It moves no data, the service joins the
-// parts by reference; but it ran on context.Background(), and a request the
-// service kept open held the upload, with its parts in the bucket, for good.
-// The stall guard does not cover a connection the service keeps alive without
-// answering, nor a client the caller built. Five minutes, as jam-core runs it.
+// parts by reference, but without a deadline a request the service keeps open
+// holds the upload, with its parts in the bucket, for good. The stall guard
+// does not cover a connection the service keeps alive without answering, nor a
+// client the caller built. Five minutes, as jam-core runs it.
 var composeTimeout = 5 * time.Minute
 
 // bucketAllowsCompose is false when a retention policy would keep the parts from
