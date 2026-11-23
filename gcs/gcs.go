@@ -560,17 +560,9 @@ func (g *GCS) Download(
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
 					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
-					// The chunk is summed from the file as it is written, so the
-					// transfer can be settled without reading it back afterwards.
-					// That needs a second handle: fl is open for writing and its
-					// offset is in use.
-					verifier, verr := os.Open(dstFileTemp)
-					if verr != nil {
-						fail("download object failed when open for verify: %s", verr)
-						return
-					}
-					defer func() { _ = verifier.Close() }()
-					sum, written, gerr := common.GentleWrite(fl, verifier, startByte, rc, pb)
+					// The chunk is summed as it is written, so the transfer can
+					// be settled without reading it back afterwards.
+					sum, written, gerr := common.GentleWrite(fl, startByte, length, rc, pb)
 					if gerr != nil {
 						fail("download object failed in gentle mode with %s", gerr)
 						return

@@ -39,7 +39,7 @@ func (w *writeSizes) Write(p []byte) (int, error) {
 // of its CPU in the kernel. The progress writer is handed exactly what is
 // written to the file, so its calls are the file's writes.
 func TestGentleWriteFillsItsBufferBeforeWriting(t *testing.T) {
-	const size = 3<<20 + 12345
+	const size = 2*gentleBuffer + 12345
 	content := make([]byte, size)
 	for i := range content {
 		content[i] = byte(i * 13)
@@ -49,20 +49,34 @@ func TestGentleWriteFillsItsBufferBeforeWriting(t *testing.T) {
 	fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer func() { _ = fl.Close() }()
-	verifier, err := os.Open(path)
-	require.NoError(t, err)
-	defer func() { _ = verifier.Close() }()
 
 	writes := &writeSizes{}
-	crc, n, werr := GentleWrite(fl, verifier, 0, tlsRecords{bytes.NewReader(content)}, writes)
+	crc, n, werr := GentleWrite(fl, 0, 0, tlsRecords{bytes.NewReader(content)}, writes)
 	require.NoError(t, werr)
 	assert.Equal(t, int64(size), n)
 	assert.Equal(t, crc32.Checksum(content, Castagnoli), crc)
-	assert.Equal(t, []int{1 << 20, 1 << 20, 1 << 20, 12345}, writes.sizes)
+	assert.Equal(t, []int{gentleBuffer, gentleBuffer, 12345}, writes.sizes)
 
 	landed, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, content, landed)
+}
+
+// A chunk smaller than the buffer holds only its own size, so many small
+// chunks at once do not each hold gentleBuffer.
+func TestGentleWriteSizesItsBufferToTheChunk(t *testing.T) {
+	const size = 3<<20 + 5
+	path := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.WriteFile(path, make([]byte, size), 0o644))
+	fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	defer func() { _ = fl.Close() }()
+
+	writes := &writeSizes{}
+	_, n, werr := GentleWrite(fl, 0, 1<<20, tlsRecords{bytes.NewReader(make([]byte, size))}, writes)
+	require.NoError(t, werr)
+	assert.Equal(t, int64(size), n)
+	assert.Equal(t, []int{1 << 20, 1 << 20, 1 << 20, 5}, writes.sizes)
 }
 
 // A source that fails partway still has what it read written and counted, so
@@ -73,13 +87,10 @@ func TestGentleWriteWritesWhatItFilledBeforeAFailure(t *testing.T) {
 	fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer func() { _ = fl.Close() }()
-	verifier, err := os.Open(path)
-	require.NoError(t, err)
-	defer func() { _ = verifier.Close() }()
 
 	src := io.MultiReader(tlsRecords{bytes.NewReader(bytes.Repeat([]byte("q"), 40000))}, failingReader{})
 	writes := &writeSizes{}
-	_, n, werr := GentleWrite(fl, verifier, 0, src, writes)
+	_, n, werr := GentleWrite(fl, 0, 0, src, writes)
 	assert.ErrorIs(t, werr, assert.AnError)
 	assert.Equal(t, int64(40000), n)
 	assert.Equal(t, []int{40000}, writes.sizes)
@@ -114,18 +125,12 @@ func BenchmarkGentleWriteParallelChunks(b *testing.B) {
 					return
 				}
 				defer func() { _ = fl.Close() }()
-				verifier, err := os.Open(path)
-				if err != nil {
-					errs[c] = err
-					return
-				}
-				defer func() { _ = verifier.Close() }()
 				if _, err = fl.Seek(off, io.SeekStart); err != nil {
 					errs[c] = err
 					return
 				}
 				src := tlsRecords{io.LimitReader(repeatReader(record), chunkSize)}
-				_, n, err := GentleWrite(fl, verifier, off, src, nil)
+				_, n, err := GentleWrite(fl, off, 0, src, nil)
 				if err == nil && n != chunkSize {
 					err = fmt.Errorf("chunk %d wrote %d", c, n)
 				}

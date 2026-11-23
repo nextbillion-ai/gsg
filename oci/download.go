@@ -294,13 +294,7 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 	var sum uint32
 	var written int64
 	if gentle {
-		// A second handle: fl is open for writing and its offset is in use.
-		verifier, verr := os.Open(dstFileTemp)
-		if verr != nil {
-			return 0, 0, fmt.Errorf("oci: cannot open %s to verify it: %w", dstFileTemp, verr)
-		}
-		defer func() { _ = verifier.Close() }()
-		sum, written, err = common.GentleWrite(fl, verifier, offset, r.Content, progressWriter(pb))
+		sum, written, err = common.GentleWrite(fl, offset, length, r.Content, progressWriter(pb))
 	} else {
 		bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 		chunkSum := common.NewChunkCRC32C(length)

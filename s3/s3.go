@@ -935,17 +935,9 @@ func (s *S3) Download(
 				if ctx.GentleIO {
 					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
 					// The same writer gs and oci use: windows dropped from the
-					// page cache and paced as they are written, each summed
-					// from the file while its pages are still cached. A second
-					// handle reads them back, as fl's offset is in use.
-					verifier, verr := os.Open(dstFileTemp)
-					if verr != nil {
-						fail("download object failed when open for verify: %s", verr)
-						return
-					}
-					defer func() { _ = verifier.Close() }()
+					// page cache and paced as they are written, and summed.
 					var gerr error
-					gentleSum, gentleLen, gerr = common.GentleWrite(fl, verifier, startByte, io.LimitReader(oo.Body, length), pb)
+					gentleSum, gentleLen, gerr = common.GentleWrite(fl, startByte, length, io.LimitReader(oo.Body, length), pb)
 					gotBytes = gentleLen
 					if gerr != nil {
 						fail("download object failed when write: %s", gerr)

@@ -321,14 +321,11 @@ func TestAGentleChunkWithNoProgressBarDoesNotPanic(t *testing.T) {
 	fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer func() { _ = fl.Close() }()
-	verifier, err := os.Open(path)
-	require.NoError(t, err)
-	defer func() { _ = verifier.Close() }()
 
 	var absent *bar.ProgressBar
 	assert.Nil(t, progressWriter(absent), "no bar means nothing to write to")
 
-	_, n, werr := common.GentleWrite(fl, verifier, 0, bytes.NewReader(content), progressWriter(absent))
+	_, n, werr := common.GentleWrite(fl, 0, 0, bytes.NewReader(content), progressWriter(absent))
 	require.NoError(t, werr)
 	assert.Equal(t, int64(len(content)), n)
 
@@ -339,6 +336,6 @@ func TestAGentleChunkWithNoProgressBarDoesNotPanic(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = again.Close() }()
 	assert.NotPanics(t, func() {
-		_, _, _ = common.GentleWrite(again, verifier, 0, bytes.NewReader(content), absent)
+		_, _, _ = common.GentleWrite(again, 0, 0, bytes.NewReader(content), absent)
 	})
 }

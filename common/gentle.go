@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// GentleWindow is how much a gentle transfer writes before it sums the window
-// and asks the kernel to drop it.
+// GentleWindow is how much a gentle transfer writes, at least, before it asks
+// the kernel to drop what it wrote.
 const GentleWindow = 10 * 1024 * 1024
 
 // gentlePause is how long a gentle transfer stands aside per window written,
@@ -35,47 +35,62 @@ func adviseRange(windowStart, windowLen, previousLen int64) (offset, length int6
 	return windowStart - previousLen, previousLen + windowLen
 }
 
+// gentleBuffer is how much a gentle transfer reads before each write. Writes
+// from many chunks land on one file, and the kernel's cost of a buffered write
+// is mostly per call: an 80 GB download in 16 chunks written in 1 MiB pieces
+// spent 525-550 s of kernel CPU and ran 110-115 s, in 2 MiB pieces 471 s and
+// 110 s, in 8 MiB pieces 373-398 s and 103-106 s, the same as jam-core's own
+// downloader, which writes 8 MiB. Dropping the pages less often (a 16 MiB
+// window with 1 MiB writes) changed neither.
+const gentleBuffer = 8 << 20
+
 // GentleWrite copies src into dst at offset without leaving the bytes in the
 // page cache, and returns the CRC32C of what landed and how much of it there
 // was.
 //
-// Three things happen together, and they have to. The copy is broken into
-// windows so the kernel can be asked to drop each one as it is written, which
-// is what keeps a large transfer from evicting everything else; a pause at each
-// window boundary leaves the disk to whatever else is using it; and each window
-// is summed *from the file*, at its offset, while its pages are still cached
-// and immediately before they are dropped. That last part is what lets the
-// caller settle the transfer without reading the file back afterwards -- a read
-// that would come straight off the disk, as large as the file, against whatever
-// the pacing was protecting.
+// The copy is broken into windows so the kernel can be asked to drop each one
+// as it is written, which is what keeps a large transfer from evicting
+// everything else, and a pause in proportion to each window leaves the disk to
+// whatever else is using it. Each write is summed from the buffer it wrote, so
+// the caller settles the transfer without reading the file back afterwards: a
+// read that would come straight off the disk, as large as the file, against
+// whatever the pacing was protecting.
 //
-// dst must already be positioned at offset. verifier reads the same file dst
-// writes; a second handle rather than dst itself, because dst is open for
-// writing and its offset is in use.
+// dst must already be positioned at offset. length is how much src is expected
+// to hold, or 0 when that is not known; it only sizes the buffer, so a small
+// chunk does not hold gentleBuffer.
 //
 // progress may be nil. It is written the bytes as they are copied, so a caller
 // that retries a failed chunk has to undo what the failed attempt reported --
 // the returned byte count is what was written before the error.
-func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader, progress io.Writer) (crc uint32, written int64, err error) {
+func GentleWrite(dst *os.File, offset, length int64, src io.Reader, progress io.Writer) (crc uint32, written int64, err error) {
 	FadviseWriteSequential(dst)
 
-	buf := make([]byte, 1024*1024)
+	size := int64(gentleBuffer)
+	if length > 0 && length < size {
+		size = length
+	}
+	buf := make([]byte, size)
 	sum := crc32.New(Castagnoli)
-	var summed, previous, paced int64
+	var dropped, previous, paced int64
 
-	closeWindow := func() error {
-		windowStart, windowLen := summed, written-summed
+	closeWindow := func() {
+		windowStart, windowLen := dropped, written-dropped
 		if windowLen == 0 {
-			return nil
+			return
 		}
-		if _, cerr := io.CopyBuffer(sum, io.NewSectionReader(verifier, offset+windowStart, windowLen), buf); cerr != nil {
-			return cerr
-		}
-		summed = written
+		dropped = written
 		at, length := adviseRange(windowStart, windowLen, previous)
 		gentleAdviseDrop(dst, offset+at, length)
 		previous = windowLen
-		return nil
+	}
+	// pace sleeps for what was written since the last pause, at gentlePause per
+	// GentleWindow whatever the window or the caller's chunk size.
+	pace := func() {
+		if unpaced := written - paced; unpaced > 0 {
+			gentleSleep(time.Duration(int64(gentlePause)*written/GentleWindow) - time.Duration(int64(gentlePause)*paced/GentleWindow))
+			paced = written
+		}
 	}
 
 	for {
@@ -84,18 +99,16 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return 0, written, werr
 			}
+			sum.Write(buf[:n])
 			if progress != nil {
 				// A progress bar that cannot be written to is not a reason to
 				// fail a transfer.
 				_, _ = progress.Write(buf[:n])
 			}
 			written += int64(n)
-			if written-summed >= GentleWindow {
-				if cerr := closeWindow(); cerr != nil {
-					return 0, written, cerr
-				}
-				gentleSleep(gentlePause)
-				paced = written
+			if written-dropped >= GentleWindow {
+				closeWindow()
+				pace()
 			}
 		}
 		if readErr == io.EOF {
@@ -105,19 +118,11 @@ func GentleWrite(dst *os.File, verifier io.ReaderAt, offset int64, src io.Reader
 			return 0, written, readErr
 		}
 	}
-	// the last, partial window
-	if cerr := closeWindow(); cerr != nil {
-		return 0, written, cerr
-	}
-
-	// Pace what the loop did not. The sleep in the loop fires only on a full
-	// window, so the remainder of any call -- or the whole of one shorter than
-	// a window, which is every chunk of a download at a 1 MiB --chunk-size --
-	// would otherwise cost nothing at all. Proportional, so the rate is the
-	// same whatever the caller's chunk size: gentlePause per GentleWindow.
-	if unpaced := written - paced; unpaced > 0 {
-		gentleSleep(time.Duration(int64(gentlePause) * unpaced / GentleWindow))
-	}
+	// the last, partial window, and the pause for what the loop did not pace:
+	// the remainder of any call, or the whole of one shorter than a window,
+	// which is every chunk of a download at a 1 MiB --chunk-size
+	closeWindow()
+	pace()
 
 	// Then one more request over everything written. A drop request on dirty
 	// pages only starts their writeback, so a window can go no sooner than the
