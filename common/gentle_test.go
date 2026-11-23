@@ -51,14 +51,11 @@ func TestGentleWriteLandsTheBytesAndSumsWhatLanded(t *testing.T) {
 
 		fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 		require.NoError(t, err)
-		verifier, err := os.Open(path)
-		require.NoError(t, err)
 
 		var progress bytes.Buffer
-		crc, n, werr := GentleWrite(fl, verifier, 0, bytes.NewReader(content), &progress)
+		crc, n, werr := GentleWrite(fl, 0, 0, bytes.NewReader(content), &progress)
 		require.NoError(t, werr)
 		require.NoError(t, fl.Close())
-		require.NoError(t, verifier.Close())
 
 		assert.Equal(t, int64(size), n, "size %d: byte count", size)
 		assert.Equal(t, crc32.Checksum(content, Castagnoli), crc, "size %d: checksum", size)
@@ -100,12 +97,9 @@ func TestGentleWriteSumsOnlyItsOwnChunk(t *testing.T) {
 		require.NoError(t, err)
 		_, err = fl.Seek(c.off, io.SeekStart)
 		require.NoError(t, err)
-		verifier, err := os.Open(path)
-		require.NoError(t, err)
-		crc, n, werr := GentleWrite(fl, verifier, c.off, bytes.NewReader(content[c.off:c.off+c.length]), nil)
+		crc, n, werr := GentleWrite(fl, c.off, 0, bytes.NewReader(content[c.off:c.off+c.length]), nil)
 		require.NoError(t, werr)
 		require.NoError(t, fl.Close())
-		require.NoError(t, verifier.Close())
 		sums[i], lens[i] = crc, n
 	}
 
@@ -126,12 +120,9 @@ func TestGentleWriteReportsWhatItWroteBeforeFailing(t *testing.T) {
 	fl, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer func() { _ = fl.Close() }()
-	verifier, err := os.Open(path)
-	require.NoError(t, err)
-	defer func() { _ = verifier.Close() }()
 
 	src := io.MultiReader(bytes.NewReader(make([]byte, 4096)), failingReader{})
-	_, n, werr := GentleWrite(fl, verifier, 0, src, nil)
+	_, n, werr := GentleWrite(fl, 0, 0, src, nil)
 	assert.Error(t, werr)
 	assert.Equal(t, int64(4096), n)
 }
@@ -174,11 +165,8 @@ func gentleWriteOf(t *testing.T, size int, offset int64) (uint32, int64) {
 	defer func() { _ = fl.Close() }()
 	_, err = fl.Seek(offset, io.SeekStart)
 	require.NoError(t, err)
-	verifier, err := os.Open(path)
-	require.NoError(t, err)
-	defer func() { _ = verifier.Close() }()
 
-	crc, n, werr := GentleWrite(fl, verifier, offset, bytes.NewReader(bytes.Repeat([]byte("z"), size)), nil)
+	crc, n, werr := GentleWrite(fl, offset, 0, bytes.NewReader(bytes.Repeat([]byte("z"), size)), nil)
 	require.NoError(t, werr)
 	return crc, n
 }

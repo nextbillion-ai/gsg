@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
+	"github.com/nextbillion-ai/gsg/worker"
 	"google.golang.org/api/googleapi"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -28,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	awsv1 "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/aws/smithy-go"
@@ -154,6 +157,13 @@ func crc32cOf(attrs *S3Attributes) (uint32, bool) {
 func noComparableCRC32C(attrs *S3Attributes) bool {
 	c := attrs.S3Attrs.Checksum
 	return c == nil || c.ChecksumType != types.ChecksumTypeFullObject || c.ChecksumCRC32C == nil || *c.ChecksumCRC32C == ""
+}
+
+// unreadableCRC32C reports, for an object crc32cOf found no CRC32C on, that it
+// does store a whole-object one which cannot be decoded. -v must fail on that
+// rather than pass as if there were nothing to compare.
+func unreadableCRC32C(attrs *S3Attributes) bool {
+	return attrs != nil && attrs.S3Attrs != nil && !noComparableCRC32C(attrs)
 }
 
 // decodeCRC32C reads the wire form of a checksum: base64 of four big-endian
@@ -702,6 +712,24 @@ func (s *S3) Init(buckets ...string) error {
 	return err
 }
 
+// newHTTPClient is the SDK's default client with each connection failing a read
+// or write that moves nothing for common.StallTimeout. The SDK sets no deadline
+// on a request, rightly, since a body's duration scales with its size, so
+// without this a peer that stops answering holds a transfer forever.
+func newHTTPClient() *awshttp.BuildableClient {
+	return awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.DialContext = common.StallGuardDialContext(t.DialContext, common.StallTimeout)
+	})
+}
+
+// newTransport is the same guard for the region lookup, which goes through the
+// v1 SDK.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = common.StallGuardDialContext(t.DialContext, common.StallTimeout)
+	return t
+}
+
 // clientFor returns the client for one bucket, building it on first use.
 func (s *S3) clientFor(bucket string) (*s3.Client, error) {
 	s.mu.Lock()
@@ -714,12 +742,12 @@ func (s *S3) clientFor(bucket string) (*s3.Client, error) {
 	// the client. This used to return nil from the callback, leaving the
 	// fallback region in place, so a lookup that failed produced a client
 	// quietly pointed at the wrong place.
-	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession()), bucket, regionHint())
+	region, rerr := s3manager.GetBucketRegion(context.Background(), session.Must(session.NewSession(&awsv1.Config{HTTPClient: &http.Client{Transport: newTransport()}})), bucket, regionHint())
 	if rerr != nil {
 		logger.Info(module, "cannot determine the region of bucket[%s]: %s", bucket, rerr)
 		return nil, rerr
 	}
-	cfg, e1 := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	cfg, e1 := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region), config.WithHTTPClient(newHTTPClient()))
 	if e1 != nil {
 		msg := fmt.Sprintf("failed in loading defaultConfig with error: %s", e1)
 		logger.Info(module, "%s", msg)
@@ -795,9 +823,9 @@ func (s *S3) Download(
 	}
 	logger.Debug(module, "Downloading [%s] with %d chunk(s), chunk size: %d bytes, total size: %d bytes", prefix, chunkNumber, chunkSize, size)
 
-	var pb *bar.ProgressBar
+	// nil without Bars: no progress output
+	pb := ctx.Bars.New(size, fmt.Sprintf("Downloading [%s]:", prefix))
 	var wg sync.WaitGroup
-	var once sync.Once
 	var shortChunks atomic.Int64
 	// A failed chunk stops the others and fails the download with its error,
 	// so cp and rsync can tell one worth another attempt from one that is not.
@@ -828,6 +856,7 @@ func (s *S3) Download(
 	// without reading it back.
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
+	submit := worker.Submitter(ctx.Pool, chunkNumber, ctx.Concurrency)
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -843,13 +872,17 @@ func (s *S3) Download(
 		wantBytes := min(length+1, size-startByte)
 
 		wg.Add(1)
-		ctx.Pool.AddWithDepth(1,
+		submit(
 			func() {
 				defer wg.Done()
+				// A panic fails this download like any chunk error, rather
+				// than ending the process from inside a pool worker.
+				defer func() {
+					if r := recover(); r != nil {
+						fail("%s", common.PanicError(fmt.Sprintf("download object panicked in chunk %d", i), r))
+					}
+				}()
 
-				once.Do(func() {
-					pb = ctx.Bars.New(size, fmt.Sprintf("Downloading [%s]:", prefix))
-				})
 				if ff.Stopped() {
 					return
 				}
@@ -886,13 +919,19 @@ func (s *S3) Download(
 				var gotBytes int64
 				// length, not wantBytes: the byte this chunk fetches past its
 				// share is the next chunk's first, and summed there.
-				sum := common.NewChunkCRC32C(length)
+				var sum *common.ChunkCRC32C
+				var gentleSum uint32
+				var gentleLen int64
 				defer func() {
 					// a chunk that failed, or was stopped, has already said so
 					if ff.Stopped() {
 						return
 					}
-					chunkSums[i], chunkLens[i] = sum.Sum()
+					if ctx.GentleIO {
+						chunkSums[i], chunkLens[i] = gentleSum, gentleLen
+					} else {
+						chunkSums[i], chunkLens[i] = sum.Sum()
+					}
 					if gotBytes != wantBytes {
 						logger.Info(module, "download of s3://%s/%s got %d bytes at offset %d, expected %d", bucket, prefix, gotBytes, startByte, wantBytes)
 						shortChunks.Add(1)
@@ -902,48 +941,30 @@ func (s *S3) Download(
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
 					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
-					common.FadviseWriteSequential(fl)
-
-					// Use throttled copy: write in small chunks with delays
-					buf := make([]byte, 1*1024*1024) // 1MB buffer
-					totalWritten := int64(0)
-
-					for {
-						n, readErr := oo.Body.Read(buf)
-						if n > 0 {
-							if _, writeErr := fl.Write(buf[:n]); writeErr != nil {
-								fail("download object failed when write: %s", writeErr)
-								return
-							}
-							_, _ = sum.Write(buf[:n])
-							if _, writeErr := pb.Write(buf[:n]); writeErr != nil {
-								// Progress bar write error, non-fatal
-							}
-							totalWritten += int64(n)
-							gotBytes = totalWritten
-
-							// Every 10MB, pause and drop cache
-							if totalWritten%(10*1024*1024) == 0 {
-								common.FadviseWriteDontNeed(fl, startByte, totalWritten)
-								time.Sleep(time.Millisecond * 20) // 20ms pause every 10MB
-							}
-						}
-						if readErr == io.EOF {
-							break
-						}
-						if readErr != nil {
-							fail("download object failed when read: %s", readErr)
-							return
-						}
+					// The same writer gs and oci use: windows dropped from the
+					// page cache and paced as they are written, and summed.
+					var gerr error
+					gentleSum, gentleLen, gerr = common.GentleWrite(fl, startByte, length, io.LimitReader(oo.Body, length), pb)
+					gotBytes = gentleLen
+					if gerr != nil {
+						fail("download object failed when write: %s", gerr)
+						return
 					}
-
-					// Final fadvise to drop remaining data
-					common.FadviseWriteDontNeed(fl, startByte, totalWritten)
+					// The byte past this chunk's share is the next chunk's to
+					// write; it is read here only to be counted, so a body that
+					// ends early or runs long still fails the length check.
+					past, perr := io.Copy(io.Discard, io.LimitReader(oo.Body, wantBytes-length+1))
+					gotBytes += past
+					if perr != nil {
+						fail("download object failed when read: %s", perr)
+						return
+					}
 				} else {
 					// Fast mode: use buffered writer
 					bufWriter := bufio.NewWriterSize(fl, 4*1024*1024)
 					defer func() { _ = bufWriter.Flush() }()
 
+					sum = common.NewChunkCRC32C(length)
 					var we error
 					if gotBytes, we = io.Copy(io.MultiWriter(bufWriter, pb, sum), oo.Body); we != nil {
 						fail("download object failed when write to offet with %s", we)
@@ -981,69 +1002,98 @@ func (s *S3) Download(
 		_ = tmpFile.Close()
 	}
 
+	// Settled before the rename, so a download that does not match leaves
+	// whatever was at dstFile as it was.
+	crc, total := common.FoldCRC32C(chunkSums, chunkLens)
+	var cache bool
+	if !forceChecksum {
+		var keep bool
+		keep, cache = settleUnverifiedDownload(dstFile, bucket, prefix, attrs, size, crc, total)
+		if !keep {
+			_ = os.Remove(dstFileTemp)
+			return nil
+		}
+	} else {
+		// The point of -v. forceChecksum only ever set ChecksumMode on the
+		// request and then discarded the answer; MustEqualCRC32C was defined
+		// and called from nowhere, so the flag verified nothing on this
+		// backend.
+		if cache, err = s.verifyDownload(dstFile, bucket, prefix, size, crc, total); err != nil {
+			_ = os.Remove(dstFileTemp)
+			return err
+		}
+	}
+
 	err = os.Rename(dstFileTemp, dstFile)
 	if err != nil {
 		logger.Info(module, "download object failed when rename file with %s", err)
 		return err
 	}
 	common.SetFileModificationTime(dstFile, getR2ModificationTime(attrs))
-	crc, total := common.FoldCRC32C(chunkSums, chunkLens)
-	if !forceChecksum {
-		settleUnverifiedDownload(dstFile, bucket, prefix, attrs, size, crc, total)
-		return nil
+	if cache {
+		common.StoreFileCRC32C(dstFile, crc)
 	}
-	// The point of -v. forceChecksum only ever set ChecksumMode on the request
-	// and then discarded the answer; MustEqualCRC32C was defined and called
-	// from nowhere, so the flag verified nothing on this backend.
-	return s.verifyDownload(dstFile, bucket, prefix, size, crc, total)
+	return nil
 }
 
-// settleUnverifiedDownload caches the CRC32C a download summed while writing,
-// when it matches the object's, so the next rsync compares without reading the
-// file. Nothing was asked to be verified, so a mismatch is logged and nothing
-// else: the download succeeds as it did before anything was summed.
+// settleUnverifiedDownload decides, before the rename, whether a download
+// nobody asked to verify goes into place, and whether the CRC32C it summed
+// while writing is worth caching so the next rsync compares without reading
+// the file.
 //
-// An object without a whole-object CRC32C has nothing to match, so nothing is
-// cached for it.
-func settleUnverifiedDownload(dstFile, bucket, prefix string, attrs *S3Attributes, size int64, crc uint32, total int64) {
+// Nothing was asked to be verified, so a mismatch is logged and the download
+// still returns nil, as it did before anything was summed. But the file is not
+// renamed into place: whatever was at dstFile -- the previous copy, or nothing
+// -- stays, rather than bytes known to be wrong stamped with the object's
+// time, which a later rsync without -v trusts.
+//
+// An object without a whole-object CRC32C has nothing to match: it goes into
+// place, and nothing is cached for it.
+func settleUnverifiedDownload(dstFile, bucket, prefix string, attrs *S3Attributes, size int64, crc uint32, total int64) (keep, cache bool) {
 	want, ok := crc32cOf(attrs)
 	if !ok {
-		return
+		return true, false
 	}
 	if total != size || crc != want {
-		logger.Info(module, "CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
-			dstFile, bucket, prefix, total, crc, size, want)
-		return
+		logger.Info(module, "CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d]. %s is left as it was.",
+			dstFile, bucket, prefix, total, crc, size, want, dstFile)
+		return false, false
 	}
-	common.StoreFileCRC32C(dstFile, crc)
+	return true, true
 }
 
 // verifyDownload is MustEqualCRC32C for a file whose CRC32C was summed while it
 // was written: the object is looked up again and compared as before, but
-// against that sum rather than a second read of the whole file.
-func (s *S3) verifyDownload(dstFile, bucket, prefix string, size int64, crc uint32, total int64) error {
+// against that sum rather than a second read of the whole file. It runs before
+// the rename, and says whether the sum is worth caching once the file is in
+// place.
+func (s *S3) verifyDownload(dstFile, bucket, prefix string, size int64, crc uint32, total int64) (cache bool, err error) {
 	attr, err := s.S3Attrs(bucket, prefix)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if attr == nil {
-		return common.Caused(fmt.Sprintf("cannot verify s3://%s/%s: no such object", bucket, prefix), common.ErrNoSuchObject)
+		return false, common.Caused(fmt.Sprintf("cannot verify s3://%s/%s: no such object", bucket, prefix), common.ErrNoSuchObject)
 	}
 	want, ok := crc32cOf(attr)
 	if !ok {
+		if unreadableCRC32C(attr) {
+			log := fmt.Sprintf("CRC32C checking failed for bucket[%s] prefix[%s]: the stored CRC32C cannot be read", bucket, prefix)
+			logger.Info(module, log)
+			return false, errors.New(log)
+		}
 		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
-		return nil
+		return false, nil
 	}
 	logger.Info(module, "CRC32C checking of local[%s] and bucket[%s] prefix[%s] are [%d] with [%d].",
 		dstFile, bucket, prefix, crc, want)
 	if total != size || crc != want {
 		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 		logger.Info(module, log)
-		return errors.New(log)
+		return false, errors.New(log)
 	}
-	common.StoreFileCRC32C(dstFile, crc)
 	logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
-	return nil
+	return true, nil
 }
 
 // UploadObject uploads an object from a file
@@ -1302,6 +1352,9 @@ func (s *S3) equalCRC32C(localPath, bucket, object string) (equal, comparable bo
 	}
 	remote, ok := crc32cOf(attr)
 	if !ok {
+		if unreadableCRC32C(attr) {
+			return false, false, fmt.Errorf("cannot verify s3://%s/%s: the stored CRC32C cannot be read", bucket, object)
+		}
 		return false, false, nil
 	}
 	local := common.GetFileCRC32C(localPath)

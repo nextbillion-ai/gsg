@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -140,20 +141,40 @@ func TestDownloadCachesTheCRC32CItSummedWhileWriting(t *testing.T) {
 	}
 }
 
-func TestDownloadWhoseSumDisagreesIsNotCachedAndFailsOnlyUnderV(t *testing.T) {
+// A sum that disagrees fails the download only under -v; without -v it is
+// logged and the download still returns nil. Either way the file it wrote is
+// not renamed into place: whatever was at the destination before -- a
+// previous copy, or nothing -- is left as it was, and no temp file stays.
+func TestDownloadWhoseSumDisagreesLeavesTheDestinationAsItWas(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789"), 100)
+	previous := []byte("the previous, good copy")
 	real := crc32.Checksum(content, common.Castagnoli)
 	for _, gentle := range []bool{false, true} {
-		name := fmt.Sprintf("gentle=%v", gentle)
-		dst := filepath.Join(t.TempDir(), "o.bin")
-		assert.Error(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(real^1)), 333, true, gentle, dst), name)
-
-		dst = filepath.Join(t.TempDir(), "o.bin")
-		require.NoError(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(real^1)), 333, false, gentle, dst), name)
-		got, err := os.ReadFile(dst)
-		require.NoError(t, err)
-		assert.Equal(t, content, got, name)
-		assert.Equal(t, real, common.GetFileCRC32C(dst), "%s: the disagreeing sum is not cached", name)
+		for _, verify := range []bool{true, false} {
+			for _, existing := range []bool{true, false} {
+				name := fmt.Sprintf("gentle=%v -v=%v existing=%v", gentle, verify, existing)
+				dir := t.TempDir()
+				dst := filepath.Join(dir, "o.bin")
+				if existing {
+					require.NoError(t, os.WriteFile(dst, previous, 0o644))
+				}
+				err := downloadVerified(t, rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(real^1)), 333, verify, gentle, dst)
+				if verify {
+					assert.Error(t, err, name)
+				} else {
+					assert.NoError(t, err, "%s: without -v a mismatch is reported, not fatal", name)
+				}
+				left, _ := os.ReadDir(dir)
+				if existing {
+					got, rerr := os.ReadFile(dst)
+					require.NoError(t, rerr, name)
+					assert.Equal(t, previous, got, "%s: the previous copy is kept", name)
+					assert.Len(t, left, 1, "%s: no temp file is left", name)
+				} else {
+					assert.Empty(t, left, "%s: nothing is put in place, and no temp file is left", name)
+				}
+			}
+		}
 	}
 }
 
@@ -170,4 +191,66 @@ func TestDownloadOfAnObjectWithoutACRC32CCachesNothing(t *testing.T) {
 			assert.NotEqual(t, real, cachedCRC32C(t, dst), "checksum %q -v=%v: nothing cached", checksum, verify)
 		}
 	}
+}
+
+// A whole-object CRC32C that is stored but cannot be decoded is unknown, not
+// absent. -v must fail on it rather than pass without comparing anything;
+// without -v the file goes into place uncached, as for a missing checksum.
+func TestDownloadOfAnObjectWithAnUnreadableCRC32C(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789"), 100)
+	real := crc32.Checksum(content, common.Castagnoli)
+	unreadable := `<Checksum><ChecksumCRC32C>!!notbase64</ChecksumCRC32C><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>`
+	for _, gentle := range []bool{false, true} {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "o.bin")
+		err := downloadVerified(t, rangedObjectWithChecksum(t, content, 0, unreadable), 333, true, gentle, dst)
+		assert.Error(t, err, "gentle=%v: -v cannot pass on a checksum it could not read", gentle)
+		left, _ := os.ReadDir(dir)
+		assert.Empty(t, left, "gentle=%v: nothing is put in place, and no temp file is left", gentle)
+
+		require.NoError(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, unreadable), 333, false, gentle, dst), "gentle=%v", gentle)
+		got, rerr := os.ReadFile(dst)
+		require.NoError(t, rerr)
+		assert.Equal(t, content, got, "gentle=%v", gentle)
+		assert.NotEqual(t, real, cachedCRC32C(t, dst), "gentle=%v: nothing cached", gentle)
+	}
+}
+
+// The library API builds a RunContext with neither Bars nor a Pool; the
+// download dereferenced both inside a pool worker, whose recovery then ended
+// the caller's process with os.Exit(1).
+func TestDownloadAndUploadNeedNeitherBarsNorAPool(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789"), 100)
+	want := crc32.Checksum(content, common.Castagnoli)
+	for _, ctx := range []system.RunContext{
+		{},
+		{ChunkSize: 333},
+		{ChunkSize: 333, GentleIO: true},
+		{ChunkSize: 64, Concurrency: 3},
+	} {
+		name := fmt.Sprintf("%+v", ctx)
+		dst := filepath.Join(t.TempDir(), "o.bin")
+		s := rangedObjectWithChecksum(t, content, 0, fullObjectChecksum(want))
+		require.NoError(t, s.Download("b", "o.bin", dst, false, ctx), name)
+		got, err := os.ReadFile(dst)
+		require.NoError(t, err, name)
+		assert.Equal(t, content, got, name)
+	}
+
+	var put atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "unexpected "+r.Method, http.StatusBadRequest)
+			return
+		}
+		n, _ := io.Copy(io.Discard, r.Body)
+		put.Add(n)
+		w.Header().Set("ETag", `"x"`)
+	}))
+	t.Cleanup(srv.Close)
+	s := &S3{clients: map[string]*s3.Client{"b": clientAt(srv)}}
+	src := filepath.Join(t.TempDir(), "src.bin")
+	require.NoError(t, os.WriteFile(src, content, 0o644))
+	require.NoError(t, s.Upload(src, "b", "o.bin", system.RunContext{}))
+	assert.Positive(t, put.Load())
 }

@@ -445,6 +445,39 @@ func TestDeletePartHasADeadline(t *testing.T) {
 	assert.True(t, transientDeleteError(err), "a timeout is worth another attempt")
 }
 
+// A sweep's context bounds its deletes: one in flight ends with it, and one
+// not yet started is abandoned at once rather than tried again.
+func TestDeletePartWithinEndsWithTheCallersContext(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	h := client.Bucket("b").Object("hung").Generation(7)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = deletePartWithin(ctx, h)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second, "the caller's deadline, not the 30 s of the delete")
+
+	err = deletePartWithin(ctx, h)
+	assert.ErrorIs(t, err, errDeleteAbandoned)
+	assert.False(t, transientDeleteError(err), "an ended context is not worth another attempt")
+
+	partDeleteSleep = func(time.Duration) { t.Error("no wait for a delete the caller abandoned") }
+	defer func() { partDeleteSleep = time.Sleep }()
+	failed := deletePartsReporting([]*storage.ObjectHandle{h, h}, func(h *storage.ObjectHandle) error { return deletePartWithin(ctx, h) })
+	assert.Equal(t, []bool{true, true}, failed)
+}
+
 func TestLookupPart(t *testing.T) {
 	var mu sync.Mutex
 	requests := map[string]int{}
@@ -551,15 +584,14 @@ func TestVerifyDownloadAcceptsChunkSumsThatAddUpToTheObject(t *testing.T) {
 
 	for _, cuts := range [][]int{nil, {1}, {1 << 19, 3 << 18}} {
 		sums, lens := gentleSums(content, cuts...)
-		assert.NoError(t, verifyDownload(true, path, "b", "o", gentleAttrs(content), sums, lens), "cuts %v", cuts)
+		for _, verify := range []bool{true, false} {
+			crc, keep, cache, err := verifyDownload(verify, path, "b", "o", gentleAttrs(content), sums, lens)
+			assert.NoError(t, err, "cuts %v", cuts)
+			assert.True(t, keep, "cuts %v", cuts)
+			assert.True(t, cache, "cuts %v", cuts)
+			assert.Equal(t, gentleAttrs(content).CRC32C, crc, "cuts %v: the sum to cache", cuts)
+		}
 	}
-
-	// the sum is now served from the cache: the content below no longer adds up to it
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("x"), len(content)), 0644))
-	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
-	assert.Equal(t, gentleAttrs(content).CRC32C, common.GetFileCRC32C(path))
 }
 
 func TestVerifyDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
@@ -570,17 +602,50 @@ func TestVerifyDownloadRejectsAWrongSumOrAShortFile(t *testing.T) {
 
 	sums, lens := gentleSums(content, 1000)
 	sums[1] ^= 1
-	assert.Error(t, verifyDownload(true, path, "b", "o", attrs, sums, lens))
-	assert.NoError(t, verifyDownload(false, path, "b", "o", attrs, sums, lens), "without -v a mismatch is reported, not fatal")
+	_, keep, _, err := verifyDownload(true, path, "b", "o", attrs, sums, lens)
+	assert.Error(t, err)
+	assert.False(t, keep)
+	_, keep, _, err = verifyDownload(false, path, "b", "o", attrs, sums, lens)
+	assert.NoError(t, err, "without -v a mismatch is reported, not fatal")
+	assert.False(t, keep, "but it is still a mismatch")
 
 	sums, lens = gentleSums(content[:len(content)-1], 1000)
-	assert.Error(t, verifyDownload(true, path, "b", "o", attrs, sums, lens))
+	_, keep, _, err = verifyDownload(true, path, "b", "o", attrs, sums, lens)
+	assert.Error(t, err)
+	assert.False(t, keep)
+}
+
+// An object that stores no CRC32C reads as 0 in the attrs, which have no
+// presence bit. There is nothing to compare: the file goes into place, as on s3 and
+// oci, and its sum is not cached. A size that disagrees is still a mismatch.
+func TestVerifyDownloadOfAnObjectThatStoresNoCRC32C(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<12)
+	path := filepath.Join(t.TempDir(), "input.osrm.geometry")
+	require.NoError(t, os.WriteFile(path, content, 0644))
+	attrs := &storage.ObjectAttrs{Size: int64(len(content))}
+
+	sums, lens := gentleSums(content, 1000)
+	for _, verify := range []bool{true, false} {
+		_, keep, cache, err := verifyDownload(verify, path, "b", "o", attrs, sums, lens)
+		assert.NoError(t, err, "-v %t: nothing to compare with is not a mismatch", verify)
+		assert.True(t, keep, "-v %t: the file goes into place", verify)
+		assert.False(t, cache, "-v %t: nothing is cached for an object without a checksum", verify)
+	}
+
+	sums, lens = gentleSums(content[:len(content)-1], 1000)
+	for _, verify := range []bool{true, false} {
+		_, keep, _, _ := verifyDownload(verify, path, "b", "o", attrs, sums, lens)
+		assert.False(t, keep, "-v %t: a short file is a mismatch with or without a checksum", verify)
+	}
 }
 
 func TestVerifyDownloadOfAnEmptyObject(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty")
 	require.NoError(t, os.WriteFile(path, nil, 0644))
-	assert.NoError(t, verifyDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0}))
+	_, keep, cache, err := verifyDownload(true, path, "b", "o", gentleAttrs(nil), []uint32{0}, []int64{0})
+	assert.NoError(t, err)
+	assert.True(t, keep)
+	assert.True(t, cache, "an empty object's CRC32C is a genuine 0, and the file sums to it")
 }
 
 // Chunks are separate range reads, and each must ask for the generation the
@@ -690,7 +755,10 @@ type fakeComposite struct {
 	composed []string // the crc32c each compose was asked to confirm
 	deleted  []string
 	mtimes   []string // the goog-reserved-file-mtime of each single-stream upload
+	listed   int      // listings, as the sweep before an upload makes
 	onLast   func(part string)
+	// onCompose runs as the compose arrives, before it is answered
+	onCompose func()
 }
 
 func (fc *fakeComposite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -739,7 +807,15 @@ func (fc *fakeComposite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fc.onLast(name)
 		}
 		_, _ = fmt.Fprintf(w, `{"bucket":"b","name":%q,"generation":"7"}`, name)
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/o"):
+		fc.mu.Lock()
+		fc.listed++
+		fc.mu.Unlock()
+		_, _ = w.Write([]byte(`{"kind":"storage#objects"}`))
 	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/compose"):
+		if fc.onCompose != nil {
+			fc.onCompose()
+		}
 		var req struct {
 			Destination struct {
 				Crc32c string `json:"crc32c"`
@@ -1111,22 +1187,100 @@ func TestDownloadCachesTheCRC32CItSummedWhileWriting(t *testing.T) {
 }
 
 // A sum that disagrees with the object fails the download only under -v, as a
-// read-back did; without -v it is logged and the download succeeds as before.
-// Either way the disagreeing sum is not cached.
-func TestDownloadWhoseSumDisagreesIsNotCachedAndFailsOnlyUnderV(t *testing.T) {
+// read-back did; without -v it is logged and the download still returns nil.
+// Either way the file it wrote is not renamed into place: whatever was at the
+// destination before -- a previous copy, or nothing -- is left as it was, and
+// no temp file stays behind.
+func TestDownloadWhoseSumDisagreesLeavesTheDestinationAsItWas(t *testing.T) {
 	content := []byte("0123456789abcdefghijklm")
+	previous := []byte("the previous, good copy")
 	wrong := crc32cBase64([]byte("something else"))
 	for _, gentle := range []bool{false, true} {
-		name := fmt.Sprintf("gentle=%v", gentle)
-		dst := filepath.Join(t.TempDir(), "o")
-		assert.Error(t, downloadServed(t, servedObject(t, content, wrong), dst, true, gentle, 4), name)
+		for _, verify := range []bool{true, false} {
+			for _, existing := range []bool{true, false} {
+				name := fmt.Sprintf("gentle=%v -v=%v existing=%v", gentle, verify, existing)
+				dir := t.TempDir()
+				dst := filepath.Join(dir, "o")
+				var before os.FileInfo
+				if existing {
+					require.NoError(t, os.WriteFile(dst, previous, 0644))
+					old := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+					require.NoError(t, os.Chtimes(dst, old, old))
+					var err error
+					before, err = os.Stat(dst)
+					require.NoError(t, err)
+				}
+				err := downloadServed(t, servedObject(t, content, wrong), dst, verify, gentle, 4)
+				if verify {
+					assert.Error(t, err, name)
+				} else {
+					assert.NoError(t, err, "%s: without -v a mismatch is reported, not fatal", name)
+				}
+				left, _ := os.ReadDir(dir)
+				if existing {
+					got, rerr := os.ReadFile(dst)
+					require.NoError(t, rerr, name)
+					assert.Equal(t, string(previous), string(got), "%s: the previous copy is kept", name)
+					after, serr := os.Stat(dst)
+					require.NoError(t, serr, name)
+					assert.True(t, after.ModTime().Equal(before.ModTime()), "%s: and its time, so rsync still sees it as stale", name)
+					assert.Len(t, left, 1, "%s: no temp file is left", name)
+				} else {
+					assert.Empty(t, left, "%s: nothing is put in place, and no temp file is left", name)
+				}
+			}
+		}
+	}
+}
 
-		dst = filepath.Join(t.TempDir(), "o")
-		require.NoError(t, downloadServed(t, servedObject(t, content, wrong), dst, false, gentle, 4), name)
+// A download that matches replaces what was there.
+func TestDownloadThatMatchesReplacesThePreviousCopy(t *testing.T) {
+	content := []byte("0123456789abcdefghijklm")
+	for _, gentle := range []bool{false, true} {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "o")
+		require.NoError(t, os.WriteFile(dst, []byte("an older copy"), 0644))
+		require.NoError(t, downloadServed(t, servedObject(t, content, crc32cBase64(content)), dst, false, gentle, 4))
 		got, err := os.ReadFile(dst)
 		require.NoError(t, err)
-		assert.Equal(t, string(content), string(got), name)
-		assert.Equal(t, crc32.Checksum(content, common.Castagnoli), common.GetFileCRC32C(dst),
-			"%s: the file's own sum, read from the file, not the one that disagreed", name)
+		assert.Equal(t, string(content), string(got))
+		left, _ := os.ReadDir(dir)
+		assert.Len(t, left, 1)
 	}
+}
+
+// The library API builds a RunContext with neither Bars nor a Pool. Both used
+// to be dereferenced inside a pool worker, whose recovery then ended the
+// caller's process with os.Exit(1).
+func TestDownloadAndUploadNeedNeitherBarsNorAPool(t *testing.T) {
+	content := []byte("0123456789abcdefghijklm")
+	for _, ctx := range []system.RunContext{
+		{},
+		{ChunkSize: 4},
+		{ChunkSize: 4, GentleIO: true},
+		{ChunkSize: 4, Concurrency: 3},
+	} {
+		name := fmt.Sprintf("%+v", ctx)
+		dst := filepath.Join(t.TempDir(), "o")
+		require.NoError(t, servedObject(t, content, crc32cBase64(content)).Download("b", "o", dst, true, ctx), name)
+		got, err := os.ReadFile(dst)
+		require.NoError(t, err, name)
+		assert.Equal(t, string(content), string(got), name)
+	}
+
+	fc := &fakeComposite{sessions: map[string]string{}}
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	require.NoError(t, err)
+	g := &GCS{client: client}
+
+	src := filepath.Join(t.TempDir(), "small.csv")
+	require.NoError(t, os.WriteFile(src, content, 0600))
+	require.NoError(t, g.Upload(src, "b", "o", system.RunContext{}), "one stream")
+
+	f, _ := compositeSource(t)
+	require.NoError(t, g.Upload(f.Name(), "b", "o", system.RunContext{Concurrency: 4}), "parts, without a pool")
+	assert.Len(t, fc.composed, 1)
+	assert.Len(t, fc.deleted, 2, "both parts are deleted after the compose")
 }

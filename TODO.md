@@ -2436,6 +2436,12 @@ Storage is not the only cost. The parts are ordinary objects, so a later
 `rsync -r` of that directory downloads them, and anything reading the directory
 sees them.
 
+**Partly addressed (#99):** a composite upload first deletes the parts that
+earlier uploads of the same object left, once their newest part is an hour old,
+so a rerun after a kill cleans up after it; `gsg sweep-parts` does the same for
+a whole prefix. An object that is never uploaded again keeps its parts until
+someone sweeps, and the signal handler below is still open.
+
 **Fix:** on SIGTERM and SIGINT, cancel the uploads and run the same sweep before
 exiting, inside the grace period (30 s by default in Kubernetes). Separately,
 `ls`, `cp -r` and `rsync -r` could skip names matching
@@ -2771,6 +2777,9 @@ sequence swept cleanly: which request the refusal lands on is a race.
 
 No case: the race decides whether the refused connection hits a part's
 reconnect or the sweep.
+
+**Partly addressed (#99):** the next upload of the same object, or
+`gsg sweep-parts`, deletes them once they are an hour old.
 
 **Fix:** keep the names an attempt could not settle, and sweep them again
 after the retry. A lookup refused a moment ago usually goes through by then,

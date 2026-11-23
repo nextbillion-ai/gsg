@@ -61,3 +61,31 @@ read is reported after the fact with a non-zero exit: treat the output as the
 object only when gsg exits 0, e.g. with `set -o pipefail`. Log lines go to
 stderr. When the reader closes the pipe early (`| head -c 100`), gsg ends at
 once on SIGPIPE, as `cat` does.
+
+-stalled connections:
+`--stall-timeout` (library: `common.StallTimeout`)
+
+Every connection gsg opens, on gs, s3 and oci, fails a read or write that moves
+no byte for `--stall-timeout`, 2 minutes by default: response headers that never
+come, a body that stops part-way, and an upload the service stops taking. There
+is no deadline on a whole transfer, so a large one that keeps moving is never
+cut. The failure goes to the same retries as a dropped connection (three
+attempts for `cp` and `rsync`). `0` turns the guard off. A library caller sets
+`common.StallTimeout` before its first transfer; a caller that builds its own
+gs client gets the guard from `gcs.NewTransport`, or by wrapping its dialer in
+`common.StallGuardDialContext`.
+
+-composite upload parts:
+`gsg sweep-parts [--older-than 1h] gs://bucket/prefix`
+
+A composite upload (`-m`, files above 256 MiB on gs) writes parts named
+`<object>.gsg-part-<id>-NN` and deletes them after the compose. A process
+killed in between leaves them. `sweep-parts` deletes the parts of every upload
+under the prefix whose newest part is older than `--older-than`, each at the
+generation listed. A running upload is left alone only while it finishes a
+part within every `--older-than`: one whose parts each take longer (a 1 TB
+object's 32 GB parts below about 9 MB/s, for the default hour) can be swept
+while it runs, and then fails at its compose rather than composing a hole.
+jam-core's `.jam-part-` parts are swept the same way. A composite upload also
+runs this sweep for its own object before it starts, so a rerun after a kill
+removes what the killed run left. The library call is `(*gcs.GCS).SweepParts`.

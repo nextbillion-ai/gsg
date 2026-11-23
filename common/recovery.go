@@ -9,12 +9,15 @@ import (
 
 var AppMode bool
 
-// Recovery recovers from exceptions
+// Recovery recovers from exceptions. The command exits non-zero; a library
+// caller is only told, since ending its process is not gsg's decision.
 func Recovery() {
 	if r := recover(); r != nil {
 		logger.Debug(module, "stacktrace from panic: \n"+string(debug.Stack()))
 		logger.Error(module, "[RECOVERED] with %s", r)
-		os.Exit(1)
+		if AppMode {
+			os.Exit(1)
+		}
 	}
 }
 

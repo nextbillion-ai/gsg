@@ -53,6 +53,10 @@ func init() {
 		&gentleIO, "gentle-io", false,
 		"enable gentle I/O mode to reduce impact on other applications (uses O_DIRECT, fadvise, throttling)",
 	)
+	rootCmd.PersistentFlags().DurationVar(
+		&common.StallTimeout, "stall-timeout", common.DefaultStallTimeout,
+		"fail a connection that moves no byte for this long (headers, body or upload), so the transfer is retried; 0 disables",
+	)
 	rootCmd.PersistentFlags().Bool(
 		"debug", false,
 		"enable debugging mode to print more logs",

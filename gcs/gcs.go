@@ -25,6 +25,7 @@ import (
 	"github.com/nextbillion-ai/gsg/common"
 	"github.com/nextbillion-ai/gsg/logger"
 	"github.com/nextbillion-ai/gsg/system"
+	"github.com/nextbillion-ai/gsg/worker"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -95,8 +96,41 @@ func (g *GCS) toFileObject(attrs *storage.ObjectAttrs, bucket string) *system.Fi
 
 // NewWithClient returns a GCS that uses c instead of building a client from
 // GOOGLE_APPLICATION_CREDENTIALS, for a caller pointing gsg at another endpoint.
+// c's transport is the caller's: build it with NewTransport, or wrap its dialer
+// in common.StallGuardDialContext, for transfers to fail on a peer that stops.
 func NewWithClient(c *storage.Client) *GCS {
 	return &GCS{client: c}
+}
+
+// NewTransport is the transport under every request of a client gsg builds,
+// before authentication is layered on.
+//
+// Over HTTP/2 every chunk of a transfer is multiplexed onto one TCP connection,
+// which caps a gsg process at roughly 230 MB/s. HTTP/1.1 with a keep-alive pool
+// spreads the chunks over as many connections as there are workers; http2
+// (GSG_HTTP2=1) keeps HTTP/2.
+//
+// Each connection fails a read or write that moves nothing for
+// common.StallTimeout. Nothing else bounds a transfer: the library's calls run
+// on context.Background(), so without it a peer that stops answering mid-body,
+// before the headers, or while taking an upload holds the process forever.
+func NewTransport(http2 bool) *http.Transport {
+	t := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           common.StallGuardDialContext((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext, common.StallTimeout),
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		ForceAttemptHTTP2:     http2,
+	}
+	if !http2 {
+		// no h2 in ALPN either, or the server still negotiates HTTP/2
+		t.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return t
 }
 
 // storageClient gets or creates a gcp storage client
@@ -117,34 +151,12 @@ func (g *GCS) Init(_ ...string) error {
 		logger.Info(module, "gcs: failed in loading [%s=%s] with error: %s", googleApplicationCredentialsEnv, path, err)
 		return err
 	}
-	// Over HTTP/2 every chunk of a transfer is multiplexed onto one TCP connection, which
-	// caps a gsg process at roughly 230 MB/s. HTTP/1.1 with a keep-alive pool spreads the
-	// chunks over as many connections as there are workers. GSG_HTTP2=1 keeps HTTP/2.
-	var clientOpts []option.ClientOption
-	if os.Getenv("GSG_HTTP2") != "1" {
-		base := &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: time.Second,
-			MaxIdleConns:          1024,
-			MaxIdleConnsPerHost:   1024,
-			ForceAttemptHTTP2:     false,
-			// no h2 in ALPN either, or the server still negotiates HTTP/2
-			TLSClientConfig: &tls.Config{NextProtos: []string{"http/1.1"}},
-			TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{},
-		}
-		rt, terr := htransport.NewTransport(context.Background(), base, option.WithCredentialsFile(path), option.WithScopes(storage.ScopeFullControl))
-		if terr != nil {
-			logger.Info(module, "get transport failed with %s", terr)
-			return terr
-		}
-		clientOpts = []option.ClientOption{option.WithHTTPClient(&http.Client{Transport: rt})}
-	} else {
-		clientOpts = []option.ClientOption{option.WithCredentialsFile(path)}
+	rt, terr := htransport.NewTransport(context.Background(), NewTransport(os.Getenv("GSG_HTTP2") == "1"), option.WithCredentialsFile(path), option.WithScopes(storage.ScopeFullControl))
+	if terr != nil {
+		logger.Info(module, "get transport failed with %s", terr)
+		return terr
 	}
-	g.client, err = storage.NewClient(context.Background(), clientOpts...)
+	g.client, err = storage.NewClient(context.Background(), option.WithHTTPClient(&http.Client{Transport: rt}))
 	if err != nil {
 		logger.Info(module, "get client failed with %s", err)
 		return err
@@ -444,9 +456,9 @@ func (g *GCS) Download(
 	// chunk opened after the overwrite still reads the old generation where
 	// versioning keeps it, and fails where it does not.
 	obj := g.client.Bucket(bucket).Object(prefix).Generation(attrs.Generation)
-	var pb *bar.ProgressBar
+	// nil without Bars: no progress output
+	pb := ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
 	var wg sync.WaitGroup
-	var once sync.Once
 	dstFileTemp := common.GetTempFile(dstFile)
 	// Every chunk opens this file, so it has to exist before any is fetched.
 	folder, _ := common.ParseFile(dstFile)
@@ -477,6 +489,7 @@ func (g *GCS) Download(
 	chunkSums := make([]uint32, chunkNumber)
 	chunkLens := make([]int64, chunkNumber)
 	var shortChunks atomic.Int64
+	submit := worker.Submitter(ctx.Pool, chunkNumber, ctx.Concurrency)
 	for i := 0; i < chunkNumber; i++ {
 
 		// decide offset and length
@@ -488,15 +501,19 @@ func (g *GCS) Download(
 		}
 
 		wg.Add(1)
-		ctx.Pool.AddWithDepth(1,
+		submit(
 			func() {
 				defer func() {
 					wg.Done()
 				}()
+				// A panic fails this download like any chunk error, rather
+				// than ending the process from inside a pool worker.
+				defer func() {
+					if r := recover(); r != nil {
+						fail("%s", common.PanicError(fmt.Sprintf("download object panicked in chunk %d", i), r))
+					}
+				}()
 
-				once.Do(func() {
-					pb = ctx.Bars.New(attrs.Size, fmt.Sprintf("Downloading [%s]:", prefix))
-				})
 				if ff.Stopped() {
 					return
 				}
@@ -543,17 +560,9 @@ func (g *GCS) Download(
 				// If gentle I/O mode, use throttled writer to reduce impact
 				if ctx.GentleIO {
 					logger.Debug(module, "Using gentle I/O mode with throttled writer for chunk at offset %d", startByte)
-					// The chunk is summed from the file as it is written, so the
-					// transfer can be settled without reading it back afterwards.
-					// That needs a second handle: fl is open for writing and its
-					// offset is in use.
-					verifier, verr := os.Open(dstFileTemp)
-					if verr != nil {
-						fail("download object failed when open for verify: %s", verr)
-						return
-					}
-					defer func() { _ = verifier.Close() }()
-					sum, written, gerr := common.GentleWrite(fl, verifier, startByte, rc, pb)
+					// The chunk is summed as it is written, so the transfer can
+					// be settled without reading it back afterwards.
+					sum, written, gerr := common.GentleWrite(fl, startByte, length, rc, pb)
 					if gerr != nil {
 						fail("download object failed in gentle mode with %s", gerr)
 						return
@@ -602,42 +611,71 @@ func (g *GCS) Download(
 		_ = tmpFile.Close()
 	}
 
+	// Settled before the rename, so a download that does not match leaves
+	// whatever was at dstFile as it was. Against the generation the chunks
+	// read, not a fresh lookup by name: an overwrite landing after the last
+	// chunk would otherwise have a correct copy of the old generation reported
+	// as corrupt.
+	crc, keep, cache, err := verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
+	if !keep {
+		_ = os.Remove(dstFileTemp)
+		return err
+	}
+
 	err = os.Rename(dstFileTemp, dstFile)
 	if err != nil {
 		logger.Info(module, "download object failed when rename file with %s", err)
 		return err
 	}
 	common.SetFileModificationTime(dstFile, GetFileModificationTime(attrs))
-	// Settled against the generation the chunks read, not a fresh lookup by
-	// name: an overwrite landing after the last chunk would otherwise have a
-	// correct copy of the old generation reported as corrupt.
-	return verifyDownload(forceChecksum, dstFile, bucket, prefix, attrs, chunkSums, chunkLens)
+	if cache {
+		common.StoreFileCRC32C(dstFile, crc)
+	}
+	return nil
 }
 
 // verifyDownload settles a download from the sums its chunks took while
-// writing, and caches the file's CRC32C when it matches the object's, so the
-// next rsync compares without reading the file. The file is not read again:
-// that read is as large as the file, and in gentle mode it would come from
-// disk, since the pages have been dropped from the cache all along.
+// writing, before the temp file is renamed. It says whether the file goes into
+// place, and whether its CRC32C, matching the object's, is worth caching once
+// the file has its name and time so the next rsync compares without reading the
+// file. The file is not read again: that read is as large as the file, and in
+// gentle mode it would come from disk, since the pages have been dropped all
+// along.
 //
-// Without -v a mismatch is logged and the download still succeeds, as it did
-// before anything was summed; it is just not cached.
-func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) error {
+// A file that does not match is never renamed into place. Under -v that is the
+// download's error. Without -v the mismatch is logged and the download returns
+// nil, as it did before anything was summed, but whatever was at dstFile --
+// the previous copy, or nothing -- stays: replacing it would stamp bytes known
+// to be wrong with the object's time, which a later rsync without -v trusts.
+//
+// The JSON API leaves crc32c out for an object that stores none, and
+// ObjectAttrs.CRC32C has no presence bit, so that reads as 0. (An XML-API
+// multipart upload, the usual example, did get one when tried on nb-data.) A stored 0
+// that the file sums to is a match like any other. A 0 the file does not sum
+// to cannot be told from "none stored", so it is treated as nothing to compare,
+// as s3 and oci treat a missing checksum: the file goes into place and is not
+// cached. For an object whose real CRC32C is 0 that lets a corrupt download of
+// the right size through; the size is still checked.
+func verifyDownload(forceChecksum bool, dstFile, bucket, prefix string, attrs *storage.ObjectAttrs, sums []uint32, lens []int64) (crc uint32, keep, cache bool, err error) {
 	crc, total := common.FoldCRC32C(sums, lens)
-	if total != attrs.Size || crc != attrs.CRC32C {
-		log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
-			dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
-		logger.Info(module, log)
-		if !forceChecksum {
-			return nil
+	if total == attrs.Size && crc == attrs.CRC32C {
+		if forceChecksum {
+			logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
 		}
-		return errors.New(log)
+		return crc, true, true, nil
 	}
-	common.StoreFileCRC32C(dstFile, crc)
-	if forceChecksum {
-		logger.Info(module, "CRC32C checking success of local[%s] and bucket[%s] prefix[%s].", dstFile, bucket, prefix)
+	if total == attrs.Size && attrs.CRC32C == 0 {
+		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
+		return crc, true, false, nil
 	}
-	return nil
+	log := fmt.Sprintf("CRC32C checking failed of local[%s] and bucket[%s] prefix[%s]: %d bytes summing to [%d], object has %d bytes and [%d].",
+		dstFile, bucket, prefix, total, crc, attrs.Size, attrs.CRC32C)
+	if !forceChecksum {
+		logger.Info(module, "%s %s is left as it was.", log, dstFile)
+		return crc, false, false, nil
+	}
+	logger.Info(module, log)
+	return crc, false, false, errors.New(log)
 }
 
 // DoAttemptUnlock takes generation as input and returns potential error
@@ -763,7 +801,7 @@ func (g *GCS) Upload(srcFile, bucket, object string, ctx system.RunContext) erro
 	}
 	size, modTime := before.Size(), before.ModTime()
 
-	// progress bar
+	// progress bar; nil without Bars, which counts nothing
 	pb := ctx.Bars.New(size, fmt.Sprintf("Uploading [%s]:", srcFile))
 
 	// upload file
@@ -837,6 +875,13 @@ var partDeleteTimeout = 30 * time.Second
 var partLookupTimeout = 30 * time.Second
 var bucketAttrsTimeout = 30 * time.Second
 
+// composeTimeout bounds the compose. It moves no data, the service joins the
+// parts by reference, but without a deadline a request the service keeps open
+// holds the upload, with its parts in the bucket, for good. The stall guard
+// does not cover a connection the service keeps alive without answering, nor a
+// client the caller built. Five minutes, as jam-core runs it.
+var composeTimeout = 5 * time.Minute
+
 // bucketAllowsCompose is false when a retention policy would keep the parts from
 // being deleted afterwards. A bucket that cannot be inspected counts as allowed;
 // parts left behind are then reported by the upload.
@@ -868,6 +913,7 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 	}
 	partSize := int64(math.Ceil(float64(size) / float64(parts)))
 	bkt := g.client.Bucket(bucket)
+	g.sweepStaleParts(bucket, object)
 	// parts are named per upload and referenced by the generation each one was
 	// written as, so two uploads of the same object never touch each other's parts
 	var uid [8]byte
@@ -891,11 +937,19 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 		abort()
 	}
 	var wg sync.WaitGroup
+	submit := worker.Submitter(ctx.Pool, parts, ctx.Concurrency)
 	for i := 0; i < parts; i++ {
 		i := i
 		wg.Add(1)
-		ctx.Pool.AddWithDepth(1, func() {
+		submit(func() {
 			defer wg.Done()
+			// A panic fails the upload, and its parts are cleaned up, like
+			// any other failed part.
+			defer func() {
+				if r := recover(); r != nil {
+					fail(i, common.PanicError(fmt.Sprintf("upload object panicked in part %d", i), r))
+				}
+			}()
 			off := int64(i) * partSize
 			length := partSize
 			if off+length > size {
@@ -984,7 +1038,9 @@ func (g *GCS) uploadComposite(f *os.File, before os.FileInfo, modTime time.Time,
 	composer.ContentType = sniffContentType(f)
 	composer.CRC32C = crc
 	composer.SendCRC32C = true
-	_, err = composer.Run(context.Background())
+	composeCtx, composeCancel := context.WithTimeout(context.Background(), composeTimeout)
+	_, err = composer.Run(composeCtx)
+	composeCancel()
 	left := cleanup()
 	if len(left) > 0 {
 		// the object is already committed and verified: a retry of the upload would
@@ -1101,7 +1157,20 @@ func lookupPart(h *storage.ObjectHandle) (*storage.ObjectHandle, error) {
 // pinned to a generation is retried until the context ends and deleteParts'
 // attempt limit is never reached.
 func deletePart(h *storage.ObjectHandle) error {
-	ctx, cancel := context.WithTimeout(context.Background(), partDeleteTimeout)
+	return deletePartWithin(context.Background(), h)
+}
+
+// errDeleteAbandoned marks a delete not attempted because the caller's context
+// had ended. It is final, so deleteParts does not wait and try again for it.
+var errDeleteAbandoned = errors.New("part delete abandoned")
+
+// deletePartWithin is deletePart bounded by the caller's context as well as its
+// own deadline, so a sweep given a deadline does not run past it deleting.
+func deletePartWithin(ctx context.Context, h *storage.ObjectHandle) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", errDeleteAbandoned, context.Cause(ctx))
+	}
+	ctx, cancel := context.WithTimeout(ctx, partDeleteTimeout)
 	defer cancel()
 	return h.Retryer(storage.WithPolicy(storage.RetryNever)).Delete(ctx)
 }
@@ -1115,6 +1184,9 @@ var partDeleteSleep = time.Sleep
 const partDeleteAttempts = 3
 
 func transientDeleteError(err error) bool {
+	if errors.Is(err, errDeleteAbandoned) {
+		return false
+	}
 	var ge *googleapi.Error
 	if errors.As(err, &ge) {
 		return ge.Code == 408 || ge.Code == 429 || ge.Code >= 500
@@ -1123,15 +1195,34 @@ func transientDeleteError(err error) bool {
 }
 
 func deleteParts(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []string {
+	failed := deletePartsReporting(handles, del)
+	var left []string
+	for i, h := range handles {
+		if failed[i] {
+			left = append(left, h.ObjectName())
+		}
+	}
+	return left
+}
+
+// deletePartsReporting is deleteParts reporting by position, for a caller whose
+// handles can share a name (versions of one part).
+func deletePartsReporting(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle) error) []bool {
 	failed := make([]bool, len(handles))
 	var wg sync.WaitGroup
+	// one upload has at most compositeMaxParts; a sweep can have thousands
+	slots := make(chan struct{}, compositeMaxParts)
 	for i, h := range handles {
 		if h == nil {
 			continue
 		}
+		// taken before the goroutine starts, so a sweep over thousands of parts
+		// runs at most compositeMaxParts goroutines rather than parking the rest
+		slots <- struct{}{}
 		wg.Add(1)
 		go func(i int, h *storage.ObjectHandle) {
 			defer wg.Done()
+			defer func() { <-slots }()
 			for attempt := 1; ; attempt++ {
 				err := del(h)
 				if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
@@ -1146,13 +1237,7 @@ func deleteParts(handles []*storage.ObjectHandle, del func(*storage.ObjectHandle
 		}(i, h)
 	}
 	wg.Wait()
-	var left []string
-	for i, h := range handles {
-		if failed[i] {
-			left = append(left, h.ObjectName())
-		}
-	}
-	return left
+	return failed
 }
 
 func sniffContentType(f *os.File) string {
