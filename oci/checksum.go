@@ -30,6 +30,9 @@ func (o *OCI) equalCRC32C(localPath, bucket, object string) (equal, comparable b
 	}
 	remote, stored := crc32cOf(head.OpcContentCrc32c)
 	if !stored {
+		if !noCRC32CStored(head.OpcContentCrc32c) {
+			return false, false, fmt.Errorf("cannot verify oci://%s/%s: the stored CRC32C cannot be read", bucket, object)
+		}
 		return false, false, nil
 	}
 	local := common.GetFileCRC32C(localPath)

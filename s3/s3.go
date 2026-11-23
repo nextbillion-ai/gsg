@@ -159,6 +159,13 @@ func noComparableCRC32C(attrs *S3Attributes) bool {
 	return c == nil || c.ChecksumType != types.ChecksumTypeFullObject || c.ChecksumCRC32C == nil || *c.ChecksumCRC32C == ""
 }
 
+// unreadableCRC32C reports, for an object crc32cOf found no CRC32C on, that it
+// does store a whole-object one which cannot be decoded. -v must fail on that
+// rather than pass as if there were nothing to compare.
+func unreadableCRC32C(attrs *S3Attributes) bool {
+	return attrs != nil && attrs.S3Attrs != nil && !noComparableCRC32C(attrs)
+}
+
 // decodeCRC32C reads the wire form of a checksum: base64 of four big-endian
 // bytes.
 func decodeCRC32C(enc string) (uint32, bool) {
@@ -1069,6 +1076,11 @@ func (s *S3) verifyDownload(dstFile, bucket, prefix string, size int64, crc uint
 	}
 	want, ok := crc32cOf(attr)
 	if !ok {
+		if unreadableCRC32C(attr) {
+			log := fmt.Sprintf("CRC32C checking failed for bucket[%s] prefix[%s]: the stored CRC32C cannot be read", bucket, prefix)
+			logger.Info(module, log)
+			return false, errors.New(log)
+		}
 		logger.Info(module, "CRC32C checking skipped for bucket[%s] prefix[%s]: no CRC32C stored", bucket, prefix)
 		return false, nil
 	}
@@ -1339,6 +1351,9 @@ func (s *S3) equalCRC32C(localPath, bucket, object string) (equal, comparable bo
 	}
 	remote, ok := crc32cOf(attr)
 	if !ok {
+		if unreadableCRC32C(attr) {
+			return false, false, fmt.Errorf("cannot verify s3://%s/%s: the stored CRC32C cannot be read", bucket, object)
+		}
 		return false, false, nil
 	}
 	local := common.GetFileCRC32C(localPath)

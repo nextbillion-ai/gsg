@@ -175,6 +175,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 		pin = head.ETag
 	}
 	want, stored := crc32cOf(head.OpcContentCrc32c)
+	unreadable := !stored && !noCRC32CStored(head.OpcContentCrc32c)
 
 	// The destination's parent may not exist yet: a recursive copy walks
 	// objects, not directories, so "a/b/c.txt" can be the first thing that
@@ -234,7 +235,7 @@ func (o *OCI) Download(bucket, prefix, dstFile string, forceChecksum bool, ctx s
 	// Settled before the rename, so a download that does not match leaves
 	// whatever was at dstFile as it was.
 	local, total := common.FoldCRC32C(sums, lens)
-	keep, cache, err := settleDownload(forceChecksum, dstFile, ref.name, prefix, local, total, size, want, stored)
+	keep, cache, err := settleDownload(forceChecksum, dstFile, ref.name, prefix, local, total, size, want, stored, unreadable)
 	if !keep {
 		_ = os.Remove(dstFileTemp)
 		return err
@@ -335,8 +336,16 @@ func (o *OCI) fetchChunk(ref bucketRef, prefix string, pin *string, dstFileTemp 
 // local and total are what the chunks summed while writing. want is what the
 // HEAD that started the download reported, and stored says whether it reported
 // one at all: OCI records a CRC32C only when the uploader asked for one, and a
-// missing checksum is not a checksum of zero.
-func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, total, size int64, want uint32, stored bool) (keep, cache bool, err error) {
+// missing checksum is not a checksum of zero. unreadable says the HEAD reported
+// one that cannot be decoded: under -v that fails rather than passing as if
+// there were nothing to compare, and without -v the file goes into place
+// uncached, as for a missing one.
+func settleDownload(forceChecksum bool, dstFile, bucket, prefix string, local uint32, total, size int64, want uint32, stored, unreadable bool) (keep, cache bool, err error) {
+	if !stored && unreadable && forceChecksum {
+		log := fmt.Sprintf("CRC32C checking failed for bucket[%s] prefix[%s]: the stored CRC32C cannot be read", bucket, prefix)
+		logger.Info(module, log)
+		return false, false, fmt.Errorf("%s", log)
+	}
 	if !stored {
 		// Nothing to check against. Saying so is the honest outcome: failing
 		// would reject every object written without a CRC32C, and passing in

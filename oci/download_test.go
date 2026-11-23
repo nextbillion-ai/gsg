@@ -233,7 +233,7 @@ func TestSettleDownloadSaysWhatItCanAndFailsOnlyWhenAsked(t *testing.T) {
 	// the object carries no checksum: not comparable, not a failure, put in
 	// place but not cached
 	for _, verify := range []bool{true, false} {
-		keep, cache, err := settleDownload(verify, path, "b", "o", crc^1, size, size, 0, false)
+		keep, cache, err := settleDownload(verify, path, "b", "o", crc^1, size, size, 0, false, false)
 		assert.NoError(t, err)
 		assert.True(t, keep, "-v %t: nothing to compare with is not a mismatch", verify)
 		assert.False(t, cache, "-v %t: nothing is cached for an object without a checksum", verify)
@@ -241,7 +241,7 @@ func TestSettleDownloadSaysWhatItCanAndFailsOnlyWhenAsked(t *testing.T) {
 
 	// agreement, with and without -v: in place and cached either way
 	for _, verify := range []bool{true, false} {
-		keep, cache, err := settleDownload(verify, path, "b", "o", crc, size, size, crc, true)
+		keep, cache, err := settleDownload(verify, path, "b", "o", crc, size, size, crc, true, false)
 		assert.NoError(t, err)
 		assert.True(t, keep, "-v %t", verify)
 		assert.True(t, cache, "-v %t: the sum taken while writing is cached", verify)
@@ -249,7 +249,7 @@ func TestSettleDownloadSaysWhatItCanAndFailsOnlyWhenAsked(t *testing.T) {
 
 	// disagreement: reported either way, fatal only under -v, never put in place
 	for _, verify := range []bool{true, false} {
-		keep, cache, err := settleDownload(verify, path, "b", "o", crc^1, size, size, crc, true)
+		keep, cache, err := settleDownload(verify, path, "b", "o", crc^1, size, size, crc, true, false)
 		if verify {
 			assert.Error(t, err)
 		} else {
@@ -259,8 +259,20 @@ func TestSettleDownloadSaysWhatItCanAndFailsOnlyWhenAsked(t *testing.T) {
 		assert.False(t, cache, "-v %t: a mismatching sum is not cached", verify)
 	}
 
+	// a stored checksum that cannot be decoded is unknown, not absent: -v fails
+	// and the file stays out of place; without -v it goes in uncached, as for a
+	// missing one
+	keep, cache, err := settleDownload(true, path, "b", "o", crc, size, size, 0, false, true)
+	assert.Error(t, err, "-v must not pass on a checksum it could not read")
+	assert.False(t, keep)
+	assert.False(t, cache)
+	keep, cache, err = settleDownload(false, path, "b", "o", crc, size, size, 0, false, true)
+	assert.NoError(t, err)
+	assert.True(t, keep)
+	assert.False(t, cache)
+
 	// a sum over fewer bytes than the object has is a mismatch, whatever it is
-	keep, _, err := settleDownload(true, path, "b", "o", crc, size-1, size, crc, true)
+	keep, _, err = settleDownload(true, path, "b", "o", crc, size-1, size, crc, true, false)
 	assert.Error(t, err)
 	assert.False(t, keep)
 }

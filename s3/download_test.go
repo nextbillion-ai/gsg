@@ -193,6 +193,29 @@ func TestDownloadOfAnObjectWithoutACRC32CCachesNothing(t *testing.T) {
 	}
 }
 
+// A whole-object CRC32C that is stored but cannot be decoded is unknown, not
+// absent. -v must fail on it rather than pass without comparing anything;
+// without -v the file goes into place uncached, as for a missing checksum.
+func TestDownloadOfAnObjectWithAnUnreadableCRC32C(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789"), 100)
+	real := crc32.Checksum(content, common.Castagnoli)
+	unreadable := `<Checksum><ChecksumCRC32C>!!notbase64</ChecksumCRC32C><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>`
+	for _, gentle := range []bool{false, true} {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "o.bin")
+		err := downloadVerified(t, rangedObjectWithChecksum(t, content, 0, unreadable), 333, true, gentle, dst)
+		assert.Error(t, err, "gentle=%v: -v cannot pass on a checksum it could not read", gentle)
+		left, _ := os.ReadDir(dir)
+		assert.Empty(t, left, "gentle=%v: nothing is put in place, and no temp file is left", gentle)
+
+		require.NoError(t, downloadVerified(t, rangedObjectWithChecksum(t, content, 0, unreadable), 333, false, gentle, dst), "gentle=%v", gentle)
+		got, rerr := os.ReadFile(dst)
+		require.NoError(t, rerr)
+		assert.Equal(t, content, got, "gentle=%v", gentle)
+		assert.NotEqual(t, real, cachedCRC32C(t, dst), "gentle=%v: nothing cached", gentle)
+	}
+}
+
 // The library API builds a RunContext with neither Bars nor a Pool; the
 // download dereferenced both inside a pool worker, whose recovery then ended
 // the caller's process with os.Exit(1).
