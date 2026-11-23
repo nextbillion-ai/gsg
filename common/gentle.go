@@ -42,6 +42,9 @@ func adviseRange(windowStart, windowLen, previousLen int64) (offset, length int6
 // 110 s, in 8 MiB pieces 373-398 s and 103-106 s, the same as jam-core's own
 // downloader, which writes 8 MiB. Dropping the pages less often (a 16 MiB
 // window with 1 MiB writes) changed neither.
+//
+// A window closes at the first write that reaches GentleWindow, so with this
+// buffer windows are 10 to 16 MiB and one adviseRange covers up to 32 MiB.
 const gentleBuffer = 8 << 20
 
 // GentleWrite copies src into dst at offset without leaving the bytes in the

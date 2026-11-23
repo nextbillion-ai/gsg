@@ -27,9 +27,10 @@ var sweepPartsCmd = &cobra.Command{
 	Short: "Remove the parts that killed composite uploads left behind",
 	Long: `Remove the .gsg-part-* (and jam-core's .jam-part-*) objects that composite
 uploads under each prefix left behind when their process was killed. An upload
-counts as dead only when its newest part is older than --older-than, so the
-parts of an upload still running are left alone. Each part is deleted at the
-generation listed. Only gs:// is supported: s3 and oci upload in native
+counts as dead only when its newest part is older than --older-than, so an
+upload still running is left alone while it finishes a part within every
+--older-than; one whose parts each take longer can be swept, and then fails at
+its compose. Each part is deleted at the generation listed. Only gs:// is supported: s3 and oci upload in native
 multipart uploads, which leave no objects.`,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {

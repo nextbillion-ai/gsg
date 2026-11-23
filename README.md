@@ -82,7 +82,10 @@ A composite upload (`-m`, files above 256 MiB on gs) writes parts named
 `<object>.gsg-part-<id>-NN` and deletes them after the compose. A process
 killed in between leaves them. `sweep-parts` deletes the parts of every upload
 under the prefix whose newest part is older than `--older-than`, each at the
-generation listed, and leaves the parts of an upload that may still be running.
+generation listed. A running upload is left alone only while it finishes a
+part within every `--older-than`: one whose parts each take longer (a 1 TB
+object's 32 GB parts below about 9 MB/s, for the default hour) can be swept
+while it runs, and then fails at its compose rather than composing a hole.
 jam-core's `.jam-part-` parts are swept the same way. A composite upload also
 runs this sweep for its own object before it starts, so a rerun after a kill
 removes what the killed run left. The library call is `(*gcs.GCS).SweepParts`.

@@ -58,8 +58,12 @@ type partUpload struct {
 // their names, which are random per upload.
 //
 // An upload is taken for dead only when its newest part, of every part listed
-// under the same upload id, is older than olderThan; a running upload adds parts
-// as they finish, so its parts are never touched while any of them is young.
+// under the same upload id, is older than olderThan. A running upload adds parts
+// as they finish, so it is protected only while it finalizes a part within
+// every olderThan window. One whose parts take longer than that can be taken
+// for dead while it runs: a 1 TB object has 32 GB parts, which take more than
+// the default hour below about 9 MB/s each. Its compose then fails; an object
+// is never composed from a hole.
 // Every part is deleted at the generation listed, noncurrent versions included,
 // so a delete can never take an object written after the listing.
 //
